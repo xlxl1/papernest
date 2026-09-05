@@ -1,0 +1,1885 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PaperNest · 文巢</title>
+<style>
+:root{
+  --bg:#f6f4ef; --card:#ffffff; --fg:#201d1a; --muted:#77726a; --line:#e6e2d8;
+  --accent:#9a6b35; --accent-deep:#7c5326; --accent-soft:#f3ebe0;
+  --ok:#2f6f4f; --ok-soft:#e7f2ec; --warn:#9a6a10; --bad:#a13b2f;
+  --shadow:0 1px 2px rgba(40,30,15,.05),0 4px 16px rgba(40,30,15,.05);
+}
+@media(prefers-color-scheme:dark){
+  :root{--bg:#151310;--card:#1e1b17;--fg:#eae6de;--muted:#9b948a;--line:#302b24;
+    --accent:#d9a866;--accent-deep:#c8924e;--accent-soft:#2b2419;
+    --ok:#6fbf8f;--ok-soft:#1f2f26;--warn:#d9ab4f;--bad:#e08272;
+    --shadow:0 1px 2px rgba(0,0,0,.25),0 6px 20px rgba(0,0,0,.2)}
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{margin:0;background:var(--bg);color:var(--fg);
+  font-family:"Segoe UI","PingFang SC","Microsoft YaHei",system-ui,sans-serif;
+  font-size:14.5px;line-height:1.7;display:flex;flex-direction:column}
+::-webkit-scrollbar{width:9px;height:9px}
+::-webkit-scrollbar-thumb{background:var(--line);border-radius:5px}
+a{color:var(--accent);text-decoration:none}
+button{font-family:inherit;cursor:pointer;border:0;border-radius:9px;font-size:13.5px;
+  padding:8px 16px;background:var(--accent);color:#fff;transition:filter .15s}
+button:hover{filter:brightness(1.08)} button:disabled{opacity:.45;cursor:wait}
+button.ghost{background:transparent;color:var(--accent);border:1px solid var(--accent)}
+input,textarea,select{font-family:inherit;font-size:13.5px;color:var(--fg);
+  background:var(--card);border:1px solid var(--line);border-radius:9px;padding:8px 12px;outline:none}
+textarea{width:100%;resize:vertical;line-height:1.65}
+input:focus,textarea:focus{border-color:var(--accent)}
+
+/* ── 顶栏 ── */
+header{position:sticky;top:0;z-index:20;display:flex;align-items:center;gap:22px;
+  padding:12px 26px;background:color-mix(in srgb,var(--bg) 82%,transparent);
+  backdrop-filter:blur(10px);border-bottom:1px solid var(--line)}
+.logo{font-size:17px;font-weight:700;letter-spacing:.02em;white-space:nowrap}
+.logo b{color:var(--accent)}
+.logo .dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--accent);margin-right:8px;vertical-align:2px}
+/* 导航条现在有 8 项：窄屏下让它自己横向滚动，而不是把「文献检索」折成两行 */
+nav{display:flex;gap:4px;flex:1;min-width:0;overflow-x:auto;scrollbar-width:none}
+nav::-webkit-scrollbar{display:none}
+nav button{background:transparent;color:var(--muted);padding:7px 18px;border-radius:999px;
+  font-size:14px;white-space:nowrap;flex:0 0 auto}
+@media(max-width:1180px){nav button{padding:7px 12px;font-size:13px}}
+nav button:hover{color:var(--fg);filter:none}
+nav button.on{background:var(--accent-soft);color:var(--accent-deep);font-weight:600}
+@media(prefers-color-scheme:dark){nav button.on{color:var(--accent)}}
+.hstats{display:flex;gap:8px;font-size:12px;color:var(--muted);white-space:nowrap}
+.hstats span{background:var(--card);border:1px solid var(--line);border-radius:999px;padding:2px 12px}
+.hstats b{color:var(--fg)}
+
+/* ── 视图容器 ── */
+main{flex:1;overflow:hidden}
+.view{display:none;height:100%}
+.view.on{display:block}
+
+/* ── 对话（主页，居中）── */
+#view-chat{display:none;flex-direction:column;align-items:center}
+#view-chat.on{display:flex}
+.chatwrap{width:100%;max-width:820px;display:flex;flex-direction:column;height:100%;padding:0 18px}
+.hero{margin:60px auto 8px;text-align:center}
+.hero .mark{width:64px;height:64px;border-radius:18px;background:linear-gradient(135deg,var(--accent),var(--accent-deep));
+  color:#fff;font-size:30px;font-weight:700;display:flex;align-items:center;justify-content:center;margin:0 auto 16px;
+  box-shadow:var(--shadow)}
+.hero h2{font-size:22px;margin:0 0 6px}
+.hero p{color:var(--muted);font-size:13.5px;margin:0}
+.chips{display:flex;gap:8px;justify-content:center;flex-wrap:wrap;margin:18px 0 6px}
+.chips button{background:var(--card);color:var(--fg);border:1px solid var(--line);border-radius:999px;
+  font-size:12.5px;padding:6px 14px;box-shadow:var(--shadow)}
+.chips button:hover{border-color:var(--accent);color:var(--accent)}
+.chatlist{flex:1;overflow-y:auto;padding:18px 4px 6px}
+.msg{max-width:92%;margin:0 0 14px;border-radius:14px;padding:10px 16px;font-size:14px;
+  white-space:pre-wrap;word-break:break-word;animation:rise .18s ease-out}
+@keyframes rise{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+.msg.user{background:var(--accent-soft);margin-left:auto;border:1px solid color-mix(in srgb,var(--accent) 25%,transparent)}
+.msg.bot{background:var(--card);border:1px solid var(--line);box-shadow:var(--shadow)}
+.msg .src{border-top:1px dashed var(--line);margin-top:8px;padding-top:6px;font-size:12px;color:var(--muted)}
+.msg .src a{cursor:pointer}
+sup.cite{background:var(--accent-soft);color:var(--accent-deep);border-radius:5px;padding:0 5px;
+  font-size:10.5px;font-weight:700;margin:0 1px;cursor:default}
+@media(prefers-color-scheme:dark){sup.cite{color:var(--accent)}}
+.chatbar{display:flex;gap:8px;padding:10px 0 16px}
+.chatbar input{flex:1;border-radius:12px;padding:11px 16px;font-size:14px;box-shadow:var(--shadow)}
+.spin{display:inline-block;width:13px;height:13px;border:2px solid var(--accent);border-top-color:transparent;
+  border-radius:50%;animation:sp .7s linear infinite;vertical-align:-2px;margin-right:6px}
+@keyframes sp{to{transform:rotate(360deg)}}
+
+/* ── 通用面板页 ── */
+.panel{max-width:1080px;margin:0 auto;padding:22px 20px 60px;height:100%;overflow-y:auto}
+.panel h2{font-size:17px;margin:0 0 4px}
+.panel .desc{color:var(--muted);font-size:13px;margin:0 0 16px}
+.box{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px 18px;
+  box-shadow:var(--shadow);margin-bottom:16px}
+.frow{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px}
+.frow label{font-size:12.5px;color:var(--muted);white-space:nowrap}
+.frow input[type=number]{width:86px}
+.tagbox{display:flex;flex-wrap:wrap;gap:6px;align-items:center;border:1px solid var(--line);
+  border-radius:9px;padding:5px 8px;background:var(--bg);flex:1;min-width:260px}
+.tag{background:var(--accent-soft);color:var(--accent-deep);border-radius:999px;
+  padding:2px 6px 2px 12px;font-size:12.5px;display:flex;align-items:center;gap:4px}
+@media(prefers-color-scheme:dark){.tag{color:var(--accent)}}
+.tag i{cursor:pointer;font-style:normal;opacity:.6;padding:0 4px}
+.tag i:hover{opacity:1}
+.tagbox input{border:0;background:transparent;flex:1;min-width:120px;padding:4px}
+.note{border:1px solid var(--line);border-left:3px solid var(--accent);border-radius:0 9px 9px 0;
+  padding:9px 14px;margin:10px 0;font-size:13px;display:none;background:var(--bg)}
+.subtabs{display:flex;gap:6px;margin-bottom:14px}
+.subtabs button{background:transparent;color:var(--muted);border:1px solid var(--line);border-radius:999px}
+.subtabs button.on{background:var(--accent);color:#fff;border-color:var(--accent)}
+.pane{display:none}.pane.on{display:block}
+
+/* 文献条目 */
+.item{border:1px solid var(--line);border-radius:11px;padding:10px 14px;margin:8px 0;
+  cursor:pointer;background:var(--card);transition:border-color .12s}
+.item:hover{border-color:var(--accent)}
+.item b{display:block;font-size:13.5px;line-height:1.5}
+.item .m{color:var(--muted);font-size:12px;margin-top:2px;display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+.badge{display:inline-block;border-radius:999px;padding:0 9px;font-size:11px;background:var(--soft);color:var(--muted)}
+.badge.ok{background:var(--ok-soft);color:var(--ok)}
+.badge.acc{background:var(--accent-soft);color:var(--accent-deep)}
+@media(prefers-color-scheme:dark){.badge.acc{color:var(--accent)}}
+
+/* 详情弹窗 */
+.overlay{position:fixed;inset:0;background:rgba(20,15,8,.45);z-index:50;display:none;
+  align-items:flex-start;justify-content:center;padding:40px 16px;overflow-y:auto}
+.overlay.on{display:flex}
+.modal{background:var(--card);border:1px solid var(--line);border-radius:16px;max-width:760px;
+  width:100%;padding:22px 26px;box-shadow:0 18px 60px rgba(0,0,0,.25);position:relative}
+.modal .x{position:absolute;top:14px;right:16px;background:none;color:var(--muted);font-size:20px;padding:2px 8px}
+.modal h3{margin:0 26px 4px 0;font-size:17px;line-height:1.5}
+.meta{color:var(--muted);font-size:12.5px;margin-bottom:10px}
+.krow{margin:5px 0;font-size:13.5px}
+.krow .k{color:var(--accent);font-weight:600}
+.finding{margin:4px 0;font-size:13px}
+.finding .v{color:var(--ok);font-weight:700}.finding .u{color:var(--warn);font-weight:700}
+.kw{display:inline-block;background:var(--accent-soft);color:var(--accent-deep);border-radius:999px;
+  padding:1px 11px;font-size:11.5px;margin:2px 5px 2px 0}
+@media(prefers-color-scheme:dark){.kw{color:var(--accent)}}
+pre.fmt{background:var(--bg);border:1px solid var(--line);border-radius:10px;padding:12px;
+  font-size:12px;white-space:pre-wrap;word-break:break-all;max-height:220px;overflow-y:auto;font-family:Consolas,monospace}
+
+/* 引用候选 */
+.cand{border:1px solid var(--line);border-radius:12px;padding:11px 14px;margin:9px 0;font-size:13px;background:var(--card)}
+.cand .ev{background:var(--bg);border:1px dashed var(--line);border-radius:8px;padding:7px 11px;margin:6px 0}
+.cand .vok{color:var(--ok);font-weight:700}.cand .vno{color:var(--warn);font-weight:700}
+.mkt{font-size:12px;color:var(--muted)}
+
+/* ── Agent 执行时间线 ── */
+.tl{position:relative;margin:14px 0 4px 12px;padding-left:28px;border-left:2px solid var(--line)}
+.tlstep{position:relative;margin:0 0 16px}
+.tlstep .dot{position:absolute;left:-37px;top:3px;width:12px;height:12px;border-radius:50%;
+  background:var(--card);border:3px solid var(--muted)}
+.tlstep.completed .dot{border-color:var(--ok)}
+.tlstep.failed .dot,.tlstep.timeout .dot{border-color:var(--bad)}
+.tlstep.running .dot{border-color:var(--warn);animation:pulse 1.2s ease-in-out infinite}
+@keyframes pulse{50%{box-shadow:0 0 0 5px color-mix(in srgb,var(--warn) 25%,transparent)}}
+.tlstep .head{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.tlstep .tool{font-weight:700;font-size:13.5px}
+.chip{font-size:11px;border-radius:999px;padding:1px 9px;background:var(--soft,var(--accent-soft));color:var(--accent-deep)}
+@media(prefers-color-scheme:dark){.chip{color:var(--accent)}}
+.chip.ok{background:var(--ok-soft);color:var(--ok)}
+.chip.bad{background:#f7e5e2;color:var(--bad)}
+@media(prefers-color-scheme:dark){.chip.bad{background:#3a221d;color:var(--bad)}}
+.chip.warn{background:#f6ecd4;color:var(--warn)}
+@media(prefers-color-scheme:dark){.chip.warn{background:#332a17;color:var(--warn)}}
+.lat{font-size:11.5px;color:var(--muted)}
+.why{font-size:12px;color:var(--muted);margin:2px 0}
+.tlstep .err{font-size:12px;color:var(--bad);margin-top:2px;word-break:break-all}
+table.mx{border-collapse:collapse;width:100%;font-size:12.5px;margin-top:6px}
+table.mx th,table.mx td{border:1px solid var(--line);padding:6px 8px;vertical-align:top;
+  text-align:left;max-width:280px}
+table.mx th{background:var(--card);font-weight:600;white-space:nowrap}
+table.mx td a{cursor:pointer}
+.prog{height:7px;border-radius:5px;background:var(--bg);border:1px solid var(--line);overflow:hidden;margin:6px 0 2px}
+.prog i{display:block;height:100%;width:0;background:linear-gradient(90deg,var(--accent),var(--accent-deep));transition:width .4s}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo"><span class="dot"></span>Paper<b>Nest</b> 文巢</div>
+  <nav>
+    <button id="nav-chat" class="on" onclick="showView('chat')">对话</button>
+    <button id="nav-agent" onclick="showView('agent')">Agent</button>
+    <button id="nav-search" onclick="showView('search')">文献检索</button>
+    <button id="nav-cite" onclick="showView('cite')">引用推荐</button>
+    <button id="nav-write" onclick="showView('write')">写作台</button>
+    <button id="nav-pipeline" onclick="showView('pipeline')">写作流水线</button>
+    <button id="nav-space" onclick="showView('space')">课题工作区</button>
+    <button id="nav-graph" onclick="showView('graph')">引文网络</button>
+    <button id="nav-feed" onclick="showView('feed')">新论文订阅</button>
+  </nav>
+  <div class="hstats" id="hstats"></div>
+</header>
+
+<main>
+<!-- ═══ 主页：对话 ═══ -->
+<div class="view on" id="view-chat">
+  <div class="chatwrap">
+    <div class="hero" id="hero">
+      <div class="mark">文</div>
+      <h2>问文献，就在这里</h2>
+      <p>回答全部来自你的文献库，逐条标注来源 · 库里没有的它会直说</p>
+      <div class="chips">
+        <button onclick="askBy('帮我综述一下库里关于 Agent 评测的进展')">综述库里的 Agent 评测进展</button>
+        <button onclick="askBy('「RAG」这个术语是什么意思？')">解释术语</button>
+        <button onclick="askBy('库里有哪些多智能体协作相关的文献？各自做了什么？')">找多智能体文献</button>
+        <button onclick="askBy('润色这段话，让它更学术：这个方法效果很好。')">润色一段话</button>
+        <button onclick="doSurvey()" title="在下方输入课题关键词后点此">生成课题综述</button>
+      </div>
+    </div>
+    <div class="chatlist" id="chat"><div id="chatAnchor"></div></div>
+    <div class="chatbar">
+      <input type="text" id="chatIn" placeholder="向文献库提问，或让我帮你写作 / 解释术语 / 润色……（回车发送）"
+             onkeydown="if(event.key==='Enter')doChat()">
+      <button id="btnChat" onclick="doChat()">发送</button>
+      <button class="ghost" id="btnNewChat" onclick="newChat()" title="清空上下文，开一段新对话">新对话</button>
+      <button class="ghost" onclick="chatHistory()" title="服务端保存的历史会话，可回放继续">历史</button>
+    </div>
+  </div>
+</div>
+
+<!-- ═══ Agent 时间线 ═══ -->
+<div class="view" id="view-agent"><div class="panel" style="max-width:900px">
+  <h2>Research Agent</h2>
+  <p class="desc">确定性 Planner → 工具注册表 → 有界状态机执行；每步超时硬截止 + 失败重试，执行轨迹全部落库可回放。</p>
+  <div class="box">
+    <textarea id="agentGoal" rows="2" placeholder="给 Agent 一个目标，例如：&#10;· 库里有哪些关于 Agent 评测的文献？分别做了什么？&#10;· 推荐支持这段话的参考文献……&#10;· 精读论文 15"></textarea>
+    <div class="frow" style="margin-top:10px">
+      <label>top_k</label><input type="number" id="agentTopk" value="5" min="1" max="20" style="width:70px">
+      <label>步超时(秒)</label><input type="number" id="agentTimeout" value="240" min="5" max="900" style="width:80px">
+      <button class="ghost" onclick="agentPlan()">预览计划</button>
+      <button onclick="agentRun()" id="btnAgent">执行</button>
+    </div>
+    <div class="note" id="agentNote"></div>
+    <div id="agentPlanBox"></div>
+  </div>
+  <div id="agentResult"></div>
+  <div class="box" style="margin-top:16px">
+    <b style="font-size:13.5px">历史执行轨迹</b>
+    <button class="ghost" style="padding:2px 12px;font-size:12px;margin-left:10px" onclick="loadAgentRuns()">刷新</button>
+    <div id="agentRuns" style="margin-top:8px"><p class="desc">还没有执行记录。</p></div>
+  </div>
+</div></div>
+
+<!-- ═══ 写作台：润色 / 评审 ═══ -->
+<div class="view" id="view-write"><div class="panel" style="max-width:900px">
+  <h2>写作台</h2>
+  <p class="desc">粘贴你写好的文稿：润色保留事实与引用编号、逐条给出修改说明；评审按审稿人视角输出总评 / 评分 / 分级问题 / 可执行修改清单，并与库内文献核对引用。</p>
+  <div class="box">
+    <textarea id="wtText" rows="10" placeholder="粘贴你的文稿（可含 Markdown、LaTeX、[n] 引用标记）……"></textarea>
+    <div class="frow" style="margin-top:10px">
+      <input type="text" id="wtInstr" placeholder="润色要求（可选，如：更凝练、补充方法细节衔接）" style="flex:1">
+      <button onclick="doPolish()" id="btnPolish">润色</button>
+      <button class="ghost" onclick="doReview()" id="btnReview">评审</button>
+    </div>
+    <p class="mkt">建议先在「文献检索」里勾选与本稿相关的文献——评审会核对文中引用是否站得住；不勾选则按文稿自动检索关联文献。</p>
+    <div class="note" id="wtNote"></div>
+  </div>
+  <div id="wtResult"></div>
+</div></div>
+
+<!-- ═══ 文献检索 ═══ -->
+<div class="view" id="view-search"><div class="panel">
+  <h2>文献检索与采集</h2>
+  <p class="desc">多关键词检索官方学术源（Semantic Scholar / OpenAlex / arXiv），按年份筛选后入库；同一查询二次执行直接走缓存。</p>
+  <div class="subtabs">
+    <button id="st-fetch" class="on" onclick="subTab('fetch')">检索采集</button>
+    <button id="st-local" onclick="subTab('local')">本地导入</button>
+    <button id="st-lib" onclick="subTab('lib')">我的文献库</button>
+    <button id="st-sym" onclick="subTab('sym')">符号库</button>
+  </div>
+
+  <div class="pane" id="pane-local">
+    <div class="box">
+      <b style="font-size:13.5px">上传 PDF</b>
+      <p class="desc">你手上已有的 PDF 也能进库：按内容 sha256 与归一化主键双重去重，按页抽全文，元数据（标题 / DOI / arXiv / 年份 / 摘要）用版面启发式抽取——<b>抽不准的字段如实留空并给出提示，不编造</b>，可在下方逐条修正。</p>
+      <div class="frow" style="margin-top:8px">
+        <input type="file" id="pdfFiles" accept="application/pdf" multiple>
+        <label><input type="checkbox" id="pdfCards" checked> 同时生成卡片</label>
+        <button onclick="doUploadPdf()" id="btnUpload">上传入库</button>
+      </div>
+      <div class="note" id="uploadNote"></div>
+      <div id="uploadList" style="margin-top:8px"></div>
+    </div>
+    <div class="box" style="margin-top:14px">
+      <b style="font-size:13.5px">导入 BibTeX / RIS / Zotero CSV</b>
+      <p class="desc">从 Zotero、EndNote、Mendeley 搬家：已存在的按归一化主键跳过，<b>只补空字段、不覆盖已有内容</b>。解析失败的条目单独列出，不会拖垮整个文件。</p>
+      <div class="frow" style="margin-top:8px">
+        <input type="file" id="bibFile" accept=".bib,.ris,.csv,.txt">
+        <select id="bibFmt">
+          <option value="auto">自动识别</option><option value="bibtex">BibTeX</option>
+          <option value="ris">RIS</option><option value="csv">Zotero CSV</option>
+        </select>
+        <label title="对缺摘要且有 DOI 的条目查 Semantic Scholar 补全，条目多时较慢">
+          <input type="checkbox" id="bibEnrich"> 联网补全摘要</label>
+        <button onclick="doImportBib()" id="btnBib">导入</button>
+      </div>
+      <textarea id="bibText" rows="4" placeholder="或者直接粘贴 BibTeX / RIS 内容到这里" style="margin-top:8px"></textarea>
+      <div class="note" id="bibNote"></div>
+      <div id="bibResult" style="margin-top:8px"></div>
+    </div>
+  </div>
+
+  <div class="pane on" id="pane-fetch">
+    <div class="box">
+      <div class="frow" style="align-items:flex-start">
+        <label>关键词</label>
+        <div class="tagbox" id="tagbox">
+          <input type="text" id="kwIn" placeholder="输入后回车或点添加，可加多个">
+        </div>
+        <button class="ghost" onclick="addKw()">添加</button>
+      </div>
+      <div class="frow">
+        <label>年份</label>
+        <input type="number" id="yFrom" placeholder="从" min="1990" max="2030">
+        <span class="mkt">—</span>
+        <input type="number" id="yTo" placeholder="到" min="1990" max="2030">
+        <label style="margin-left:14px">条数上限</label>
+        <input type="number" id="limit" value="50" min="1" max="100">
+        <button onclick="doIngest()" id="btnFetch">检索并入库</button>
+      </div>
+      <div class="note" id="fetchNote"></div>
+    </div>
+    <div id="fetchList"></div>
+  </div>
+
+  <div class="pane" id="pane-lib">
+    <div class="box">
+      <div class="frow">
+        <input type="text" id="fs" placeholder="库内检索（标题 / 摘要 / 关键词）" style="flex:1"
+               onkeydown="if(event.key==='Enter')doLibSearch()">
+        <label>年份</label>
+        <input type="number" id="libFrom" placeholder="从" min="1990" max="2030" style="width:78px">
+        <span class="mkt">—</span>
+        <input type="number" id="libTo" placeholder="到" min="1990" max="2030" style="width:78px">
+        <button class="ghost" onclick="doLibSearch()">筛选</button>
+        <button class="ghost" onclick="doMatrix()">对比矩阵（勾选 <span id="cmpN">0</span> 篇）</button>
+        <button class="ghost" onclick="doPpt()">生成汇报 PPT</button>
+      </div>
+    </div>
+    <div id="libList"><p class="desc">加载中…</p></div>
+  </div>
+
+  <div class="pane" id="pane-sym">
+    <div class="box">
+      <div class="frow">
+        <input type="text" id="symQ" placeholder="搜索符号 / 含义 / 论文标题（回车）" style="flex:1"
+               onkeydown="if(event.key==='Enter')loadSymbols()">
+        <select id="symKind"><option value="">全部</option><option value="symbol">数学符号</option><option value="abbrev">缩写</option></select>
+        <button class="ghost" onclick="loadSymbols()">查询</button>
+      </div>
+      <p class="mkt">LaTeX 可直接粘贴进 Overleaf；Word 里用 MathType 的「Toggle TeX / 粘贴 TeX」同样识别。数据来自已精读论文的全文，符号由模型抽取自原文明确定义处。</p>
+    </div>
+    <div id="symList"><p class="desc">库内还没有符号数据——打开一篇文献详情，先「L2 全文精读」，再「抽取符号」。</p></div>
+  </div>
+</div></div>
+
+<!-- ═══ 引用推荐 ═══ -->
+<div class="view" id="view-cite"><div class="panel" style="max-width:860px">
+  <h2>引用推荐</h2>
+  <p class="desc">粘贴你正在写的段落，推荐可支撑它的文献——每条带「支撑证据句」并通过机械回取校验，防 AI 引用幻觉；勾选后导出四格式，可直接导入 EndNote / Zotero。</p>
+  <div class="box">
+    <textarea id="citeIn" rows="6" placeholder="例如：现有研究表明，LLM Agent 在多步工具调用中的可靠性仍是主要瓶颈，需要系统性的评测基准……"></textarea>
+    <div class="frow" style="margin-top:10px">
+      <button onclick="doCite()" id="btnCite">推荐文献</button>
+      <select id="fmt"><option value="bibtex">BibTeX</option><option value="ris">RIS (EndNote)</option>
+        <option value="gbt7714">GB/T 7714</option><option value="ieee">IEEE</option></select>
+      <button class="ghost" onclick="doExport()">导出已勾选</button>
+      <span class="mkt" id="selCount">已勾选 0 篇</span>
+    </div>
+    <div class="note" id="citeNote"></div>
+    <div id="citeList"></div>
+    <div id="exportBox"></div>
+  </div>
+</div></div>
+<!-- ═══ 写作流水线（二期多 Agent）═══ -->
+<div class="view" id="view-pipeline"><div class="panel" style="max-width:960px">
+  <h2>写作流水线（多 Agent）</h2>
+  <p class="desc">选题 → 大纲 → 逐节撰写（⇄ 文献白名单）→ 润色 → 机械终检。两个人工检查点（定题、改纲）；每条 [n] 引用须通过证据句机械回取校验，点角标可看原文；节级内容寻址缓存让改一节只重算一节。不生成实验数据，无证据处如实标「待补证据」。</p>
+  <div class="box">
+    <textarea id="wrTopic" rows="2" placeholder="课题描述（选题 Agent 的输入），例如：大模型 Agent 的评测方法研究现状与缺口……"></textarea>
+    <div class="frow" style="margin-top:10px">
+      <label>目标字数</label><input type="number" id="wrWords" value="3000" min="500" max="20000" style="width:90px">
+      <label>重写上限/节</label><input type="number" id="wrRewrites" value="2" min="0" max="3" style="width:60px">
+      <button onclick="wrCreate()" id="btnWr">创建并选题</button>
+    </div>
+    <div class="note" id="wrNote"></div>
+  </div>
+  <div id="wrDetail"></div>
+  <div class="box" style="margin-top:16px">
+    <b style="font-size:13.5px">历史写作任务</b>
+    <button class="ghost" style="padding:2px 12px;font-size:12px;margin-left:10px" onclick="wrList()">刷新</button>
+    <div id="wrRuns" style="margin-top:8px"><p class="desc">还没有写作任务。</p></div>
+  </div>
+</div></div>
+
+<!-- ═══ 课题工作区：项目 / 笔记 / 文档 ═══ -->
+<div class="view" id="view-space"><div class="panel" style="max-width:1000px">
+  <h2>课题工作区</h2>
+  <p class="desc">按课题归拢笔记与文稿：笔记可挂到具体文献上，文稿可挂来源（论文 + 页码 + 原句），AI 写作只在挂上的文献范围内取证。这些数据一直存在库里，之前只有 API 没有界面。</p>
+  <div class="box">
+    <div class="frow">
+      <input type="text" id="spName" placeholder="新课题名称，例如：XL-MIMO 近场信道估计" style="flex:1;min-width:220px">
+      <input type="text" id="spTopic" placeholder="课题关键词（选填，供检索）" style="flex:1;min-width:180px">
+      <button onclick="spCreateProject()">新建课题</button>
+    </div>
+    <div class="note" id="spNote"></div>
+  </div>
+  <div class="box" style="margin-top:14px">
+    <b style="font-size:13.5px">我的课题</b>
+    <button class="ghost" style="padding:2px 12px;font-size:12px;margin-left:10px" onclick="spLoadProjects()">刷新</button>
+    <div id="spProjects" style="margin-top:8px"><p class="desc">还没有课题。</p></div>
+  </div>
+  <div id="spDetail"></div>
+</div></div>
+
+<!-- ═══ 引文网络：阅读缺口 / 相关推荐 ═══ -->
+<div class="view" id="view-graph"><div class="panel" style="max-width:1000px">
+  <h2>引文网络</h2>
+  <p class="desc">从数据源顺带把 references / citations 拉成边，边用归一化主键存——库外论文日后被正常检索入库时会自动接上。有了边就能算两件检索算不出来的事：<b>阅读缺口</b>（被你库里多篇引用、自己却不在库里的论文）与<b>相关推荐</b>（共被引 + 文献耦合，不是词面相似）。全部纯读库，不调 LLM。</p>
+  <div class="box">
+    <div class="frow">
+      <label>拉取被引最高的前</label>
+      <input type="number" id="gfLimit" value="20" min="1" max="200" style="width:70px">
+      <label>篇，每篇最多</label>
+      <input type="number" id="gfPer" value="60" min="10" max="500" style="width:70px">
+      <label>条边</label>
+      <button onclick="gfFetch()" id="btnGf">拉引文边（联网）</button>
+      <button class="ghost" onclick="gfLoad()">刷新</button>
+    </div>
+    <div class="note" id="gfNote"></div>
+    <div id="gfStats" style="margin-top:8px"></div>
+  </div>
+  <div class="box" style="margin-top:14px">
+    <b style="font-size:13.5px">阅读缺口</b>
+    <span class="mkt"> · 被库内论文引用最多、但自己不在库里的文献</span>
+    <div id="gfGaps" style="margin-top:8px"><p class="desc">先拉引文边。</p></div>
+  </div>
+  <div class="box" style="margin-top:14px">
+    <div class="frow">
+      <input type="text" id="gfSeed" placeholder="种子论文 id，逗号分隔（如 146,355）" style="flex:1;min-width:200px">
+      <button class="ghost" onclick="gfRelated()">找相关论文</button>
+    </div>
+    <div id="gfRelated" style="margin-top:8px"><p class="desc">填几篇种子论文，用共被引与文献耦合找它们的邻居。</p></div>
+  </div>
+</div></div>
+
+<!-- ═══ 新论文订阅 ═══ -->
+<div class="view" id="view-feed"><div class="panel" style="max-width:1000px">
+  <h2>新论文订阅</h2>
+  <p class="desc">从你库里的论文反推「兴趣画像」，给 arXiv 新提交的论文打分。<b>打分确定性、0 次模型调用，每条都说明为什么推给你</b>：命中了画像里哪些词、在标题还是摘要、那个词有没有区分度（批内 IDF）。只命中一个泛词的会被降权并标「弱」。已在库的、最近推过的、你标过「不感兴趣」的都不再出现。</p>
+  <div class="box">
+    <div class="frow">
+      <label>回看</label><input type="number" id="fdDays" value="3" min="1" max="30" style="width:64px"><label>天</label>
+      <label>取前</label><input type="number" id="fdTopK" value="15" min="1" max="50" style="width:64px"><label>篇</label>
+      <input type="text" id="fdCats" placeholder="arXiv 分类（留空则从画像猜），如 cs.CL,eess.SP" style="flex:1;min-width:200px">
+      <label title="对前若干条加一层模型判断，失败不影响主流程"><input type="checkbox" id="fdLlm"> 模型重排</label>
+      <button onclick="fdRun()" id="btnFd">生成摘报</button>
+    </div>
+    <div class="note" id="fdNote"></div>
+    <div id="fdProfile" style="margin-top:8px"></div>
+  </div>
+  <div class="box" style="margin-top:14px">
+    <b style="font-size:13.5px">最近摘报</b>
+    <button class="ghost" style="padding:2px 12px;font-size:12px;margin-left:10px" onclick="fdLoad()">刷新</button>
+    <div id="fdDigests" style="margin-top:8px"></div>
+  </div>
+  <div id="fdItems"></div>
+</div></div>
+</main>
+
+<!-- 详情弹窗 -->
+<div class="overlay" id="ov"><div class="modal">
+  <button class="x" onclick="closeModal()">✕</button>
+  <div id="modalBody"></div>
+</div></div>
+
+<script>
+const $=id=>document.getElementById(id);
+const esc=s=>(s??'').toString().replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+/* ── 访问口令：让 PAPERNEST_API_KEY 这把锁真的能开起来 ──
+   服务端的鉴权中间件一直是好的，但这个页面此前 30 处 fetch 加 1 处 EventSource
+   一个都不带 key——于是「设了 key 界面全线 401、不设就裸奔」，这道锁事实上不可启用。
+   这里包一层 window.fetch 与 EventSource，所有 /api/ 请求自动带上口令：
+   - fetch 走 x-api-key 请求头（不进访问日志）
+   - EventSource **不能设请求头**，只能拼 ?api_key=，因此仅在确有口令时才拼
+   口令存 localStorage（每个浏览器各存各的，不随代码分发）。401 时弹一次输入框并重试。 */
+const PN_KEY='papernest_api_key';
+const pnKey=()=>{try{return localStorage.getItem(PN_KEY)||'';}catch(e){return '';}};
+const pnSetKey=v=>{try{v?localStorage.setItem(PN_KEY,v):localStorage.removeItem(PN_KEY);}catch(e){}};
+function pnAskKey(msg){
+  const v=prompt(msg||'该服务需要访问口令（服务端 PAPERNEST_API_KEY）：',pnKey()||'');
+  if(v===null) return null;            // 用户取消：不重试，也不清掉已有口令
+  pnSetKey(v.trim()); return v.trim();
+}
+function pnIsApi(u){
+  try{ return new URL(u,location.href).pathname.startsWith('/api/'); }catch(e){ return false; }
+}
+/* 浏览器**自己**发起的加载——<img src>、<iframe src>、<a href> 的顶层导航——
+   不经过 window.fetch，包装器碰不到它们，也没法给它们设请求头。
+   这类 URL 只能把口令拼进 query。设了口令却不拼，PDF 阅读视图与「跳到第 N 页」
+   的证据链会整条 401，而 <img> 的 onerror 会把它显示成「这一页取不到」，
+   看起来像渲染 bug 而不是鉴权失败。 */
+function pnUrl(u){
+  const k=pnKey();
+  if(!k||!pnIsApi(u)) return u;
+  return u+(u.indexOf('?')<0?'?':'&')+'api_key='+encodeURIComponent(k);
+}
+(function(){
+  const rawFetch=window.fetch.bind(window);
+  let asking=null;                     // 并发 401 只弹一次输入框
+  window.fetch=async function(input,init){
+    const url=(typeof input==='string')?input:(input&&input.url)||'';
+    if(!pnIsApi(url)) return rawFetch(input,init);
+    const send=k=>{
+      const o=Object.assign({},init||{});
+      o.headers=new Headers((init&&init.headers)||(typeof input!=='string'&&input.headers)||{});
+      if(k) o.headers.set('x-api-key',k);
+      return rawFetch(typeof input==='string'?input:input.url,o);
+    };
+    let r=await send(pnKey());
+    if(r.status===401){
+      if(!asking) asking=Promise.resolve(pnAskKey('访问被拒（401）。请输入服务端设置的 PAPERNEST_API_KEY：'))
+                                 .finally(()=>{asking=null;});
+      const k=await asking;
+      if(k) r=await send(k);
+    }
+    return r;
+  };
+  const RawES=window.EventSource;
+  window.EventSource=function(url,cfg){
+    const k=pnKey();
+    if(k&&pnIsApi(url)) url+=(url.indexOf('?')<0?'?':'&')+'api_key='+encodeURIComponent(k);
+    return new RawES(url,cfg);
+  };
+  window.EventSource.prototype=RawES.prototype;
+})();
+
+/* ── 视图切换 ── */
+function showView(v){
+  for(const x of ['chat','agent','search','cite','write','pipeline','space','graph','feed']){
+    $('view-'+x).classList.toggle('on',x===v);
+    const b=$('nav-'+x); if(b) b.classList.toggle('on',x===v);
+  }
+  if(v==='search') doLibSearch();
+  if(v==='agent') loadAgentRuns();
+  if(v==='pipeline') wrList();
+  if(v==='space') spLoadProjects();
+  if(v==='graph') gfLoad();
+  if(v==='feed') fdLoad();
+}
+function subTab(t){
+  for(const x of ['fetch','local','lib','sym']){
+    $('st-'+x).classList.toggle('on',x===t);
+    $('pane-'+x).classList.toggle('on',x===t);
+  }
+  if(t==='sym') loadSymbols();
+}
+
+/* ── 统计 ── */
+async function loadStats(){
+  const s=await (await fetch('/api/stats')).json();
+  $('hstats').innerHTML=`<span>文献 <b>${s.papers_total}</b></span><span>L2 精读 <b>${s.level_counts.L2}</b></span>`+
+    `<span>向量 <b>${s.vectors}</b></span><span>LLM <b>${s.llm_calls}</b> 次</span>`+
+    (s.cost_usd?`<span>cost <b>$${(+s.cost_usd).toFixed(4)}</b></span>`:'');
+}
+
+/* ── 异步任务：提交 + SSE 进度 ── */
+function sseJob(jobId,onJob){return new Promise((resolve,reject)=>{
+  const es=new EventSource('/api/jobs/'+jobId+'/events');
+  let settled=false;
+  const fin=j=>{ if(settled)return; settled=true; es.close(); (j.status==='done')?resolve(j):reject(new Error(j.error||'任务失败')); };
+  es.addEventListener('job',e=>{ const j=JSON.parse(e.data); onJob&&onJob(j);
+    if(j.status==='done'||j.status==='failed') fin(j); });
+  es.onerror=()=>{ if(settled)return;   // 流意外断开：退化为一次性轮询
+    fetch('/api/jobs/'+jobId).then(r=>r.json()).then(fin)
+      .catch(()=>{ if(!settled){settled=true;es.close();reject(new Error('进度连接中断'));} }); };
+});}
+async function submitJob(kind,params,onJob){
+  const r=await (await fetch('/api/jobs',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({kind,params})})).json();
+  if(r.error||r.detail) throw new Error(r.error||r.detail||'任务提交失败');
+  return await sseJob(r.job_id,onJob);
+}
+
+/* ── 对话（主页，SSE 流式）──
+   session_id 交给服务端：历史与每轮来源落库，刷新不丢；会话内 [n] 编号固定指同一篇。
+   本地只留 sessionStorage 一份 id，清掉即新会话。 */
+const hist=[];
+let chatSession = (()=>{ try{ return sessionStorage.getItem('pn_chat')||''; }catch(_){ return ''; } })();
+function setChatSession(id){
+  if(!id||id===chatSession) return;
+  chatSession=id;
+  try{ sessionStorage.setItem('pn_chat',id); }catch(_){}
+}
+function newChat(){
+  chatSession='';
+  try{ sessionStorage.removeItem('pn_chat'); }catch(_){}
+  hist.length=0;
+  $('chat').innerHTML='<div id="chatAnchor"></div>';
+  $('hero').style.display='';
+  note('fetchNote','已开始新对话（上一段对话仍保存在服务端）');
+}
+async function chatHistory(){
+  try{
+    const {sessions}=await spApi('/api/chat/sessions?limit=30');
+    $('modalBody').innerHTML=`<h3>历史对话</h3>
+      <p class="mkt">历史与每轮实际引用的文献都存在服务端，点「继续」可接着聊（[n] 编号仍指向同一篇论文）。</p>
+      ${sessions.length?sessions.map(s=>`
+        <div class="cand">
+          <b>${esc(s.title||'（无标题）')}</b>
+          <span class="mkt"> · ${s.n} 条 · ${esc(s.updated_at||'')}</span>
+          <div class="bar" style="margin-top:6px">
+            <button class="ghost" onclick="chatResume('${s.id}')">继续这段对话</button>
+            <button class="ghost" onclick="chatDelete('${s.id}',this)">删除</button>
+          </div>
+        </div>`).join(''):'<p class="desc">还没有历史会话。</p>'}`;
+    $('ov').classList.add('on');
+  }catch(e){ alert('加载历史失败：'+e.message); }
+}
+
+async function chatResume(id){
+  try{
+    const s=await spApi('/api/chat/sessions/'+id);
+    setChatSession(id);
+    hist.length=0;
+    $('chat').innerHTML='<div id="chatAnchor"></div>';
+    $('hero').style.display='none';
+    for(const m of s.messages||[]){
+      hist.push({role:m.role,content:m.content});
+      if(m.role==='user'){ pushMsg('user',m.content); continue; }
+      const d=document.createElement('div'); d.className='msg bot';
+      const src=(m.sources||[]).map(x=>`<a onclick="openPaper(${x.paper_id})">[${x.idx}] ${esc(x.title)}</a>`).join('<br>');
+      d.innerHTML=esc(m.content).replace(/\[(\d{1,2})\]/g,'<sup class="cite">$1</sup>')
+        +(src?`<div class="src">来源：<br>${src}</div>`:'');
+      $('chat').appendChild(d);
+    }
+    scrollChat(); closeModal(); showView('chat');
+  }catch(e){ alert('恢复会话失败：'+e.message); }
+}
+
+async function chatDelete(id,btn){
+  if(!confirm('删除这段对话？服务端记录一并删除，不可恢复。')) return;
+  try{
+    await spApi('/api/chat/sessions/'+id,{method:'DELETE'});
+    if(chatSession===id) newChat();
+    btn.closest('.cand').remove();
+  }catch(e){ alert('删除失败：'+e.message); }
+}
+
+function askBy(t){ $('chatIn').value=t; doChat(); }
+async function doChat(){
+  const q=$('chatIn').value.trim(); if(!q) return;
+  $('chatIn').value=''; $('hero').style.display='none';
+  pushMsg('user',q); hist.push({role:'user',content:q});
+  const {el,done}=pushThinking();
+  let raw='', sources=[], degraded='';
+  const render=(streaming)=>{
+    const body=esc(raw).replace(/\[(\d{1,2})\]/g,'<sup class="cite">$1</sup>');
+    const src=(streaming&&sources.length)
+      ? `<div class="src">已检索 ${sources.length} 篇相关文献，正在组织回答…</div>`:'';
+    el.innerHTML=`${body}${src}${degraded?`<div class="src">⚠ ${esc(degraded)}</div>`:''}`;
+    scrollChat();
+  };
+  try{
+    const resp=await fetch('/api/chat/stream',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({messages:hist.slice(-12), session_id:chatSession})});
+    if(!resp.ok){ const e=await resp.json().catch(()=>({})); done('请求失败：'+(e.detail||resp.status)); return; }
+    const reader=resp.body.getReader(); const dec=new TextDecoder();
+    let buf='';
+    const handle=block=>{
+      let ev='message', data='';
+      for(const line of block.split('\n')){
+        if(line.startsWith('event: ')) ev=line.slice(7).trim();
+        else if(line.startsWith('data: ')) data+=line.slice(6);
+      }
+      if(!data) return;
+      let j; try{ j=JSON.parse(data); }catch(_){ return; }
+      if(ev==='sources'){ sources=j.sources||[]; degraded=j.degraded||''; setChatSession(j.session_id); render(true); }
+      else if(ev==='delta'){ raw+=j.t; render(true); }
+      else if(ev==='error'){ raw+=(raw?'\n\n':'')+'⚠ '+j.error; }
+      else if(ev==='done'){
+        const src=(sources||[]).map(s=>`<a onclick="openPaper(${s.paper_id})">[${s.idx}] ${esc(s.title)}（${esc(s.venue||'')} ${s.year||''}）</a>`).join('<br>');
+        hist.push({role:'assistant',content:j.answer||raw});
+        done(`${esc(j.answer||raw).replace(/\[(\d{1,2})\]/g,'<sup class="cite">$1</sup>')}${src?`<div class="src">来源（点击查看详情）：<br>${src}</div>`:''}${(j.degraded||degraded)?`<div class="src">⚠ ${esc(j.degraded||degraded)}</div>`:''}`);
+      }
+    };
+    while(true){
+      const {done:d, value}=await reader.read();
+      if(d) break;
+      buf+=dec.decode(value,{stream:true});
+      let idx;
+      while((idx=buf.indexOf('\n\n'))>=0){ handle(buf.slice(0,idx)); buf=buf.slice(idx+2); }
+    }
+  }catch(e){ done('请求失败：'+e); }
+  loadStats();
+}
+function pushMsg(role,text){
+  const d=document.createElement('div'); d.className='msg '+role; d.textContent=text;
+  $('chat').appendChild(d); scrollChat(); return d;
+}
+function pushThinking(){
+  const d=document.createElement('div'); d.className='msg bot';
+  d.innerHTML='<span class="spin"></span>正在检索文献库并组织回答…';
+  $('chat').appendChild(d); scrollChat();
+  return {el:d, done:t=>{d.innerHTML=t; scrollChat();}};
+}
+function scrollChat(){ const c=$('chat'); c.scrollTop=c.scrollHeight; }
+
+/* ── 课题综述（网页 LLM 做不到：基于私有库 + 逐句证据核验）── */
+async function doSurvey(){
+  const t=$('chatIn').value.trim();
+  if(!t){ alert('先在下方输入课题关键词（如：XL-MIMO 波束训练），再点「生成课题综述」'); return; }
+  $('chatIn').value=''; $('hero').style.display='none';
+  pushMsg('user', '生成课题综述：'+t);
+  const {el,done}=pushThinking();
+  try{
+    const j=await submitJob('survey',{topic:t,top_k:10},
+      job=>{ el.innerHTML=`<span class="spin"></span>【${esc(job.stage||'')}】${esc(job.message||'生成中…')}`; });
+    const r=j.result;
+    const html=esc(r.survey).replace(/\[(\d{1,2})\]/g,'<sup class="cite">$1</sup>');
+    const src=(r.sources||[]).map(s=>`<a onclick="openPaper(${s.paper_id})">[${s.idx}] ${esc(s.title)}</a>`).join('<br>');
+    const bad=(r.checks||[]).filter(c=>c.ok===false).map(c=>`<li>${esc(c.claim)}…（相关度 ${c.score}）</li>`).join('');
+    done(`${html}<div class="src">✓ ${esc(r.verified_summary||'')}${bad?`<br><b>未通过核验的论断：</b><ul style="margin:4px 0 0 18px">${bad}</ul>`:''}<br><br>来源：<br>${src}</div>`);
+  }catch(e){ done('综述生成失败：'+e.message); }
+  loadStats();
+}
+
+/* ── Research Agent：计划预览 / 执行 / 时间线 / 历史回放 ── */
+function timelineHTML(plan,events){
+  const byStep={};
+  (events||[]).forEach(e=>{ (byStep[e.step_id]=byStep[e.step_id]||[]).push(e); });
+  const chipFor=st=>st==='completed'?'<span class="chip ok">✓ 完成</span>'
+    :st==='failed'?'<span class="chip bad">✗ 失败</span>'
+    :st==='timeout'?'<span class="chip bad">⏱ 超时</span>'
+    :st==='running'?'<span class="chip warn">↻ 重试中</span>':'<span class="chip">· 未执行</span>';
+  return `<div class="tl">`+(plan||[]).map(p=>{
+    const evs=byStep[p.id]||[];
+    const last=evs.length?evs[evs.length-1]:null;
+    const st=last?last.status:'planned';
+    const retries=evs.filter(e=>e.attempt>1).length;
+    return `<div class="tlstep ${st}">
+      <span class="dot"></span>
+      <div class="head"><span class="tool">${esc(p.tool)}</span>${chipFor(st)}
+        ${last?`<span class="lat">${last.latency_ms}ms</span>`:''}
+        ${retries?`<span class="chip warn">重试 ${retries} 次</span>`:''}</div>
+      <div class="why">${esc(p.reason)}</div>
+      ${last&&last.summary?`<div class="mkt">${esc(last.summary)}</div>`:''}
+      ${last&&last.error?`<div class="err">${esc(last.error)}</div>`:''}
+    </div>`;}).join('')+`</div>`;
+}
+function renderAgentRun(r){
+  const head=`<div class="box"><div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+    <b>run ${esc((r.run_id||'').slice(0,8))}</b>
+    <span class="chip ${r.status==='completed'?'ok':(r.status==='failed'||r.status==='timeout'?'bad':'warn')}">${esc(r.status)}</span>
+    ${r.total_ms?`<span class="lat">总耗时 ${r.total_ms}ms</span>`:''}
+    ${r.degraded?`<span class="chip warn">有降级</span>`:''}</div>
+    <div class="why">${esc(r.goal)}</div>
+    ${timelineHTML(r.plan,r.events)}</div>`;
+  let body='';
+  if(r.answer){
+    const html=esc(r.answer).replace(/\[(\d{1,2})\]/g,'<sup class="cite">$1</sup>');
+    const src=(r.sources||[]).map(s=>`<a onclick="openPaper(${s.paper_id})">[${s.idx??'?'}] ${esc(s.title||'')}</a>`).join('<br>');
+    body=`<div class="msg bot" style="max-width:none">${html}
+      ${src?`<div class="src">来源：<br>${src}</div>`:''}
+      ${r.degraded?`<div class="src">⚠ ${esc(r.degraded)}</div>`:''}
+      ${r.error?`<div class="src" style="color:var(--bad)">✗ ${esc(r.error)}</div>`:''}</div>`;
+  } else if(r.error){
+    body=`<div class="msg bot" style="max-width:none;color:var(--bad)">✗ ${esc(r.error)}</div>`;
+  }
+  return head+body;
+}
+async function agentPlan(){
+  const g=$('agentGoal').value.trim();
+  if(!g){ note('agentNote','先输入目标'); return; }
+  const r=await (await fetch('/api/agent/plan',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({goal:g,top_k:+$('agentTopk').value||5})})).json();
+  note('agentNote','Planner 路由结果（dry-run，未执行任何工具）：');
+  $('agentPlanBox').innerHTML=timelineHTML(r.plan,[]);
+}
+async function agentRun(){
+  const g=$('agentGoal').value.trim();
+  if(!g){ note('agentNote','先输入目标'); return; }
+  $('btnAgent').disabled=true;
+  note('agentNote','<span class="spin"></span>Agent 执行中…');
+  try{
+    const r=await (await fetch('/api/agent/run',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({goal:g,top_k:+$('agentTopk').value||5,timeout_s:+$('agentTimeout').value||240})})).json();
+    $('agentResult').innerHTML=renderAgentRun(r);
+    note('agentNote','');
+  }catch(e){ note('agentNote','✗ 执行失败：'+e.message); }
+  $('btnAgent').disabled=false;
+  loadAgentRuns();
+}
+async function loadAgentRuns(){
+  try{
+    const r=await (await fetch('/api/agent/runs?limit=10')).json();
+    $('agentRuns').innerHTML=(r.runs||[]).map(x=>`<div class="item" onclick="replayRun('${esc(x.run_id)}')">
+      <b>${esc(x.goal)}</b><span class="m">
+      <span class="chip ${x.status==='completed'?'ok':(x.status==='failed'?'bad':'warn')}">${esc(x.status)}</span>
+      <span>${esc(x.created_at)}</span><span>${x.total_ms||0}ms</span></span></div>`).join('')
+      ||'<p class="desc">还没有执行记录。</p>';
+  }catch(e){ $('agentRuns').innerHTML='<p class="desc">历史加载失败。</p>'; }
+}
+async function replayRun(id){
+  const r=await (await fetch('/api/agent/runs/'+id)).json();
+  $('agentResult').innerHTML=renderAgentRun(r);
+  $('view-agent').scrollIntoView({behavior:'smooth'});
+}
+
+/* ── 多关键词 tag ── */
+const kws=[];
+function addKw(){
+  const v=$('kwIn').value.trim(); if(!v) return;
+  v.split(/[,，;；\s]+/).filter(Boolean).forEach(k=>{ if(!kws.includes(k)) kws.push(k); });
+  $('kwIn').value=''; renderKw();
+}
+function renderKw(){
+  $('tagbox').querySelectorAll('.tag').forEach(t=>t.remove());
+  kws.forEach((k,i)=>{
+    const t=document.createElement('span'); t.className='tag';
+    t.innerHTML=`${esc(k)}<i onclick="delKw(${i})">✕</i>`;
+    $('tagbox').insertBefore(t,$('kwIn'));
+  });
+}
+function delKw(i){ kws.splice(i,1); renderKw(); }
+
+/* ── 检索采集（异步任务 + SSE 进度）── */
+async function doIngest(){
+  if(!kws.length){ note('fetchNote','先添加至少一个关键词'); return; }
+  $('btnFetch').disabled=true;
+  try{
+    const j=await submitJob('ingest',
+      {query:kws.join(' '), limit:+$('limit').value||20,
+       year_from:+$('yFrom').value||null, year_to:+$('yTo').value||null},
+      job=>{ note('fetchNote',`<b>${esc(job.stage||'')}</b> ${esc(job.message||'')}`+
+        `<div class="prog"><i style="width:${Math.round((job.progress||0)*100)}%"></i></div>`); });
+    const r=j.result;
+    note('fetchNote',
+      `来源 <b>${esc(r.source)}</b> ｜ 命中 <b>${r.results}</b> 篇`+
+      (r.year_filtered?` ｜ 年份筛掉 <b>${r.year_filtered}</b> 篇`:'')+
+      ` ｜ 新入库 <b>${r.new_papers}</b> ｜ 缓存命中 <b>${r.cache_hits}</b>（0 LLM）｜ 本轮 LLM <b>${r.llm_calls}</b> 次`+
+      (r.vectors_indexed?` ｜ 向量 <b>${r.vectors_indexed}</b>`:'')+
+      (r.cache_hits>0&&r.llm_calls===0?'　<b style="color:var(--ok)">✓ 二次查询零 LLM 调用</b>':''));
+    renderFetchList(r);
+  }catch(e){ note('fetchNote','✗ 采集失败：'+e.message); }
+  $('btnFetch').disabled=false;
+  await loadStats();
+}
+let lastFetchIds=[];
+function renderFetchList(r){
+  lastFetchIds=r;
+}
+
+/* ── 文献库 ── */
+async function doLibSearch(){
+  const p=new URLSearchParams({q:$('fs').value.trim(),limit:60});
+  if(+$('libFrom').value) p.set('year_from',$('libFrom').value);
+  if(+$('libTo').value) p.set('year_to',$('libTo').value);
+  const r=await (await fetch('/api/papers?'+p)).json();
+  $('libList').innerHTML = r.papers.map(p=>{
+    const lv=p.level>=2?'<span class="badge ok">L2 精读</span>':
+      (p.card_model&&p.card_model!=='mock-extractive'?'<span class="badge acc">L1</span>':'<span class="badge">mock</span>');
+    return `<div class="item"><label style="display:flex;gap:8px;align-items:flex-start;cursor:pointer">
+      <input type="checkbox" ${libSel.has(p.id)?'checked':''} onchange="togSelLib(${p.id},this.checked)"
+             onclick="event.stopPropagation()" style="margin-top:4px;width:auto">
+      <span style="flex:1" onclick="openPaper(${p.id})"><b>${esc(p.title)}</b>
+      <span class="m">${esc(p.venue||'')} ${p.year||''} · 被引 ${p.citation_count??'-'} ${lv}
+      ${p.has_pages?'<span class="badge acc">全文</span>':''}</span></span></label></div>`;}).join('')
+    || '<p class="desc">没有匹配的文献。</p>';
+}
+
+/* ── 方法对比表 ── */
+const libSel = new Set();
+function togSelLib(id,on){ on?libSel.add(id):libSel.delete(id); $('cmpN').textContent=libSel.size; }
+async function doCompare(){
+  if(libSel.size<2){ alert('先在列表勾选至少 2 篇文献'); return; }
+  note('fetchNote','对比表生成中…（重档模型，约 20-40 秒）');
+  try{
+    const r=await (await fetch('/api/table',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({paper_ids:[...libSel]})})).json();
+    if(r.error){ note('fetchNote','✗ '+r.error); return; }
+    $('modalBody').innerHTML=`<h3>方法对比表（${libSel.size} 篇）</h3>
+      <p class="mkt">内容来自库内结构化卡片，缺项写「—」；LaTeX 可直接粘贴进 Overleaf。</p>
+      <p class="mkt"><b>Markdown</b></p><pre class="fmt">${esc(r.markdown||'')}</pre>
+      <p class="mkt"><b>LaTeX</b></p><pre class="fmt">${esc(r.latex||'（无）')}</pre>`;
+    $('ov').classList.add('on');
+  }catch(e){ note('fetchNote','✗ '+e); }
+}
+
+/* ── 结构化对比矩阵 ── */
+async function doMatrix(useLlm){
+  if(libSel.size<2){ alert('先在列表勾选至少 2 篇文献'); return; }
+  note('fetchNote','抽取中…'+(useLlm?'（LLM 增强：每篇一次调用）':'（离线确定性抽取，0 token）'));
+  try{
+    const m=await spApi('/api/matrix', spJson('POST',
+      {paper_ids:[...libSel], use_llm: useLlm===undefined?null:useLlm}));
+    const cols=m.columns||[];
+    const head=['文献','年份'].concat(cols.map(c=>esc(c.label||c.key)));
+    const rows=(m.rows||[]).map(r=>{
+      const cells=cols.map(c=>{
+        const cell=(r.cells||{})[c.key]||{};
+        if(!cell.value) return `<td class="mkt">—</td>`;
+        const mark = cell.page ? `<span class="chip ok">p.${cell.page}</span>`
+                   : (cell.verified ? '' : `<span class="chip warn">未核验</span>`);
+        const full=esc(cell.value);
+        const short=cell.value.length>140?esc(cell.value.slice(0,140))+'…':full;
+        return `<td title="${full}">${short} ${mark}</td>`;
+      }).join('');
+      return `<tr><td><a onclick="openPaper(${r.paper_id})">${esc(r.title||'')}</a></td>`
+        +`<td>${r.year||''}</td>${cells}</tr>`;
+    }).join('');
+    const vr = m.verified_rate==null ? '—' : Math.round(m.verified_rate*100)+'%';
+    $('modalBody').innerHTML=`<h3>文献对比矩阵（${(m.rows||[]).length} 篇）</h3>
+      <p class="mkt">格子鼠标悬停看完整内容。<b>空格 = 原文未覆盖，不是遗漏</b>——PaperNest 不编造缺失内容；
+        <span class="chip ok">p.N</span> 是依据句所在页，<span class="chip warn">未核验</span> 表示没通过原文机械回取校验。</p>
+      <div class="frow" style="margin:8px 0">
+        <span class="chip">覆盖率 ${Math.round((m.coverage||0)*100)}%</span>
+        <span class="chip">机械核验率 ${vr}</span>
+        <button class="ghost" onclick="doMatrix(false)">离线重算</button>
+        <button class="ghost" onclick="doMatrix(true)">LLM 增强抽取</button>
+        <button class="ghost" onclick="matrixExport('csv')">导出 CSV</button>
+        <button class="ghost" onclick="matrixExport('latex')">导出 LaTeX</button>
+      </div>
+      ${m.degraded?`<div class="note">⚠ ${esc(Array.isArray(m.degraded)?m.degraded.join('；'):m.degraded)}</div>`:''}
+      <div style="overflow-x:auto"><table class="mx">
+        <tr>${head.map(h=>`<th>${h}</th>`).join('')}</tr>${rows}</table></div>
+      ${(m.errors||[]).map(e=>`<div class="mkt">⚠ ${esc(e)}</div>`).join('')}`;
+    $('ov').classList.add('on');
+  }catch(e){ note('fetchNote','✗ '+e.message); }
+}
+
+async function matrixExport(fmt){
+  try{
+    const r=await fetch('/api/matrix',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({paper_ids:[...libSel], use_llm:null, fmt})});
+    const text=await r.text();
+    const blob=new Blob([text],{type:'text/plain;charset=utf-8'});
+    const a=document.createElement('a');
+    a.href=URL.createObjectURL(blob);
+    a.download=`papernest-matrix.${fmt==='latex'?'tex':fmt}`;
+    a.click(); URL.revokeObjectURL(a.href);
+  }catch(e){ alert('导出失败：'+e); }
+}
+
+/* ── 符号大全 ── */
+async function loadSymbols(){
+  const p=new URLSearchParams({q:$('symQ').value.trim(),kind:$('symKind').value});
+  const r=await (await fetch('/api/symbols?'+p)).json();
+  $('symList').innerHTML = r.items.map(it=>{
+    const ms=(it.meanings||[]).map(m=>`<div class="mkt">· ${esc(m.meaning)} —— <a onclick="openPaperByName('${esc(m.paper)}')">${esc(m.paper)}</a> ${m.year||''} p${m.page}</div>`).join('');
+    const badge = it.kind==='builtin' ? `<span class="badge acc">内置 · ${esc(it.cat||'')}</span>`
+                : `<span class="badge">${it.kind==='abbrev'?'缩写':'论文符号'}</span>`;
+    const name = it.name ? `<span class="mkt">${esc(it.name)}</span>` : '';
+    return `<div class="cand">
+      <b style="font-size:15px">${esc(it.sym)}</b> ${badge} ${name}
+      ${it.latex?`<button class="ghost" style="padding:2px 10px;font-size:12px;margin-left:8px" onclick="navigator.clipboard.writeText('${esc(it.latex).replace(/'/g, '&#39;')}').then(()=>this.textContent='已复制 LaTeX')">复制 LaTeX</button>`:''}
+      <div class="mkt">${it.latex?`<code>${esc(it.latex)}</code>`:''}</div>
+      ${ms}
+    </div>`;}).join('')
+    || '<p class="desc">没有匹配的符号。</p>';
+}
+async function doExtractSym(id){
+  note('readNote','符号抽取中…（flash 模型，约 20 秒）');
+  const r=await (await fetch(`/api/paper/${id}/symbols`,{method:'POST'})).json();
+  if(r.error){ note('readNote','✗ '+r.error); return; }
+  note('readNote',`✓ 抽取 ${r.count} 条符号/缩写，已入「符号大全」`);
+}
+
+/* ── 打开符号来源论文（按标题匹配库内检索）── */
+async function openPaperByName(title){
+  $('fs').value=title.slice(0,30);
+  subTab('lib'); doLibSearch();
+}
+
+/* ── 详情弹窗 ── */
+async function openPaper(id){
+  const p=await (await fetch('/api/paper/'+id)).json();
+  const c=p.card||{};
+  const kw=(c.keywords||[]).map(k=>`<span class="kw">${esc(k)}</span>`).join('');
+  // 页码做成可点：直接把内嵌阅读器跳到那一页，证据不用再靠人肉翻
+  const pageChip=(pg)=> p.has_pdf && Number.isFinite(+pg)
+    ? `<a class="${''}" style="cursor:pointer" onclick="pdfGoto(${p.id},${+pg})">第${esc(pg)}页 ↗</a>`
+    : `第${esc(pg)}页`;
+  const fs=(c.key_findings||[]).map(f=>`<div class="finding"><span class="${f.verified?'v':'u'}">${f.verified?'✓':'?'} ${pageChip(f.page)}</span> ${esc(f.claim)}</div>`).join('');
+  const rows=[['TL;DR',c.tldr],['问题',c.problem],['方法',c.method],['结果',c.results],
+              ['局限',c.limitations],['与我课题',c.relation_to_topic]].filter(([,v])=>v)
+    .map(([k,v])=>`<div class="krow"><span class="k">${k}：</span>${esc(v)}</div>`).join('');
+  $('modalBody').innerHTML=`<h3>${esc(p.title)}</h3>
+    <div class="meta">${(p.authors||[]).join(', ')} ｜ ${esc(p.venue||'')} ${p.year||''} ｜ 被引 ${p.citation_count??'-'} ｜
+      ${p.level>=2?'<span class="badge ok">L2 精读</span>':`<span class="badge acc">L${p.level}</span>`}
+      ${p.card_model==='mock-extractive'?'<span class="badge">mock 卡</span>':''}
+      ${p.oa_pdf_url?`｜ <a href="${esc(p.oa_pdf_url)}" target="_blank">PDF ↗</a>`:'｜ 无 OA PDF'}</div>
+    <div class="bar">
+      <button class="ghost" onclick="doRead(${p.id})">${p.level>=2?'重新精读':'L2 全文精读'}</button>
+      ${p.has_pdf?`<button class="ghost" onclick="pdfToggle(${p.id})" id="btnPdf">阅读原文</button>`:''}
+      <button class="ghost" onclick="doExtractSym(${p.id})">抽取符号</button>
+      <button class="ghost" onclick="exportIds([${p.id}])">导出引用</button>
+      <button class="ghost" onclick="doPpt([${p.id}])">生成汇报 PPT</button>
+    </div>
+    <div class="note" id="readNote"></div>
+    <div id="pdfBox"></div>
+    ${rows?`<div style="margin-top:10px">${rows}</div>`:''}
+    ${p.abstract?`<div class="krow" style="margin-top:8px"><span class="k">摘要：</span>${esc(p.abstract)}</div>`:''}
+    ${fs?`<div class="krow"><span class="k">关键结论（✓=机械核验通过）：</span>${fs}</div>`:''}
+    ${c._verified_summary?`<p class="mkt">${esc(c._verified_summary)}</p>`:''}
+    ${kw?`<div style="margin-top:6px">${kw}</div>`:''}
+    <div id="modalExport"></div>`;
+  $('ov').classList.add('on');
+}
+/* ── 内嵌 PDF 阅读器 ──
+   用浏览器自带的 PDF 查看器 + `#page=N` 片段跳页，不引第三方 PDF 库。
+   证据句仍显示在旁边：`#search=` 各家浏览器支持不一致，不能靠它做高亮。 */
+/* 连续阅读用内嵌 iframe；「跳到第 N 页」用服务端渲染的整页图片。
+   不靠 `#page=N`：浏览器内置 PDF 查看器对它的支持各家不一，本项目内嵌环境实测不跳页，
+   而「点结论上的页码 → 看到那一页」是证据链要兑现的动作，不能建在不保证的行为上。 */
+function pdfToggle(id){
+  const box=$('pdfBox'), btn=$('btnPdf');
+  if(box.dataset.on==='pdf'){ box.innerHTML=''; box.dataset.on=''; if(btn) btn.textContent='阅读原文'; return; }
+  box.dataset.on='pdf'; if(btn) btn.textContent='收起原文';
+  box.innerHTML=`<iframe src="${pnUrl(`/api/paper/${id}/pdf`)}"
+    style="width:100%;height:70vh;border:1px solid var(--line);border-radius:10px;margin-top:10px"
+    title="论文原文"></iframe>`;
+}
+async function pdfGoto(id,page){
+  const box=$('pdfBox');
+  box.dataset.on='page';
+  const btn=$('btnPdf'); if(btn) btn.textContent='阅读原文';
+  box.innerHTML=`<div class="box" style="margin-top:10px">
+      <div class="frow" style="margin-bottom:8px">
+        <b style="font-size:13.5px">原文第 ${page} 页</b>
+        <button class="ghost" onclick="pdfGoto(${id},${Math.max(1,page-1)})">上一页</button>
+        <button class="ghost" onclick="pdfGoto(${id},${page+1})">下一页</button>
+        <button class="ghost" onclick="pdfToggle(${id})">整篇连读</button>
+        <a class="ghost" style="padding:4px 12px" href="${pnUrl(`/api/paper/${id}/page/${page}.png?dpi=200`)}"
+           target="_blank">大图 ↗</a>
+      </div>
+      <img src="${pnUrl(`/api/paper/${id}/page/${page}.png`)}" alt="第 ${page} 页"
+           style="width:100%;border:1px solid var(--line);border-radius:8px"
+           onerror="this.parentNode.querySelector('.note-img').style.display='block';this.style.display='none'">
+      <div class="note note-img" style="display:none">这一页取不到（PDF 可能已删除，或页码超出范围）</div>
+      <div id="pdfPageText" class="mkt" style="margin-top:8px;white-space:pre-wrap"></div>
+    </div>`;
+  box.scrollIntoView({behavior:'smooth',block:'nearest'});
+  // 顺带把该页入库的纯文本显示出来：证据句就是从这里机械回取的，对得上才算数
+  try{
+    const {pages}=await (await fetch(`/api/paper/${id}/pages`)).json();
+    const hit=(pages||[]).find(p=>p.page_no===page);
+    if(hit) $('pdfPageText').textContent=hit.text.slice(0,1200);
+  }catch(_){}
+}
+function closeModal(){
+  const box=$('pdfBox'); if(box){ box.innerHTML=''; box.dataset.on=''; }  // 关弹窗时停掉 PDF 渲染
+  $('ov').classList.remove('on');
+}
+$('ov').addEventListener('click',e=>{ if(e.target===$('ov')) closeModal(); });
+async function doRead(id){
+  note('readNote','精读任务已提交…');
+  try{
+    const j=await submitJob('read',{paper_id:id},
+      job=>{ note('readNote',`<b>${esc(job.stage||'')}</b> ${esc(job.message||'')}`+
+        `<div class="prog"><i style="width:${Math.round((job.progress||0)*100)}%"></i></div>`); });
+    const r=j.result;
+    if(r.error){ note('readNote','✗ '+r.error); return; }
+    note('readNote',`✓ 抽取 ${r.pages_stored} 页入库`+(r.card?`；${r.card._verified_summary||''}`:'；'+(r.note||'')));
+    if(r.card) openPaper(id);
+    loadStats();
+  }catch(e){ note('readNote','✗ 精读失败：'+e.message); }
+}
+async function exportIds(ids){
+  const r=await (await fetch('/api/export',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({paper_ids:ids,fmt:$('fmt').value})})).text();
+  $('modalExport').innerHTML=`<p class="mkt">${esc($('fmt').value)}（复制导入 EndNote / Zotero）</p><pre class="fmt">${esc(r)}</pre>`;
+  if($('modalBody').find===undefined) return;
+}
+
+/* ── 引用推荐 ── */
+const sel=new Set();
+async function doCite(){
+  const t=$('citeIn').value.trim(); if(!t) return;
+  sel.clear(); updSel(); $('exportBox').innerHTML='';
+  $('btnCite').disabled=true; $('citeList').innerHTML='<p class="desc">匹配中…</p>';
+  const r=await (await fetch('/api/cite',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({text:t,topk:6})})).json();
+  $('btnCite').disabled=false;
+  $('citeNote').style.display=r.degraded?'block':'none';
+  if(r.degraded) $('citeNote').textContent='（降级：'+r.degraded+'）';
+  $('citeList').innerHTML=r.candidates.map(c=>{
+    const st=c.strong?'<span class="vok">✓ 强推荐</span>':(c.verified?'<span class="vno">△ 弱相关</span>':'<span class="vno">× 证据未核</span>');
+    return `<div class="cand">
+      <label><input type="checkbox" onchange="togSel(${c.paper_id},this.checked)"> ${st} <b>${esc(c.title)}</b>（${esc(c.venue||'')} ${c.year||''}）</label>
+      ${c.evidence_sentence?`<div class="ev">支撑证据句${c.verified?'（已通过机械回取校验）':'（<b>未通过</b>校验）'}：<br>${esc(c.evidence_sentence)}</div>`:'<div class="ev">无句级证据（配置向量模型后可用）</div>'}
+      <span class="mkt">相关度 ${c.score}</span> · <a onclick="openPaper(${c.paper_id})">详情</a></div>`;}).join('')
+    || '<p class="desc">库内没有可推荐的文献——先去「文献检索」采集。</p>';
+}
+function togSel(id,on){ on?sel.add(id):sel.delete(id); updSel(); }
+function updSel(){ $('selCount').textContent=`已勾选 ${sel.size} 篇`; }
+async function doExport(){
+  if(!sel.size){ note('citeNote','先勾选至少一篇'); return; }
+  const r=await (await fetch('/api/export',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({paper_ids:[...sel],fmt:$('fmt').value})})).text();
+  $('exportBox').innerHTML=`<p class="mkt">已选 ${sel.size} 篇 → ${esc($('fmt').value)}（复制导入 EndNote / Zotero）</p><pre class="fmt">${esc(r)}</pre>`;
+}
+
+/* ── 写作台：润色 / 评审 / 汇报 PPT ── */
+async function doPolish(){
+  const t=$('wtText').value.trim();
+  if(!t){ note('wtNote','先粘贴文稿'); return; }
+  $('btnPolish').disabled=true; $('btnReview').disabled=true;
+  note('wtNote','<span class="spin"></span>润色任务已提交…');
+  try{
+    const j=await submitJob('polish',{text:t,instruction:$('wtInstr').value.trim(),paper_ids:[...libSel]},
+      job=>{ note('wtNote',`<b>${esc(job.stage||'')}</b> ${esc(job.message||'')}`+
+        `<div class="prog"><i style="width:${Math.round((job.progress||0)*100)}%"></i></div>`); });
+    renderPolish(j.result);
+    note('wtNote','');
+  }catch(e){ note('wtNote','✗ 润色失败：'+e.message); }
+  $('btnPolish').disabled=false; $('btnReview').disabled=false;
+}
+async function doReview(){
+  const t=$('wtText').value.trim();
+  if(!t){ note('wtNote','先粘贴文稿'); return; }
+  $('btnPolish').disabled=true; $('btnReview').disabled=true;
+  note('wtNote','<span class="spin"></span>评审任务已提交…');
+  try{
+    const j=await submitJob('review',{text:t,paper_ids:[...libSel]},
+      job=>{ note('wtNote',`<b>${esc(job.stage||'')}</b> ${esc(job.message||'')}`+
+        `<div class="prog"><i style="width:${Math.round((job.progress||0)*100)}%"></i></div>`); });
+    renderReview(j.result);
+    note('wtNote','');
+  }catch(e){ note('wtNote','✗ 评审失败：'+e.message); }
+  $('btnPolish').disabled=false; $('btnReview').disabled=false;
+}
+function renderPolish(r){
+  const src=(r.sources||[]).map(s=>`<a onclick="openPaper(${s.paper_id})">[${s.idx}] ${esc(s.title)}</a>`).join(' · ');
+  const chg=(r.changes||[]).map(c=>`<div class="cand"><span class="chip acc">${esc(c.type||'修改')}</span>
+    ${c.before?`<s style="color:var(--muted)">${esc(c.before)}</s> → <b>${esc(c.after)}</b>`:`<b>${esc(c.after||'')}</b>`}
+    <div class="mkt">${esc(c.reason||'')}</div></div>`).join('');
+  $('wtResult').innerHTML=`<div class="box">
+    <div style="display:flex;gap:8px;align-items:center"><b>润色结果</b>
+      <span class="chip ${r.model==='offline'?'warn':'ok'}">${esc(r.model||'')}</span>
+      <button class="ghost" style="padding:2px 12px;font-size:12px" onclick="navigator.clipboard.writeText(this.closest('.box').querySelector('pre').textContent).then(()=>this.textContent='已复制')">复制全文</button>
+      ${r.degraded?`<span class="chip warn">降级</span>`:''}</div>
+    ${r.degraded?`<div class="mkt" style="color:var(--warn)">${esc(r.degraded)}</div>`:''}
+    <pre class="fmt" style="max-height:420px">${esc(r.revised||'')}</pre>
+    ${src?`<p class="mkt">参照文献：${src}</p>`:''}
+    ${chg?`<p class="mkt" style="margin-top:10px"><b>修改说明（${(r.changes||[]).length} 条）：</b></p>${chg}`:''}
+  </div>`;
+}
+function renderReview(r){
+  const src=(r.sources||[]).map(s=>`<a onclick="openPaper(${s.paper_id})">[${s.idx}] ${esc(s.title)}</a>`).join(' · ');
+  const sevChip=s=>s==='major'?'<span class="chip bad">major</span>'
+    :s==='minor'?'<span class="chip warn">minor</span>':'<span class="chip">suggestion</span>';
+  const issues=(r.issues||[]).map(it=>`<div class="cand">${sevChip(esc(it.severity||'suggestion'))}
+    <b>${esc(it.location||'')}</b><div>${esc(it.problem||'')}</div>
+    <div class="mkt" style="color:var(--ok)">修改建议：${esc(it.fix||'')}</div></div>`).join('');
+  const strengths=(r.strengths||[]).map(s=>`<li>${esc(s)}</li>`).join('');
+  const checks=(r.checklist||[]).map(s=>`<li>${esc(s)}</li>`).join('');
+  $('wtResult').innerHTML=`<div class="box">
+    <div style="display:flex;gap:8px;align-items:center"><b>评审报告</b>
+      ${r.score!=null?`<span class="chip ${r.score>=7?'ok':(r.score>=5?'warn':'bad')}">完成度 ${r.score}/10</span>`:''}
+      <span class="chip ${r.model==='offline'?'warn':'ok'}">${esc(r.model||'')}</span>
+      ${r.degraded?`<span class="chip warn">降级</span>`:''}</div>
+    ${r.degraded?`<div class="mkt" style="color:var(--warn)">${esc(r.degraded)}</div>`:''}
+    <p style="margin:8px 0">${esc(r.overall||'')}</p>
+    ${strengths?`<p class="mkt"><b>优点</b></p><ul style="margin:4px 0 10px 20px">${strengths}</ul>`:''}
+    ${issues?`<p class="mkt"><b>问题与修改建议（${(r.issues||[]).length} 条）</b></p>${issues}`:''}
+    ${checks?`<p class="mkt"><b>下一步清单</b></p><ol style="margin:4px 0 10px 20px">${checks}</ol>`:''}
+    ${src?`<p class="mkt">引用核对依据：${src}</p>`:''}
+  </div>`;
+}
+async function doPpt(ids){
+  ids=(ids&&ids.length)?ids:[...libSel];
+  if(!ids.length){ alert('先在「文献检索 → 我的文献库」勾选文献，或从文献详情发起'); return; }
+  const topic=$('fs')?$('fs').value.trim():'';
+  try{
+    const r=await fetch('/api/pptx',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({paper_ids:ids,topic})});
+    if(!r.ok){ const e=await r.json().catch(()=>({})); alert('生成失败：'+(e.detail||r.status)); return; }
+    const blob=await r.blob();
+    const cd=r.headers.get('content-disposition')||'';
+    const m=cd.match(/filename\*?=(?:UTF-8'')?"?([^";]+)"?/i);
+    const name=m?decodeURIComponent(m[1]):'papernest_report.pptx';
+    const a=document.createElement('a');
+    a.href=URL.createObjectURL(blob); a.download=name; a.click();
+    URL.revokeObjectURL(a.href);
+  }catch(e){ alert('生成失败：'+e); }
+}
+
+/* ── 写作流水线（二期多 Agent）── */
+let wrRun=null;   // 当前 run 的完整状态 {run, outline, sections}
+const wrChip=s=>`<span class="chip ${s==='done'?'ok':(s==='failed'?'bad':'warn')}">${esc(s)}</span>`;
+
+async function wrCreate(){
+  const t=$('wrTopic').value.trim();
+  if(!t){ note('wrNote','先输入课题描述'); return; }
+  $('btnWr').disabled=true;
+  note('wrNote','<span class="spin"></span>选题 Agent 分析中…');
+  try{
+    const r=await (await fetch('/api/write/runs',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({topic:t,target_words:+$('wrWords').value||3000,
+        max_rewrites:+$('wrRewrites').value||2})})).json();
+    if(r.detail) throw new Error(r.detail);
+    await wrWait(r.job_id,'选题');
+    $('wrTopic').value='';
+    await wrLoad(r.run.id);
+    note('wrNote','');
+  }catch(e){ note('wrNote','✗ 选题失败：'+e.message); }
+  $('btnWr').disabled=false;
+}
+async function wrWait(jobId,label){
+  await sseJob(jobId,j=>note('wrNote',
+    `<b>【${esc(label)}】</b>${esc(j.stage||'')} ${esc(j.message||'')}`+
+    `<div class="prog"><i style="width:${Math.round((j.progress||0)*100)}%"></i></div>`));
+}
+async function wrLoad(id){
+  wrRun=await (await fetch('/api/write/runs/'+id)).json();
+  if(wrRun.detail) throw new Error(wrRun.detail);
+  renderWr();
+}
+function wrStagesBar(st){
+  const map={topic_running:0,pending_user_topic:0,outline_running:1,pending_user_outline:1,
+    drafting:2,drafted:2,polishing:3,done:4};
+  const cur=map[st];
+  const names=['① 选题','② 大纲','③ 逐节撰写','④ 润色终检','⑤ 导出'];
+  return '<div class="frow" style="margin-top:6px">'+names.map((n,i)=>{
+    const cls=st==='failed'?'chip bad':(cur==null?'chip':(i<cur?'chip ok':(i===cur?'chip warn':'chip')));
+    return `<span class="${cls}">${n}</span>`;}).join('')
+    +(st==='failed'?'<span class="chip bad">✗ 失败</span>':'')+'</div>';
+}
+function renderWr(){
+  if(!wrRun){ $('wrDetail').innerHTML=''; return; }
+  const run=wrRun.run;
+  let h=`<div class="box"><div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+    <b>${esc(run.title||run.topic.slice(0,36))}</b>
+    ${wrChip(run.status)}<span class="mkt">${esc(run.stage||'')}</span></div>
+    ${wrStagesBar(run.status)}</div>`;
+  if(run.status==='pending_user_topic') h+=wrTopicPanel(run);
+  if(run.status==='pending_user_outline') h+=wrOutlinePanel()+wrSectionsPanel();
+  if(['drafting','drafted','failed'].includes(run.status)){
+    h+=wrSectionsPanel();
+    if(run.status==='drafted') h+=`<div class="box"><div class="frow" style="margin:0">
+      <button onclick="wrPolish()">润色并终检导出</button>
+      <span class="mkt">润色 Agent 保持事实与引用编号不变 → 机械终检（悬空/未核验编号、待补证据、字数）</span></div></div>`;
+  }
+  if(run.status==='done') h+=wrSectionsPanel()+wrDonePanel(run);
+  if(run.error) h+=`<div class="box" style="border-left:3px solid var(--bad)"><span style="color:var(--bad)">✗ ${esc(run.error)}</span></div>`;
+  $('wrDetail').innerHTML=h;
+}
+/* 检查点①：选题候选（每条带证据句 + 机械核验标记） */
+function wrTopicPanel(run){
+  const cands=(run.topics||[]).map((t,i)=>`
+    <div class="cand"><label><input type="radio" name="wrTop" value="${i}" ${i===0?'checked':''}
+      onchange="$('wrTitle').value='${esc(t.title||'').replace(/'/g,'&#39;')}'"> <b>${esc(t.title||'')}</b></label>
+      <div class="mkt">缺口：${esc(t.gap||'')}</div>
+      <div class="mkt">切入：${esc(t.angle||'')}${t.risks?`　风险：${esc(t.risks)}`:''}</div>
+      ${(t.evidence||[]).map(ev=>`<div class="ev">${ev.verified?'<span class="vok">✓ 已核</span>':'<span class="vno">× 待核</span>'}
+        <a onclick="openPaper(${ev.paper_id})">文献 #${ev.paper_id}</a>：${esc(ev.quote||'')}</div>`).join('')}
+    </div>`).join('');
+  return `<div class="box"><b>检查点① 定题</b>
+    <p class="mkt">候选来自库内文献局限栏的缺口分析；证据句必须逐字回取到原文才算核验通过。也可在输入框自行改写题目。</p>
+    ${cands||'<p class="desc">没有候选——库内相关文献不足，先去「文献检索」采集。</p>'}
+    <div class="frow" style="margin-top:8px">
+      <input type="text" id="wrTitle" style="flex:1" placeholder="确认 / 修改题目后定题"
+        value="${esc((run.topics||[])[0]?.title||'')}">
+      <button onclick="wrPick()">定题并生成大纲</button>
+    </div></div>`;
+}
+async function wrPick(){
+  const title=$('wrTitle').value.trim();
+  if(!title){ note('wrNote','先确定题目'); return; }
+  try{
+    const r=await (await fetch(`/api/write/runs/${wrRun.run.id}/topic`,{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify({title})})).json();
+    if(r.detail) throw new Error(r.detail);
+    await wrWait(r.job_id,'大纲');
+    await wrLoad(wrRun.run.id);
+    note('wrNote','');
+  }catch(e){ note('wrNote','✗ 大纲失败：'+e.message); }
+}
+/* 检查点②：大纲编辑器 */
+function wrOutlinePanel(){
+  const o=wrRun.outline; if(!o) return '';
+  const rows=o.sections.map((s,i)=>`
+    <div class="cand" data-sec="${i}">
+      <div class="frow" style="margin-bottom:6px;margin-top:0">
+        <b style="white-space:nowrap">第 ${s.no} 节</b>
+        <input type="text" class="wr-sec-title" value="${esc(s.title)}" style="flex:1">
+        <label>字数</label><input type="number" class="wr-sec-words" value="${s.words||600}" style="width:76px">
+      </div>
+      <textarea class="wr-sec-points" rows="2">${esc((s.points||[]).join('\n'))}</textarea>
+      <div class="mkt">拟引文献：${(s.paper_ids||[]).map(id=>`<a onclick="openPaper(${id})">#${id}</a>`).join(' ')||'—（文献 Agent 会在撰写时按论证要点重新核验白名单）'}</div>
+    </div>`).join('');
+  return `<div class="box"><b>检查点② 确认或修改大纲</b> <span class="chip">v${o.version}${o.edited?'·人工改过':''}</span>
+    ${o.warnings&&o.warnings.length?`<div class="mkt" style="color:var(--warn)">机械校验：${o.warnings.map(esc).join('；')}</div>`:''}
+    ${rows}
+    <div class="frow" style="margin-top:8px">
+      <button onclick="wrOutlineGo(true)">保存修改并开写</button>
+      <button class="ghost" onclick="wrOutlineGo(false)">不改，直接开写</button>
+    </div></div>`;
+}
+async function wrOutlineGo(edited){
+  let body={};   // 不带 sections = 采用当前大纲直接开写
+  if(edited){
+    const secs=document.querySelectorAll('#wrDetail .cand[data-sec]');
+    const list=[...secs].map((c,i)=>({
+      no:i+1,
+      title:c.querySelector('.wr-sec-title').value.trim()||`第 ${i+1} 节`,
+      points:c.querySelector('.wr-sec-points').value.split('\n').map(x=>x.trim()).filter(Boolean),
+      words:+c.querySelector('.wr-sec-words').value||600,
+      paper_ids:(wrRun.outline.sections[i]||{}).paper_ids||[]}));
+    if(list.length<2){ note('wrNote','至少保留 2 节'); return; }
+    body={sections:list};
+  }
+  try{
+    const r=await (await fetch(`/api/write/runs/${wrRun.run.id}/outline`,{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})).json();
+    if(r.detail) throw new Error(r.detail);
+    await wrWait(r.job_id,'撰写');
+    await wrLoad(wrRun.run.id);
+    note('wrNote','');
+  }catch(e){ note('wrNote','✗ 撰写失败：'+e.message); }
+}
+/* 章节草稿（[n] 角标 → 悬浮证据句，点击开文献详情） */
+function wrCitedText(s){
+  const cites=s.citations||{};
+  return esc(s.content||'').replace(/\[(\d{1,2})\]/g,(m,n)=>{
+    const c=cites[n];
+    if(!c) return `<sup class="cite" style="background:#f7e5e2;color:var(--bad)" title="白名单外/悬空编号">${n}</sup>`;
+    const tip=esc((c.title||'')+' ▸ '+(c.evidence_sentence||'无证据句').slice(0,200));
+    return `<sup class="cite" title="${tip}" onclick="openPaper(${c.paper_id})" style="cursor:pointer">${n}</sup>`;
+  }).replace(/（待补证据）/g,'<span style="color:var(--warn)">（待补证据）</span>');
+}
+function wrSectionsPanel(){
+  const secs=wrRun.sections||[]; if(!secs.length) return '';
+  const cards=secs.map(s=>{
+    const chip=s.status==='done'?'<span class="chip ok">✓ 完成</span>'
+      :s.status==='reused'?'<span class="chip ok">♻ 缓存复用</span>'
+      :s.status==='failed'?'<span class="chip bad">✗ 失败</span>':wrChip(s.status);
+    const scoreChip=s.score!=null?`<span class="chip ${s.score>=7?'ok':'warn'}">评审 ${s.score}/10</span>`
+      :'<span class="chip">评审 —</span>';
+    const att=s.attempt>1?`<span class="chip warn">${s.attempt} 稿</span>`:'';
+    const rm=(s.removed||[]).length?`<span class="chip bad">剥离白名单外编号 ${s.removed.length}</span>`:'';
+    const ev=(s.whitelist||[]).length?`<details style="margin-top:4px"><summary class="mkt">引用白名单 ${s.whitelist.length} 条（均经机械核验）</summary>${
+      s.whitelist.map(w=>`<div class="ev"><a onclick="openPaper(${w.paper_id})">${esc(w.title||('#'+w.paper_id))}</a>：${esc((w.evidence_sentence||'').slice(0,120))}</div>`).join('')}</details>`:'';
+    return `<div class="cand">
+      <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+        <b>第 ${s.sec_no} 节 ${esc(s.title)}</b>${chip}${scoreChip}${att}${rm}
+        <button class="ghost" style="margin-left:auto;padding:2px 12px;font-size:12px"
+          onclick="wrRegen(${s.sec_no})">重新生成本节</button></div>
+      ${s.review&&s.review.overall?`<div class="mkt">评审总评：${esc(String(s.review.overall).slice(0,150))}</div>`:''}
+      <div style="font-size:13.5px;line-height:1.85;margin-top:6px">${wrCitedText(s)}</div>
+      ${ev}</div>`;}).join('');
+  return `<div class="box"><b>章节草稿</b><span class="mkt" style="margin-left:8px">角标 [n] 悬浮可看证据句，点击开文献详情；「待补证据」= 库内外都找不到支撑，需人工补</span>${cards}</div>`;
+}
+async function wrRegen(no){
+  note('wrNote','<span class="spin"></span>重跑章节（强制绕过缓存）…');
+  try{
+    const r=await (await fetch(`/api/write/runs/${wrRun.run.id}/sections/${no}/regenerate`,{method:'POST'})).json();
+    if(r.detail) throw new Error(r.detail);
+    await wrWait(r.job_id,'重写第 '+no+' 节');
+    await wrLoad(wrRun.run.id);
+    note('wrNote','');
+  }catch(e){ note('wrNote','✗ '+e.message); }
+}
+async function wrPolish(){
+  note('wrNote','<span class="spin"></span>润色 + 机械终检中…');
+  try{
+    const r=await (await fetch(`/api/write/runs/${wrRun.run.id}/polish`,{method:'POST'})).json();
+    if(r.detail) throw new Error(r.detail);
+    await wrWait(r.job_id,'润色终检');
+    await wrLoad(wrRun.run.id);
+    note('wrNote','');
+  }catch(e){ note('wrNote','✗ 润色失败：'+e.message); }
+}
+/* 终检报告 + 导出 */
+function wrDonePanel(run){
+  const r=run.result||{}; if(!r.files) return '';
+  const ok=r.ok?'<span class="chip ok">✓ 终检通过</span>':'<span class="chip warn">⚠ 有待核项（详情如下）</span>';
+  return `<div class="box"><b>终检报告（机械，不加 LLM）</b> ${ok}
+    <div class="mkt" style="margin-top:6px">
+      字数 <b>${r.words}</b>｜引用 <b>${r.citation_count}</b> 条｜
+      草稿引用核验率 <b>${r.verified_rate==null?'—':(r.verified_rate*100).toFixed(1)+'%'}</b>｜
+      悬空编号 <b>${(r.dangling||[]).length}</b>｜待补证据段 <b>${r.pending_evidence}</b>
+      ${r.removed_local_citations?`｜撰写期剥离白名单外编号 <b>${r.removed_local_citations}</b>`:''}
+      ${r.polish_degraded?`<br><span style="color:var(--warn)">润色降级：${esc(r.polish_degraded)}</span>`:''}</div>
+    ${(r.dangling||[]).length?`<div class="mkt" style="color:var(--bad)">悬空编号：${r.dangling.join(', ')}</div>`:''}
+    ${(r.references||[]).length?`<details style="margin-top:6px" open><summary class="mkt">参考文献（GB/T 7714，${r.references.length} 条）</summary>
+      <div class="mkt" style="margin-top:4px">${r.references.map(esc).join('<br>')}</div></details>`:''}
+    <div class="frow" style="margin-top:10px">
+      <button onclick="wrExport('md')">下载 Markdown</button>
+      <button class="ghost" onclick="wrExport('docx')">下载 Word (.docx)</button>
+    </div>
+    <p class="mkt" style="margin-top:6px">导出稿含「AI 参与说明」页脚：AI 辅助生成、引用全部来自库内真实文献、未生成实验数据。</p></div>`;
+}
+async function wrExport(fmt){
+  try{
+    const r=await fetch(`/api/write/runs/${wrRun.run.id}/export?fmt=${fmt}`);
+    if(!r.ok){ const e=await r.json().catch(()=>({})); alert('导出失败：'+(e.detail||r.status)); return; }
+    const blob=await r.blob();
+    const a=document.createElement('a');
+    a.href=URL.createObjectURL(blob); a.download=`${wrRun.run.id}.${fmt==='docx'?'docx':'md'}`; a.click();
+    URL.revokeObjectURL(a.href);
+  }catch(e){ alert('导出失败：'+e); }
+}
+async function wrList(){
+  try{
+    const r=await (await fetch('/api/write/runs?limit=12')).json();
+    $('wrRuns').innerHTML=(r.runs||[]).map(x=>`
+      <div class="item" onclick="wrLoad('${esc(x.id)}')" style="${wrRun&&wrRun.run.id===x.id?'border-color:var(--accent)':''}">
+        <b>${esc(x.title||x.topic.slice(0,40))}</b><span class="m">
+        ${wrChip(x.status)}<span>${esc(x.stage||'')}</span><span>${esc(x.updated_at||'')}</span></span></div>`).join('')
+      ||'<p class="desc">还没有写作任务。</p>';
+  }catch(e){ $('wrRuns').innerHTML='<p class="desc">历史加载失败。</p>'; }
+}
+
+function note(id,html){ const n=$(id); n.style.display='block'; n.innerHTML=html; }
+
+/* ── 课题工作区：项目 / 笔记 / 文档 ── */
+let spCur=null, spCurTopic='';  // 当前展开的项目 id 与它的课题词（供 AI 写作检索取证）
+const NOTE_TYPES=[['insight','洞见'],['question','问题'],['method','方法'],
+                  ['todo','待办'],['quote','摘录']];
+
+async function spApi(path,opt){
+  const r=await fetch(path,opt);
+  let body={}; try{ body=await r.json(); }catch(_){}
+  if(!r.ok) throw new Error(body.detail||body.error||('HTTP '+r.status));
+  return body;
+}
+const spJson=(method,body)=>({method,headers:{'Content-Type':'application/json'},
+                              body:JSON.stringify(body)});
+
+async function spLoadProjects(){
+  try{
+    const {projects}=await spApi('/api/projects');
+    $('spProjects').innerHTML = projects.length ? projects.map(p=>`
+      <div class="cand">
+        <b>${esc(p.name)}</b>
+        <span class="chip">${p.note_count||0} 笔记</span>
+        <span class="chip">${p.document_count||0} 文稿</span>
+        ${p.topic?`<span class="mkt"> · ${esc(p.topic)}</span>`:''}
+        <div class="bar" style="margin-top:6px">
+          <button class="ghost" onclick="spOpen(${p.id})">打开</button>
+          <button class="ghost" onclick="spDeleteProject(${p.id},'${esc(p.name).replace(/'/g,'&#39;')}')">删除</button>
+        </div>
+      </div>`).join('') : '<p class="desc">还没有课题。上面建一个开始。</p>';
+  }catch(e){ note('spNote','✗ '+e.message); }
+}
+
+async function spCreateProject(){
+  const name=$('spName').value.trim();
+  if(!name){ note('spNote','课题名称不能为空'); return; }
+  try{
+    const p=await spApi('/api/projects', spJson('POST',
+      {name, topic:$('spTopic').value.trim(), description:''}));
+    $('spName').value=''; $('spTopic').value='';
+    note('spNote','✓ 已创建「'+esc(p.name)+'」');
+    await spLoadProjects(); spOpen(p.id);
+  }catch(e){ note('spNote','✗ '+e.message); }
+}
+
+async function spDeleteProject(id,name){
+  if(!confirm(`删除课题「${name}」？它下面的笔记与文稿会一并删除，不可恢复。`)) return;
+  try{
+    await spApi('/api/projects/'+id,{method:'DELETE'});
+    if(spCur===id){ spCur=null; $('spDetail').innerHTML=''; }
+    note('spNote','✓ 已删除'); spLoadProjects();
+  }catch(e){ note('spNote','✗ '+e.message); }
+}
+
+async function spOpen(id){
+  spCur=id;
+  try{
+    const [proj,notes,docs]=await Promise.all([
+      spApi('/api/projects/'+id),
+      spApi(`/api/projects/${id}/notes`),
+      spApi(`/api/projects/${id}/documents`)]);
+    spCurTopic = (proj.topic||proj.name||'').trim();
+    $('spDetail').innerHTML=`
+      <div class="box" style="margin-top:16px">
+        <h3 style="margin:0 0 4px">${esc(proj.name)}</h3>
+        <p class="desc">${esc(proj.topic||'（未设课题关键词）')}</p>
+        <div class="frow" style="margin-top:10px">
+          <input type="text" id="spNoteTitle" placeholder="笔记标题" style="flex:1;min-width:180px">
+          <select id="spNoteType">${NOTE_TYPES.map(([v,l])=>`<option value="${v}">${l}</option>`).join('')}</select>
+          <input type="number" id="spNotePaper" placeholder="关联论文 id（选填）" style="width:150px">
+          <button onclick="spCreateNote()">加笔记</button>
+        </div>
+        <textarea id="spNoteBody" rows="3" placeholder="笔记内容（挂上论文 id 后，可在文献详情里回看）" style="margin-top:8px"></textarea>
+        <div class="note" id="spDetailNote"></div>
+      </div>
+      <div class="box" style="margin-top:14px">
+        <b style="font-size:13.5px">笔记（${notes.notes.length}）</b>
+        <div id="spNotes" style="margin-top:8px">${spRenderNotes(notes.notes)}</div>
+      </div>
+      <div class="box" style="margin-top:14px">
+        <div class="frow">
+          <input type="text" id="spDocTitle" placeholder="新文稿标题" style="flex:1;min-width:200px">
+          <button onclick="spCreateDoc()">新建文稿</button>
+        </div>
+        <b style="font-size:13.5px;display:block;margin-top:12px">文稿（${docs.documents.length}）</b>
+        <div id="spDocs" style="margin-top:8px">${spRenderDocs(docs.documents)}</div>
+      </div>`;
+  }catch(e){ note('spNote','✗ '+e.message); }
+}
+
+function spRenderNotes(notes){
+  if(!notes.length) return '<p class="desc">还没有笔记。</p>';
+  return notes.map(n=>`
+    <div class="cand">
+      <b>${esc(n.title)}</b>
+      <span class="chip">${esc((NOTE_TYPES.find(t=>t[0]===n.note_type)||[,n.note_type])[1])}</span>
+      ${n.paper_id?`<a class="mkt" onclick="openPaper(${n.paper_id})"> · 关联论文 #${n.paper_id}</a>`:''}
+      <div class="mkt" style="white-space:pre-wrap;margin-top:4px">${esc(n.content||'（空）')}</div>
+      <div class="bar" style="margin-top:6px">
+        <button class="ghost" onclick="spEditNote(${n.id})">编辑</button>
+        <button class="ghost" onclick="spDeleteNote(${n.id})">删除</button>
+      </div>
+    </div>`).join('');
+}
+
+function spRenderDocs(docs){
+  if(!docs.length) return '<p class="desc">还没有文稿。</p>';
+  return docs.map(d=>`
+    <div class="cand">
+      <b>${esc(d.title)}</b>
+      <span class="chip">v${d.version}</span>
+      <span class="chip">${esc(d.status)}</span>
+      <span class="chip">${(d.sources||[]).length} 个来源</span>
+      <div class="bar" style="margin-top:6px">
+        <button class="ghost" onclick="spOpenDoc(${d.id})">打开编辑</button>
+      </div>
+    </div>`).join('');
+}
+
+async function spCreateNote(){
+  if(!spCur) return;
+  const title=$('spNoteTitle').value.trim();
+  if(!title){ note('spDetailNote','笔记标题不能为空'); return; }
+  const pid=parseInt($('spNotePaper').value,10);
+  try{
+    await spApi(`/api/projects/${spCur}/notes`, spJson('POST',{
+      title, content:$('spNoteBody').value, note_type:$('spNoteType').value,
+      tags:[], paper_id:Number.isFinite(pid)&&pid>0?pid:null}));
+    spOpen(spCur);
+  }catch(e){ note('spDetailNote','✗ '+e.message); }
+}
+
+async function spEditNote(id){
+  try{
+    const cur=await spApi('/api/notes/'+id);
+    const title=prompt('笔记标题', cur.title); if(title===null) return;
+    const content=prompt('笔记内容', cur.content||''); if(content===null) return;
+    await spApi('/api/notes/'+id, spJson('PATCH',{title,content}));
+    spOpen(spCur);
+  }catch(e){ note('spDetailNote','✗ '+e.message); }
+}
+
+async function spDeleteNote(id){
+  if(!confirm('删除这条笔记？')) return;
+  try{ await spApi('/api/notes/'+id,{method:'DELETE'}); spOpen(spCur); }
+  catch(e){ note('spDetailNote','✗ '+e.message); }
+}
+
+async function spCreateDoc(){
+  if(!spCur) return;
+  const title=$('spDocTitle').value.trim();
+  if(!title){ note('spDetailNote','文稿标题不能为空'); return; }
+  try{
+    await spApi(`/api/projects/${spCur}/documents`, spJson('POST',{title,content:'',status:'draft'}));
+    $('spDocTitle').value=''; spOpen(spCur);
+  }catch(e){ note('spDetailNote','✗ '+e.message); }
+}
+
+async function spOpenDoc(id){
+  try{
+    const d=await spApi('/api/documents/'+id);
+    const src=(d.sources||[]).map(s=>
+      `<div class="mkt">· <a onclick="openPaper(${s.paper_id})">${esc(s.title)}</a>${s.page_no?` 第${s.page_no}页`:''}${s.quote?`：${esc(s.quote)}`:''}</div>`).join('')
+      || '<p class="desc">还没有挂来源。AI 写作会自动把用到的文献挂上。</p>';
+    $('modalBody').innerHTML=`
+      <h3>${esc(d.title)} <span class="chip">v${d.version}</span></h3>
+      <p class="mkt">AI 写作只在下面「来源」里的文献范围内取证；生成后来源会自动补齐。</p>
+      <textarea id="spDocBody" rows="16" style="width:100%">${esc(d.content||'')}</textarea>
+      <div class="frow" style="margin-top:8px">
+        <button onclick="spSaveDoc(${d.id})">保存</button>
+        <select id="spDocMode">
+          <option value="draft">写草稿</option><option value="outline">列大纲</option>
+          <option value="polish">润色</option><option value="review">评审</option>
+          <option value="expand">扩写</option><option value="summarize">做摘要</option>
+        </select>
+        <input type="text" id="spDocInstr" placeholder="给 AI 的要求" style="flex:1;min-width:200px">
+        <button class="ghost" onclick="spRunDoc(${d.id})">AI 写作</button>
+      </div>
+      <div class="note" id="spDocNote"></div>
+      <p class="mkt" style="margin-top:10px"><b>来源</b></p>${src}`;
+    $('ov').classList.add('on');
+  }catch(e){ note('spDetailNote','✗ '+e.message); }
+}
+
+async function spSaveDoc(id){
+  try{
+    await spApi('/api/documents/'+id, spJson('PATCH',{content:$('spDocBody').value}));
+    note('spDocNote','✓ 已保存（版本 +1）'); spOpen(spCur);
+  }catch(e){ note('spDocNote','✗ '+e.message); }
+}
+
+async function spRunDoc(id){
+  note('spDocNote','生成中…（未配 LLM 时返回离线模板）');
+  try{
+    // 已挂的来源优先；一篇都没挂时把课题词带进 instruction——
+    // 后端是拿 instruction 去检索取证的，只写「列个大纲」检索不到任何东西，
+    // 生成稿就会通篇「待补证据」。
+    const doc=await spApi('/api/documents/'+id);
+    const pids=[...new Set((doc.sources||[]).map(s=>s.paper_id))];
+    let instr=$('spDocInstr').value.trim()||'继续完善这份文稿';
+    if(!pids.length && spCurTopic) instr += `（课题：${spCurTopic}）`;
+    const r=await spApi(`/api/documents/${id}/write`, spJson('POST',{
+      instruction:instr, mode:$('spDocMode').value, paper_ids:pids, save:true}));
+    $('spDocBody').value=r.content||'';
+    note('spDocNote',`✓ ${r.mode} 完成（模型 ${esc(r.model)}，来源 ${(r.sources||[]).length} 篇）`
+      +(r.degraded?`<br>⚠ ${esc(r.degraded)}`:''));
+    spOpen(spCur);
+  }catch(e){ note('spDocNote','✗ '+e.message); }
+}
+
+/* ── 本地导入：PDF 上传 / BibTeX 导入 ── */
+async function doUploadPdf(){
+  const files=$('pdfFiles').files;
+  if(!files.length){ note('uploadNote','先选几个 PDF'); return; }
+  const btn=$('btnUpload'); btn.disabled=true;
+  note('uploadNote',`上传解析中…（${files.length} 份，按页抽全文，可能要几十秒）`);
+  const fd=new FormData();
+  for(const f of files) fd.append('files',f);
+  fd.append('make_card',$('pdfCards').checked?'true':'false');
+  try{
+    const r=await (await fetch('/api/papers/upload',{method:'POST',body:fd})).json();
+    note('uploadNote',`✓ 入库 ${r.imported} 份 · 失败 ${r.failed} 份`);
+    $('uploadList').innerHTML=[
+      ...r.papers.map(p=>`
+        <div class="cand">
+          <b>${esc(p.title)}</b>
+          ${p.duplicate?`<span class="chip">已存在（${esc(p.duplicate_by)} 去重）</span>`
+                       :`<span class="chip ok">新入库 #${p.paper_id}</span>`}
+          <span class="chip">${p.pages_stored} 页</span>
+          <div class="mkt">${esc(p.filename)}</div>
+          ${(p.warnings||[]).map(w=>`<div class="mkt">⚠ ${esc(w)}</div>`).join('')}
+          <div class="bar" style="margin-top:6px">
+            <button class="ghost" onclick="openPaper(${p.paper_id})">查看</button>
+            <button class="ghost" onclick="fixMeta(${p.paper_id})">修正元数据</button>
+          </div>
+        </div>`),
+      ...r.errors.map(e=>`<div class="cand"><span class="chip bad">失败</span>
+          <b>${esc(e.filename||'')}</b><div class="mkt">${esc(e.error)}</div></div>`),
+    ].join('') || '<p class="desc">没有结果。</p>';
+    loadStats(); doLibSearch();
+  }catch(e){ note('uploadNote','✗ '+e); }
+  finally{ btn.disabled=false; }
+}
+
+async function fixMeta(id){
+  try{
+    const p=await spApi('/api/paper/'+id);
+    const title=prompt('标题（改标题/DOI 会重算归一化主键）', p.title); if(title===null) return;
+    const authors=prompt('作者（分号分隔，留空则不改）', (p.authors||[]).join('; '));
+    if(authors===null) return;
+    const year=prompt('年份（留空则不改）', p.year||''); if(year===null) return;
+    const body={title};
+    if(authors.trim()) body.authors=authors.split(';').map(s=>s.trim()).filter(Boolean);
+    if(String(year).trim()) body.year=parseInt(year,10);
+    const r=await spApi(`/api/paper/${id}/metadata`, spJson('PATCH',body));
+    note('uploadNote',`✓ #${id} 已更新：${Object.keys(r.changed).join('、')||'无变化'}`
+      +(r.norm_key_changed?`（主键重算为 ${esc(r.norm_key)}）`:''));
+    doLibSearch();
+  }catch(e){ note('uploadNote','✗ '+e.message); }
+}
+
+async function doImportBib(){
+  const f=$('bibFile').files[0], pasted=$('bibText').value.trim();
+  if(!f && !pasted){ note('bibNote','选一个文件，或把内容粘进下面的框'); return; }
+  const btn=$('btnBib'); btn.disabled=true;
+  note('bibNote','导入中…'+($('bibEnrich').checked?'（开了联网补全，会慢很多）':''));
+  try{
+    let r;
+    if(f){
+      const fd=new FormData(); fd.append('file',f);
+      const q=`?fmt=${$('bibFmt').value}&enrich=${$('bibEnrich').checked}`;
+      r=await (await fetch('/api/import/bibliography/file'+q,{method:'POST',body:fd})).json();
+    }else{
+      r=await spApi('/api/import/bibliography', spJson('POST',
+        {text:pasted, fmt:$('bibFmt').value, enrich:$('bibEnrich').checked,
+         source_name:'粘贴导入'}));
+    }
+    if(r.detail){ note('bibNote','✗ '+r.detail); return; }
+    if(r.job_id){                // 开了联网补全 → 转后台任务，走 SSE 看进度
+      note('bibNote','联网补全较慢，已转后台任务，进度实时更新…');
+      const job=await sseJob(r.job_id, j=>note('bibNote',
+        `${Math.round((j.progress||0)*100)}% ${esc(j.stage||'')} ${esc(j.message||'')}`));
+      r=job.result||{};
+    }
+    note('bibNote',`✓ 格式 ${esc(r.format)} · 解析 ${r.parsed} 条 → 新增 ${r.imported}`
+      +` · 已存在跳过 ${r.skipped} · 失败 ${r.failed}`);
+    $('bibResult').innerHTML=(r.errors||[]).length
+      ? `<b style="font-size:13px">解析提示（${r.errors.length} 条）</b>`
+        +(r.errors.slice(0,15).map(e=>`<div class="mkt">⚠ ${esc(e)}</div>`).join(''))
+      : '<p class="desc">没有解析问题。</p>';
+    loadStats(); doLibSearch();
+  }catch(e){ note('bibNote','✗ '+e); }
+  finally{ btn.disabled=false; }
+}
+
+/* ── 引文网络 ── */
+async function gfLoad(){
+  try{
+    const s=await spApi('/api/graph/stats');
+    $('gfStats').innerHTML=
+      `<span class="chip">${s.edges} 条边</span>
+       <span class="chip">${s.papers_with_edges}/${s.papers_total} 篇有边（覆盖 ${(s.coverage*100).toFixed(1)}%）</span>
+       <span class="chip">${s.external_nodes} 个库外节点</span>
+       <span class="chip warn">${s.gap_papers} 个阅读缺口</span>`;
+    const {gaps}=await spApi('/api/graph/gaps?top_k=15');
+    $('gfGaps').innerHTML = gaps.length ? gaps.map(g=>`
+      <div class="cand">
+        <span class="chip warn">被库内引用 ${g.cited_by_count} 次</span>
+        <b style="margin-left:6px">${esc(g.title||'（无标题）')}</b>
+        ${g.year?`<span class="mkt"> ${g.year}</span>`:''}
+        <div class="mkt">引它的：${(g.cited_by_titles||[]).slice(0,3).map(t=>esc(t.slice(0,44))).join('；')||'—'}</div>
+        <div class="bar" style="margin-top:6px">
+          <button class="ghost" onclick="gfAdopt('${esc(g.norm_key).replace(/'/g,'&#39;')}',this)">加进文献库</button>
+          ${g.doi?`<a class="ghost" style="padding:4px 12px" href="https://doi.org/${esc(g.doi)}" target="_blank">原文 ↗</a>`:''}
+        </div>
+      </div>`).join('') : '<p class="desc">还没有缺口数据——先拉引文边。</p>';
+  }catch(e){ note('gfNote','✗ '+e.message); }
+}
+
+async function gfFetch(){
+  const btn=$('btnGf'); btn.disabled=true;
+  note('gfNote','拉取中…（走 Semantic Scholar，受共享池限流，几十篇可能要几分钟）');
+  try{
+    // 逐篇拉：一篇失败不影响其它篇，进度也看得见
+    const {papers}=await spApi('/api/papers?limit='+parseInt($('gfLimit').value,10));
+    let ok=0, edges=0;
+    for(const p of papers){
+      try{
+        const r=await spApi(`/api/paper/${p.id}/edges?limit=${parseInt($('gfPer').value,10)}`,
+                            {method:'POST'});
+        ok++; edges+=r.edges_added||0;
+        note('gfNote',`已处理 ${ok}/${papers.length} 篇，新增 ${edges} 条边…`);
+      }catch(_){ /* 单篇失败继续 */ }
+    }
+    note('gfNote',`✓ 完成：${ok}/${papers.length} 篇，新增 ${edges} 条边`);
+    gfLoad();
+  }catch(e){ note('gfNote','✗ '+e.message); }
+  finally{ btn.disabled=false; }
+}
+
+async function gfAdopt(key,btn){
+  btn.disabled=true; btn.textContent='入库中…';
+  try{
+    const r=await spApi('/api/graph/adopt?norm_key='+encodeURIComponent(key),{method:'POST'});
+    btn.textContent = r.status==='adopted' ? `✓ 已入库 #${r.paper_id}` : `已在库 #${r.paper_id}`;
+    loadStats();
+  }catch(e){ btn.disabled=false; btn.textContent='加进文献库'; note('gfNote','✗ '+e.message); }
+}
+
+async function gfRelated(){
+  const ids=($('gfSeed').value||'').split(',').map(x=>parseInt(x,10)).filter(Number.isFinite);
+  if(!ids.length){ note('gfNote','先填种子论文 id（文献检索页每篇卡片上有）'); return; }
+  try{
+    const {related}=await spApi('/api/graph/related', spJson('POST',{paper_ids:ids,top_k:15}));
+    $('gfRelated').innerHTML = related.length ? related.map(r=>`
+      <div class="cand">
+        <span class="chip ${r.in_library?'ok':''}">${r.in_library?'库内':'库外'}</span>
+        <span class="chip">${r.score.toFixed(3)}</span>
+        <b style="margin-left:6px">${esc(r.title||'（无标题）')}</b>
+        <div class="mkt">${esc(r.reason||'')}</div>
+        ${r.in_library
+          ? `<div class="bar" style="margin-top:6px"><button class="ghost" onclick="openPaper(${r.paper_id})">查看</button></div>`
+          : `<div class="bar" style="margin-top:6px"><button class="ghost" onclick="gfAdopt('${esc(r.norm_key).replace(/'/g,'&#39;')}',this)">加进文献库</button></div>`}
+      </div>`).join('') : '<p class="desc">没找到相关论文——这些种子论文可能还没拉过引文边。</p>';
+  }catch(e){ note('gfNote','✗ '+e.message); }
+}
+
+/* ── 新论文订阅 ── */
+async function fdLoad(){
+  try{
+    const p=await spApi('/api/subscribe/profile');
+    $('fdProfile').innerHTML=
+      `<span class="mkt">兴趣画像取自库内 ${p.n_papers} 篇 · 猜测分类 `
+      +`${(p.arxiv_categories||[]).join(' / ')||'（猜不出，请手填）'}</span><div style="margin-top:6px">`
+      +(p.terms||[]).slice(0,12).map(t=>`<span class="kw">${esc(t.term)} ${t.weight.toFixed(2)}</span>`).join('')
+      +'</div>';
+    const {digests}=await spApi('/api/subscribe/digests?limit=10');
+    $('fdDigests').innerHTML = digests.length ? digests.map(d=>`
+      <div class="cand">
+        <b>#${d.id}</b> <span class="mkt">${esc(d.created_at||'')}</span>
+        <span class="chip">回看 ${d.days} 天</span>
+        <span class="chip">拉取 ${d.n_fetched}</span>
+        <span class="chip ok">新论文 ${d.n_new}</span>
+        <button class="ghost" style="margin-left:8px" onclick="fdOpen(${d.id})">查看</button>
+      </div>`).join('') : '<p class="desc">还没有摘报。上面点「生成摘报」。</p>';
+  }catch(e){ note('fdNote','✗ '+e.message); }
+}
+
+async function fdRun(){
+  const btn=$('btnFd'); btn.disabled=true;
+  note('fdNote','拉取中…（走 arXiv 官方 API，有礼貌间隔，通常十几秒）');
+  try{
+    const cats=$('fdCats').value.split(',').map(s=>s.trim()).filter(Boolean);
+    const r=await spApi('/api/subscribe/digest', spJson('POST',{
+      days:parseInt($('fdDays').value,10), top_k:parseInt($('fdTopK').value,10),
+      categories:cats.length?cats:null, use_llm:$('fdLlm').checked}));
+    const job=await sseJob(r.job_id, j=>note('fdNote',
+      `${Math.round((j.progress||0)*100)}% ${esc(j.stage||'')} ${esc(j.message||'')}`));
+    const res=job.result||{};
+    note('fdNote',`✓ 拉取 ${res.n_fetched||0} 篇 → 去重后 ${res.n_new||0} 篇新论文`
+      +((res.degraded||[]).length?`<br>⚠ ${(res.degraded||[]).map(esc).join('；')}`:''));
+    await fdLoad();
+    if(res.digest_id) fdOpen(res.digest_id);
+  }catch(e){ note('fdNote','✗ '+e.message); }
+  finally{ btn.disabled=false; }
+}
+
+async function fdOpen(id){
+  try{
+    const d=await spApi('/api/subscribe/digests/'+id);
+    $('fdItems').innerHTML=`<div class="box" style="margin-top:14px">
+      <b style="font-size:13.5px">摘报 #${id}（${(d.items||[]).length} 篇）</b>
+      ${(d.items||[]).map(it=>fdItem(id,it)).join('')||'<p class="desc">这次没有新论文。</p>'}
+    </div>`;
+    $('fdItems').scrollIntoView({behavior:'smooth',block:'nearest'});
+  }catch(e){ note('fdNote','✗ '+e.message); }
+}
+
+function fdItem(digestId,it){
+  const key=esc(it.norm_key).replace(/'/g,'&#39;');
+  const reasons=(it.reasons||[]).slice(0,4).map(r=>
+    `<span class="chip" title="词权重 ${r.weight} · 批内区分度 idf ${r.idf}">${esc(r.term)}`
+    +` · ${r.where==='title'?'标题':'摘要'} · idf ${r.idf}</span>`).join(' ');
+  return `<div class="cand">
+    <span class="chip ${it.weak_match?'warn':'ok'}">${(it.score||0).toFixed(3)}</span>
+    ${it.weak_match?`<span class="chip warn" title="${esc(it.weak_match)}">弱匹配</span>`:''}
+    <b style="margin-left:6px">${esc(it.title||'')}</b>
+    <div class="mkt">arXiv:${esc(it.arxiv_id||'')} · ${esc((it.published||'').slice(0,10))}</div>
+    <div style="margin-top:4px">${reasons||'<span class="mkt">（无命中词项）</span>'}</div>
+    ${it.llm_note?`<div class="mkt">模型判断：${esc(it.llm_note)}</div>`:''}
+    <div class="bar" style="margin-top:6px">
+      <button class="ghost" onclick="fdAdopt(${digestId},'${key}',this)">加进文献库</button>
+      <button class="ghost" onclick="fdDismiss(${digestId},'${key}',this)">不感兴趣</button>
+      <a class="ghost" style="padding:4px 12px" href="https://arxiv.org/abs/${esc(it.arxiv_id||'')}" target="_blank">原文 ↗</a>
+    </div>
+  </div>`;
+}
+
+async function fdAdopt(digestId,key,btn){
+  btn.disabled=true; btn.textContent='入库中…';
+  try{
+    const r=await spApi(`/api/subscribe/digests/${digestId}/adopt?norm_key=`
+      +encodeURIComponent(key),{method:'POST'});
+    btn.textContent = r.status==='exists' ? `已在库 #${r.paper_id}` : `✓ 已入库 #${r.paper_id}`;
+    loadStats();
+  }catch(e){ btn.disabled=false; btn.textContent='加进文献库'; note('fdNote','✗ '+e.message); }
+}
+
+async function fdDismiss(digestId,key,btn){
+  btn.disabled=true;
+  try{
+    await spApi(`/api/subscribe/digests/${digestId}/dismiss?norm_key=`
+      +encodeURIComponent(key),{method:'POST'});
+    btn.textContent='已忽略（不再推送）';
+  }catch(e){ btn.disabled=false; note('fdNote','✗ '+e.message); }
+}
+
+loadStats(); doLibSearch();
+</script>
+</body>
+</html>

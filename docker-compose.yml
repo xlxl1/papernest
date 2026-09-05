@@ -1,0 +1,21 @@
+services:
+  papernest:
+    build: .
+    container_name: papernest
+    ports:
+      # **只绑回环**。原来是 "8765:8765"，等于 0.0.0.0——同网段任意主机都能无凭据
+      # 调用全部 /api/*（删项目/笔记、反复触发烧钱的 LLM 任务）。
+      # 要对外提供服务：设好 PAPERNEST_API_KEY，再自行改成 "0.0.0.0:8765:8765"
+      # 或挂到反向代理后面。
+      - "127.0.0.1:8765:8765"
+    environment:
+      # 容器内 uvicorn 必然绑 0.0.0.0，所以这里**强制要求**口令：
+      # 缺失时 compose 直接报错拒绝启动，而不是悄悄跑起一个裸奔的服务。
+      # 本机自用又确实不想设口令，就显式写 PAPERNEST_ALLOW_NO_AUTH=1。
+      PAPERNEST_API_KEY: ${PAPERNEST_API_KEY:?必须设置访问口令，请用 ASCII 字符（HTTP 头装不下非 ASCII）；确实要裸奔则显式设 PAPERNEST_ALLOW_NO_AUTH=1}
+      PAPERNEST_BIND_HOST: "0.0.0.0"
+    env_file:
+      - .env            # key 只从宿主机 .env 注入，不进镜像
+    volumes:
+      - ./data:/app/data  # 库 / PDF / 评测报告持久化在宿主机
+    restart: unless-stopped

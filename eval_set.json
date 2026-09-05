@@ -1,0 +1,774 @@
+[
+  {
+    "id": "r01",
+    "type": "retrieval",
+    "query": "LLM Agent 方法论与应用综述",
+    "gold_keys": [
+      "doi:10.48550/arxiv.2503.21460"
+    ],
+    "form": "keyword"
+  },
+  {
+    "id": "r02",
+    "type": "retrieval",
+    "query": "agent evaluation benchmark framework",
+    "gold_keys": [
+      "doi:10.35199/norddesign2024.74",
+      "doi:10.18653/v1/2025.acl-long.1355"
+    ],
+    "form": "keyword"
+  },
+  {
+    "id": "r03",
+    "type": "retrieval",
+    "query": "多智能体框架用于阿尔茨海默病照护",
+    "gold_keys": [
+      "doi:10.1038/s41746-025-01940-4"
+    ],
+    "form": "keyword"
+  },
+  {
+    "id": "r04",
+    "type": "retrieval",
+    "query": "web navigating agent built on large language models",
+    "gold_keys": [
+      "doi:10.1145/3637528.3671620"
+    ],
+    "form": "keyword"
+  },
+  {
+    "id": "r05",
+    "type": "retrieval",
+    "query": "role-playing agent evaluation survey",
+    "gold_keys": [
+      "doi:10.48550/arxiv.2502.13012"
+    ],
+    "form": "keyword"
+  },
+  {
+    "id": "r06",
+    "type": "retrieval",
+    "query": "训练与评测大模型智能体的环境",
+    "gold_keys": [
+      "doi:10.18653/v1/2025.acl-long.1355"
+    ],
+    "form": "keyword"
+  },
+  {
+    "id": "r07",
+    "type": "retrieval",
+    "query": "multimodal tool learning agent",
+    "gold_keys": [
+      "doi:10.1109/wacv61041.2025.00650"
+    ],
+    "form": "keyword"
+  },
+  {
+    "id": "r08",
+    "type": "retrieval",
+    "query": "fact-checking multi-agent audit",
+    "gold_keys": [
+      "doi:10.48550/arxiv.2502.17924"
+    ],
+    "form": "keyword"
+  },
+  {
+    "id": "r09",
+    "type": "retrieval",
+    "query": "计算流体力学仿真自动化 微调大模型",
+    "gold_keys": [
+      "doi:10.1016/j.taml.2025.100594"
+    ],
+    "form": "keyword"
+  },
+  {
+    "id": "r10",
+    "type": "retrieval",
+    "query": "药物发现 虚拟制药 小分子",
+    "gold_keys": [
+      "doi:10.48550/arxiv.2503.22164"
+    ],
+    "form": "keyword"
+  },
+  {
+    "id": "r11",
+    "type": "retrieval",
+    "query": "agriculture LLM ecosystem",
+    "gold_keys": [
+      "doi:10.48550/arxiv.2508.08632"
+    ],
+    "form": "keyword"
+  },
+  {
+    "id": "r12",
+    "type": "retrieval",
+    "query": "城市知识图谱构建 智能体",
+    "gold_keys": [
+      "doi:10.48550/arxiv.2402.06861"
+    ],
+    "form": "keyword"
+  },
+  {
+    "id": "r13",
+    "type": "retrieval",
+    "query": "scientific visualization generation agent",
+    "gold_keys": [
+      "doi:10.1109/ldav68558.2025.00007"
+    ],
+    "form": "keyword"
+  },
+  {
+    "id": "r14",
+    "type": "retrieval",
+    "query": "data science agent survey",
+    "gold_keys": [
+      "doi:10.48550/arxiv.2508.02744"
+    ],
+    "form": "keyword"
+  },
+  {
+    "id": "r15",
+    "type": "retrieval",
+    "query": "个性化推荐 多模态智能体",
+    "gold_keys": [
+      "doi:10.1038/s41598-025-96458-w"
+    ],
+    "form": "keyword"
+  },
+  {
+    "id": "r16",
+    "type": "retrieval",
+    "query": "rule learning ability of language models",
+    "gold_keys": [
+      "doi:10.18653/v1/2025.findings-acl.698"
+    ],
+    "form": "keyword"
+  },
+  {
+    "id": "r17",
+    "type": "retrieval",
+    "query": "地图综合 制图 多智能体",
+    "gold_keys": [
+      "doi:10.1080/13658816.2025.2507844"
+    ],
+    "form": "keyword"
+  },
+  {
+    "id": "r18",
+    "type": "retrieval",
+    "query": "enterprise-ready LLM Command A",
+    "gold_keys": [
+      "arxiv:2504.00698"
+    ],
+    "form": "keyword"
+  },
+  {
+    "id": "r19",
+    "type": "retrieval",
+    "query": "molecular dynamics simulation agent materials science",
+    "gold_keys": [
+      "doi:10.1038/s41598-025-92337-6"
+    ],
+    "form": "keyword"
+  },
+  {
+    "id": "r20",
+    "type": "retrieval",
+    "query": "高血压筛查 分诊 大模型",
+    "gold_keys": [
+      "doi:10.1161/hypertensionaha.125.25305"
+    ],
+    "form": "keyword"
+  },
+  {
+    "id": "r21",
+    "type": "retrieval",
+    "query": "XL-MIMO 近场信道估计",
+    "gold_keys": [
+      "doi:10.1109/jiot.2024.3477573",
+      "doi:10.1109/tvt.2025.3589352",
+      "doi:10.1109/tccn.2025.3566047"
+    ],
+    "form": "keyword"
+  },
+  {
+    "id": "r22",
+    "type": "retrieval",
+    "query": "near-field user localization beam squint",
+    "gold_keys": [
+      "doi:10.1109/twc.2024.3510303",
+      "doi:10.1109/mwc.010.2400237"
+    ],
+    "form": "keyword"
+  },
+  {
+    "id": "r23",
+    "type": "retrieval",
+    "query": "波束训练 码本设计 多用户",
+    "gold_keys": [
+      "doi:10.1109/tcomm.2025.3577652",
+      "doi:10.1109/tcomm.2023.3338737"
+    ],
+    "form": "keyword"
+  },
+  {
+    "id": "r25",
+    "type": "retrieval",
+    "query": "深度学习 多波束赋形 近场",
+    "gold_keys": [
+      "doi:10.1109/jiot.2025.3555290"
+    ],
+    "form": "keyword"
+  },
+  {
+    "id": "r27",
+    "type": "retrieval",
+    "query": "OFDM 双宽带 调制 XL-MIMO",
+    "gold_keys": [
+      "doi:10.1109/twc.2024.3509914"
+    ],
+    "form": "keyword"
+  },
+  {
+    "id": "r28",
+    "type": "retrieval",
+    "query": "天线间距优化 近场 自由度",
+    "gold_keys": [
+      "doi:10.1109/lwc.2025.3535100"
+    ],
+    "form": "keyword"
+  },
+  {
+    "id": "r31",
+    "type": "retrieval",
+    "query": "脊髓损伤康复 训练疗效",
+    "gold_keys": [
+      "title:375c66730e477fdd",
+      "doi:10.3760/cma.j.issn.0254-1424.2014.09.011"
+    ],
+    "form": "keyword"
+  },
+  {
+    "id": "r32",
+    "type": "retrieval",
+    "query": "core stability training muscle endurance",
+    "gold_keys": [
+      "doi:10.3969/j.issn.2095-4344.0552"
+    ],
+    "form": "keyword"
+  },
+  {
+    "id": "r34",
+    "type": "retrieval",
+    "query": "目标跟踪 粒子滤波 约束知识",
+    "gold_keys": [
+      "title:d0fad28d32cb2abc"
+    ],
+    "form": "keyword"
+  },
+  {
+    "id": "r35",
+    "type": "retrieval",
+    "query": "半盲信道估计 MIMO SC-FDMA",
+    "gold_keys": [
+      "title:91fd95a6367015a8",
+      "title:955c637fe67e95e4"
+    ],
+    "form": "keyword"
+  },
+  {
+    "id": "r37",
+    "type": "retrieval",
+    "query": "sling exercise rotator cuff efficacy",
+    "gold_keys": [
+      "doi:10.18282/po4722"
+    ],
+    "form": "keyword"
+  },
+  {
+    "id": "r39",
+    "type": "retrieval",
+    "query": "转移学习 信道预测 大规模MIMO",
+    "gold_keys": [
+      "doi:10.1631/fitee.2200169"
+    ],
+    "form": "keyword"
+  },
+  {
+    "id": "c01",
+    "type": "citation",
+    "query": "LLM-based agents have been widely studied, yet how to systematically evaluate and train them across diverse environments remains an open problem, motivating dedicated benchmarks.",
+    "gold_keys": [
+      "doi:10.18653/v1/2025.acl-long.1355",
+      "doi:10.35199/norddesign2024.74"
+    ]
+  },
+  {
+    "id": "c02",
+    "type": "citation",
+    "query": "多智能体大模型框架在医疗健康领域展现出应用潜力，已用于阿尔茨海默病照护决策与高血压患者管理。",
+    "gold_keys": [
+      "doi:10.1038/s41746-025-01940-4",
+      "doi:10.1161/hypertensionaha.125.25305"
+    ]
+  },
+  {
+    "id": "c03",
+    "type": "citation",
+    "query": "In XL-MIMO systems, spherical wavefront and beam squint make near-field channel estimation fundamentally different from far-field, and deep learning based estimators have been proposed.",
+    "gold_keys": [
+      "doi:10.1109/twc.2024.3510303",
+      "doi:10.1109/tccn.2025.3566047"
+    ]
+  },
+  {
+    "id": "c04",
+    "type": "citation",
+    "query": "6G 超大规模 MIMO 的波束训练需要针对近场球面波前重新设计码字与训练序列。",
+    "gold_keys": [
+      "doi:10.1109/tcomm.2025.3577652",
+      "doi:10.1109/tcomm.2023.3338737"
+    ]
+  },
+  {
+    "id": "c05",
+    "type": "citation",
+    "query": "Automated fact-checking benefits from adaptive multi-agent frameworks that dynamically audit claims against evidence.",
+    "gold_keys": [
+      "doi:10.48550/arxiv.2502.17924"
+    ]
+  },
+  {
+    "id": "c06",
+    "type": "citation",
+    "query": "康复训练中，核心稳定性训练被证明能改善腰部肌肉耐力与平衡能力。",
+    "gold_keys": [
+      "doi:10.3969/j.issn.2095-4344.0552",
+      "doi:10.3969/j.issn.2095-4344.0291"
+    ]
+  },
+  {
+    "id": "c07",
+    "type": "citation",
+    "query": "Web navigation agents powered by large language models still perform far from humans on real-world websites.",
+    "gold_keys": [
+      "doi:10.1145/3637528.3671620"
+    ]
+  },
+  {
+    "id": "c08",
+    "type": "citation",
+    "query": "城市知识图谱能从多源城市数据中蒸馏关键知识，大模型智能体为其构建提供了统一框架。",
+    "gold_keys": [
+      "doi:10.48550/arxiv.2402.06861"
+    ]
+  },
+  {
+    "id": "q01",
+    "type": "qa",
+    "query": "AgentGym 提供了哪些训练环境和训练方法？",
+    "gold_keys": [
+      "doi:10.18653/v1/2025.acl-long.1355"
+    ]
+  },
+  {
+    "id": "q02",
+    "type": "qa",
+    "query": "visibility region（视距区域）是什么，它如何被用于物理层认证？",
+    "gold_keys": [
+      "doi:10.1109/lwc.2024.3486773",
+      "doi:10.1109/tsp.2024.3479319"
+    ]
+  },
+  {
+    "id": "q03",
+    "type": "qa",
+    "query": "CARE-AD 的多智能体框架是怎么分工照顾阿尔茨海默病患者的？",
+    "gold_keys": [
+      "doi:10.1038/s41746-025-01940-4"
+    ]
+  },
+  {
+    "id": "q04",
+    "type": "qa",
+    "query": "CartoAgent 用多智能体协作解决了制图学的什么任务？",
+    "gold_keys": [
+      "doi:10.1080/13658816.2025.2507844"
+    ]
+  },
+  {
+    "id": "q05",
+    "type": "qa",
+    "query": "Command A 是面向什么场景的企业级模型？有什么特点？",
+    "gold_keys": [
+      "arxiv:2504.00698"
+    ]
+  },
+  {
+    "id": "q06",
+    "type": "qa",
+    "query": "MLLM-Tool 解决了工具调用的什么问题？",
+    "gold_keys": [
+      "doi:10.1109/wacv61041.2025.00650"
+    ]
+  },
+  {
+    "id": "q07",
+    "type": "qa",
+    "query": "UrbanKGent 构建城市知识图谱的流程是怎样的？",
+    "gold_keys": [
+      "doi:10.48550/arxiv.2402.06861"
+    ]
+  },
+  {
+    "id": "q08",
+    "type": "qa",
+    "query": "NMAP-Net 是什么？它如何做近场多波束赋形？",
+    "gold_keys": [
+      "doi:10.1109/jiot.2025.3555290"
+    ]
+  },
+  {
+    "id": "q09",
+    "type": "qa",
+    "query": "双面近场 XL-MIMO 的码字选择难点在哪？论文怎么解决？",
+    "gold_keys": [
+      "doi:10.1109/tcomm.2024.3492092"
+    ]
+  },
+  {
+    "id": "q10",
+    "type": "qa",
+    "query": "电针联合游泳训练对脊髓全横断大鼠有什么影响？",
+    "gold_keys": [
+      "title:375c66730e477fdd"
+    ]
+  },
+  {
+    "id": "n01",
+    "type": "retrieval",
+    "form": "natural",
+    "query": "有哪些关于 LLM Agent 方法论与应用的综述？",
+    "gold_keys": [
+      "doi:10.48550/arxiv.2503.21460"
+    ],
+    "derived_from": "r01"
+  },
+  {
+    "id": "n02",
+    "type": "retrieval",
+    "form": "natural",
+    "query": "What benchmark frameworks exist for agent evaluation?",
+    "gold_keys": [
+      "doi:10.35199/norddesign2024.74",
+      "doi:10.18653/v1/2025.acl-long.1355"
+    ],
+    "derived_from": "r02"
+  },
+  {
+    "id": "n03",
+    "type": "retrieval",
+    "form": "natural",
+    "query": "多智能体框架怎么用在阿尔茨海默病照护上？",
+    "gold_keys": [
+      "doi:10.1038/s41746-025-01940-4"
+    ],
+    "derived_from": "r03"
+  },
+  {
+    "id": "n04",
+    "type": "retrieval",
+    "form": "natural",
+    "query": "Is there a web navigating agent built on large language models?",
+    "gold_keys": [
+      "doi:10.1145/3637528.3671620"
+    ],
+    "derived_from": "r04"
+  },
+  {
+    "id": "n05",
+    "type": "retrieval",
+    "form": "natural",
+    "query": "Any survey on role-playing agent evaluation?",
+    "gold_keys": [
+      "doi:10.48550/arxiv.2502.13012"
+    ],
+    "derived_from": "r05"
+  },
+  {
+    "id": "n06",
+    "type": "retrieval",
+    "form": "natural",
+    "query": "训练和评测大模型智能体都有哪些环境？",
+    "gold_keys": [
+      "doi:10.18653/v1/2025.acl-long.1355"
+    ],
+    "derived_from": "r06"
+  },
+  {
+    "id": "n07",
+    "type": "retrieval",
+    "form": "natural",
+    "query": "How do multimodal tool learning agents work?",
+    "gold_keys": [
+      "doi:10.1109/wacv61041.2025.00650"
+    ],
+    "derived_from": "r07"
+  },
+  {
+    "id": "n08",
+    "type": "retrieval",
+    "form": "natural",
+    "query": "What is a fact-checking multi-agent audit?",
+    "gold_keys": [
+      "doi:10.48550/arxiv.2502.17924"
+    ],
+    "derived_from": "r08"
+  },
+  {
+    "id": "n09",
+    "type": "retrieval",
+    "form": "natural",
+    "query": "微调大模型做计算流体力学仿真自动化，有相关论文吗？",
+    "gold_keys": [
+      "doi:10.1016/j.taml.2025.100594"
+    ],
+    "derived_from": "r09"
+  },
+  {
+    "id": "n10",
+    "type": "retrieval",
+    "form": "natural",
+    "query": "小分子药物发现和虚拟制药方面有什么工作？",
+    "gold_keys": [
+      "doi:10.48550/arxiv.2503.22164"
+    ],
+    "derived_from": "r10"
+  },
+  {
+    "id": "n11",
+    "type": "retrieval",
+    "form": "natural",
+    "query": "What is the agriculture LLM ecosystem?",
+    "gold_keys": [
+      "doi:10.48550/arxiv.2508.08632"
+    ],
+    "derived_from": "r11"
+  },
+  {
+    "id": "n12",
+    "type": "retrieval",
+    "form": "natural",
+    "query": "用智能体构建城市知识图谱的论文有哪些？",
+    "gold_keys": [
+      "doi:10.48550/arxiv.2402.06861"
+    ],
+    "derived_from": "r12"
+  },
+  {
+    "id": "n13",
+    "type": "retrieval",
+    "form": "natural",
+    "query": "Which agent generates scientific visualizations?",
+    "gold_keys": [
+      "doi:10.1109/ldav68558.2025.00007"
+    ],
+    "derived_from": "r13"
+  },
+  {
+    "id": "n14",
+    "type": "retrieval",
+    "form": "natural",
+    "query": "Is there a data science agent survey?",
+    "gold_keys": [
+      "doi:10.48550/arxiv.2508.02744"
+    ],
+    "derived_from": "r14"
+  },
+  {
+    "id": "n15",
+    "type": "retrieval",
+    "form": "natural",
+    "query": "多模态智能体在个性化推荐上是怎么做的？",
+    "gold_keys": [
+      "doi:10.1038/s41598-025-96458-w"
+    ],
+    "derived_from": "r15"
+  },
+  {
+    "id": "n16",
+    "type": "retrieval",
+    "form": "natural",
+    "query": "What is the rule learning ability of language models?",
+    "gold_keys": [
+      "doi:10.18653/v1/2025.findings-acl.698"
+    ],
+    "derived_from": "r16"
+  },
+  {
+    "id": "n17",
+    "type": "retrieval",
+    "form": "natural",
+    "query": "多智能体做地图综合与制图，有哪些研究？",
+    "gold_keys": [
+      "doi:10.1080/13658816.2025.2507844"
+    ],
+    "derived_from": "r17"
+  },
+  {
+    "id": "n18",
+    "type": "retrieval",
+    "form": "natural",
+    "query": "What is the enterprise-ready LLM Command A?",
+    "gold_keys": [
+      "arxiv:2504.00698"
+    ],
+    "derived_from": "r18"
+  },
+  {
+    "id": "n19",
+    "type": "retrieval",
+    "form": "natural",
+    "query": "Is there a molecular dynamics simulation agent for materials science?",
+    "gold_keys": [
+      "doi:10.1038/s41598-025-92337-6"
+    ],
+    "derived_from": "r19"
+  },
+  {
+    "id": "n20",
+    "type": "retrieval",
+    "form": "natural",
+    "query": "大模型用于高血压筛查和分诊，有哪些论文？",
+    "gold_keys": [
+      "doi:10.1161/hypertensionaha.125.25305"
+    ],
+    "derived_from": "r20"
+  },
+  {
+    "id": "n21",
+    "type": "retrieval",
+    "form": "natural",
+    "query": "XL-MIMO 的近场信道估计怎么做？",
+    "gold_keys": [
+      "doi:10.1109/jiot.2024.3477573",
+      "doi:10.1109/tvt.2025.3589352",
+      "doi:10.1109/tccn.2025.3566047"
+    ],
+    "derived_from": "r21"
+  },
+  {
+    "id": "n22",
+    "type": "retrieval",
+    "form": "natural",
+    "query": "How does beam squint affect near-field user localization?",
+    "gold_keys": [
+      "doi:10.1109/twc.2024.3510303",
+      "doi:10.1109/mwc.010.2400237"
+    ],
+    "derived_from": "r22"
+  },
+  {
+    "id": "n23",
+    "type": "retrieval",
+    "form": "natural",
+    "query": "多用户场景下的波束训练和码本设计有哪些方法？",
+    "gold_keys": [
+      "doi:10.1109/tcomm.2025.3577652",
+      "doi:10.1109/tcomm.2023.3338737"
+    ],
+    "derived_from": "r23"
+  },
+  {
+    "id": "n25",
+    "type": "retrieval",
+    "form": "natural",
+    "query": "深度学习怎么做近场多波束赋形？",
+    "gold_keys": [
+      "doi:10.1109/jiot.2025.3555290"
+    ],
+    "derived_from": "r25"
+  },
+  {
+    "id": "n27",
+    "type": "retrieval",
+    "form": "natural",
+    "query": "XL-MIMO 里 OFDM 双宽带调制是什么？",
+    "gold_keys": [
+      "doi:10.1109/twc.2024.3509914"
+    ],
+    "derived_from": "r27"
+  },
+  {
+    "id": "n28",
+    "type": "retrieval",
+    "form": "natural",
+    "query": "近场自由度和天线间距优化有什么关系？",
+    "gold_keys": [
+      "doi:10.1109/lwc.2025.3535100"
+    ],
+    "derived_from": "r28"
+  },
+  {
+    "id": "n31",
+    "type": "retrieval",
+    "form": "natural",
+    "query": "脊髓损伤康复训练的疗效如何？",
+    "gold_keys": [
+      "title:375c66730e477fdd",
+      "doi:10.3760/cma.j.issn.0254-1424.2014.09.011"
+    ],
+    "derived_from": "r31"
+  },
+  {
+    "id": "n32",
+    "type": "retrieval",
+    "form": "natural",
+    "query": "Does core stability training improve muscle endurance?",
+    "gold_keys": [
+      "doi:10.3969/j.issn.2095-4344.0552"
+    ],
+    "derived_from": "r32"
+  },
+  {
+    "id": "n34",
+    "type": "retrieval",
+    "form": "natural",
+    "query": "带约束知识的粒子滤波怎么做目标跟踪？",
+    "gold_keys": [
+      "title:d0fad28d32cb2abc"
+    ],
+    "derived_from": "r34"
+  },
+  {
+    "id": "n35",
+    "type": "retrieval",
+    "form": "natural",
+    "query": "MIMO SC-FDMA 的半盲信道估计有哪些方法？",
+    "gold_keys": [
+      "title:91fd95a6367015a8",
+      "title:955c637fe67e95e4"
+    ],
+    "derived_from": "r35"
+  },
+  {
+    "id": "n37",
+    "type": "retrieval",
+    "form": "natural",
+    "query": "What is the efficacy of sling exercise for rotator cuff?",
+    "gold_keys": [
+      "doi:10.18282/po4722"
+    ],
+    "derived_from": "r37"
+  },
+  {
+    "id": "n39",
+    "type": "retrieval",
+    "form": "natural",
+    "query": "大规模MIMO 里怎么用转移学习做信道预测？",
+    "gold_keys": [
+      "doi:10.1631/fitee.2200169"
+    ],
+    "derived_from": "r39"
+  }
+]

@@ -1,0 +1,19 @@
+httpx>=0.27
+fastapi>=0.110
+python-multipart>=0.0.9
+uvicorn>=0.29
+numpy>=1.26
+pymupdf>=1.24
+python-pptx>=1.0
+python-docx>=1.1
+# Chroma 后端**已停用**：项目定的向量库是 Milvus。代码与测试都保留（后端抽象层
+# 靠它证明确实抽得动三种形态），但**默认不随镜像分发**——它的依赖树约 163MB，
+# 里面还有本项目完全用不到的 onnxruntime 与 kubernetes。
+# 镜像里要它：docker compose build --build-arg WITH_CHROMA=1
+# 本机跑 Chroma 那部分测试：pip install chromadb
+chromadb>=1.0
+
+# Milvus —— **本项目的向量库**。纯 Python 客户端，装它本身很轻；
+# 但它是服务端架构，要连一个 Milvus 实例（可复用机器上已有的，见 docker-compose.milvus.yml）。
+# 注意：Milvus Lite（嵌入式）不支持 Windows，全部历史版本零个 Windows wheel。
+pymilvus>=2.4
