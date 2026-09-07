@@ -20,7 +20,7 @@ import unicodedata
 from datetime import date
 from pathlib import Path
 
-from . import cards, config, db, fulltext
+from . import cards, config, db, fulltext, structure
 from .normalize import norm_key as _norm_key
 
 # 上传硬约束：魔数 + 体积上限。50MB 之上多半是扫描件合订本，解析代价与收益不成比例。
@@ -192,10 +192,14 @@ def _page_lines(page) -> list[dict]:
             d = ln.get("dir") or (1.0, 0.0)
             if abs(d[0]) < 0.98:
                 continue
-            spans = [s for s in ln.get("spans", []) if (s.get("text") or "").strip()]
+            raw_spans = ln.get("spans", []) or []
+            # 与 structure._line_of 同一个坑：统计看有实字的 span，
+            # **拼文本必须看全部 span**，否则纯空白 span（词边界）被过滤掉，
+            # 相邻的词就粘死了。共用 structure.join_spans，别在两处各写一份。
+            spans = [s for s in raw_spans if (s.get("text") or "").strip()]
             if not spans:
                 continue
-            text = _clean("".join(s["text"] for s in spans))
+            text = _clean(structure.join_spans(raw_spans))
             if not text:
                 continue
             bbox = ln.get("bbox") or (0, 0, 0, 0)

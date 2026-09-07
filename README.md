@@ -75,7 +75,8 @@ git push -u origin main
       · **④ 部署安全收口**：默认零鉴权 + 前端不带口令导致「锁不可启用」、`.bib` 可写入的 `oa_pdf_url` 构成 SSRF 链路，均已修（见「工程加固」）
       · **⑤ 并发与阻塞点**：`assign_indices` 的读-改-写竞态（实测 24 线程并发只拿到 5 个不同编号、映射表丢 19 篇）· `upload_pdfs`/`import_bibliography_file` 是 `async def` 却跑同步 IO 占死事件循环 · agent 的「硬截止」只截断调用方（改成协作式取消，见 `papernest/deadline.py`）
       · **⑥ 上下文组装**：把块级命中接进 `rag.prepare`，并用新增的 `cli.py qasper ctxab` 三臂配对实测——「换成按章节块组装」是**负收益**，已否决并保持默认关闭（见「上下文组装：一条负结果」）
-      · **⑦ 对自己这批修复做独立对抗审计**（7 维度 · 每条再核验）：确认 23 条、修掉其中 8 条 must-fix——包括非 ASCII 口令让 /api/* 恒 500、前端三处资源加载绕过口令、`rcs`/`agent` 两条链路的降级仍在被丢弃（正是修复 ② 要消灭的形状）、SSRF 防线把库里 5 篇 arXiv 的 http:// 链接永久挡死、`stats.describe` 对负结果说「方向为正」· **1155 条测试**
+      · **⑦ 对自己这批修复做独立对抗审计**（7 维度 · 每条再核验）：确认 23 条、修掉其中 8 条 must-fix——包括非 ASCII 口令让 /api/* 恒 500、前端三处资源加载绕过口令、`rcs`/`agent` 两条链路的降级仍在被丢弃（正是修复 ② 要消灭的形状）、SSRF 防线把库里 5 篇 arXiv 的 http:// 链接永久挡死、`stats.describe` 对负结果说「方向为正」
+      · **⑧ span 拼接吃掉词间空格**（原审计 blocker）：真库 435/784 个 chunk 被污染，新增 `structure.join_spans()` 按几何间距补回空格，真实 PDF 上粘连行 365→0· **1165 条测试**
 - [ ] Demo 视频录制（材料就绪，待录）
 - [x] **补齐全库向量**（2026-09-03，443 篇 / 约 3.5k 条嵌入）：覆盖 20.7% → **100%**，
       线上口径全部重测（见「评测」一节的配对对比）；`chunk` 向量 784 条**零丢失**，
@@ -505,12 +506,53 @@ citekey 命名（与 BibTeX 导出同键，Obsidian ↔ LaTeX 对得上号）、
 1. **脚本与原始数据没有收进仓库**（当时在临时目录里跑的），仓库里没有任何入口能重跑它。
 2. **2026-09-03 真去量了一次，结论与它相反**——见下面「上下文组装：一条负结果」。
 3. **当时的评测口径对一个已知缺陷不敏感**：`qasper` 的 gold 匹配先删掉全部空白再做子串包含，
-   而 `structure.py` 用 `"".join` 拼 span 会吃掉词间空格（真库 435/784 个 chunk 含粘连词）。
+   而 `structure.py` 用 `"".join` 拼 span 会吃掉词间空格。
    于是 `Thissectionpresents` 与 `This section presents` 在评测里得分相同，
    而线上的 `chunks_fts`（trigram）与 embedding 都对空格敏感。
+   **该缺陷已于 2026-09-03 修复**（见下节），但**存量 chunks 尚未重切**。
 
 诚实的说法是「**按章节切在检索排序上有效（块级权重表可复现）；
 而「按章节块组装上下文」这一步实测为负收益，已如实记录并保持默认关闭**」。
+
+### span 拼接吃掉词间空格（2026-09-03 修复）
+
+`structure._line_of` 与 `pdfimport` 都是先 `spans = [s for s in ... if s.text.strip()]`
+过滤掉纯空白的 span，再 `"".join(...)` 无分隔拼接。而 PyMuPDF 在字体切换处会把一行
+切成多个 span，词间空格要么是独立的空白 span（被过滤掉）、要么根本不在文本里、
+只体现为 bbox 之间的水平间距——两种情况下相邻的词都会被粘死。
+
+实测（真库）：
+
+| 来源 | 含 25 字母以上粘连词的比例 |
+|---|---|
+| `pages`（走 `page.get_text("text")`） | **0 / 566（0%）** |
+| `chunks`（走 `structure.section_chunks`） | **435 / 784（55.5%）** |
+
+样本：`pioNER:DatasetsandBaselinesforArmenian`、`ntelligenceisenteringapivotalerawiththe`。
+
+粘连文本对三处都是毒：trigram FTS 匹配不到正常词、embedding 语义变差、
+以及**打断机械回取校验**（本项目要求证据句能在原文里逐字找到）。
+
+修法：新增 `structure.join_spans()`，按几何间距补回空格
+（间距 > `0.12 × 字号` 就插一个，断词连字符结尾不插），两处共用同一实现。
+拿仓库里的真实 PDF 验证：**含粘连词的行 365 → 0**。
+
+**为什么此前 30 多条切分用例全绿**：夹具用 `page.insert_text((x,y), text)` 整行写入，
+PyMuPDF 回读时一行只有**一个**含空格的 span，`"".join` 恰好等价于正确拼接——
+合成夹具把真实数据的形态整个排除在外。现在 `tests/test_span_join.py` 用**手工构造的
+多 span 行**测纯函数，另加一条用真实 PDF 的集成用例。
+
+**存量 chunks 已于 2026-09-03 重切完毕**：26 份 PDF 从旧会话的临时目录归位到
+`data/pdf/`（`pdf_path` 一并更新——原来指向 `%TEMP%`，随时会被清理），
+跑 `cli.py rechunk` + `cli.py vec embed-chunks` 重建：
+
+| | 重切前 | 重切后 |
+|---|---|---|
+| chunks | 784 | 804 |
+| 含粘连词 | **435（55.5%）** | **0（0%）** |
+| chunk 向量 | 784 | 804（100% 覆盖，0 孤儿） |
+
+样本对照：`pioNER:DatasetsandBaselinesforArmenian` → `pioNER: Datasets and Baselines for Armenian`。
 
 ### 上下文组装：一条负结果（2026-09-03）
 
@@ -524,7 +566,8 @@ citekey 命名（与 BibTeX 导出同键，Obsidian ↔ LaTeX 对得上号）、
 |---|---|---|---|---|
 | A 改造前：绝对词频选页 + 页首硬截 | 0.2273 | 0.2273 | - | - |
 | B 只改选块：密度归一 + 围绕命中取窗口 | **0.2614** | **0.2614** | 7/88 | 0.452 |
-| C 再换成按章节块组装 | 0.2045 | **0.1136** | 17/88 | 0.331 |
+| C 再换成按章节块组装（修 span 之前） | 0.2045 | **0.1136** | 17/88 | 0.331 |
+| C 同上（修 span 拼接 + 重切全库之后） | 0.2500 | **0.2500** | 17/88 | 1.0 |
 
 ```bash
 $env:EMBED_MODEL=''; python cli.py qasper ctxab --n-papers 30
@@ -535,10 +578,12 @@ $env:EMBED_MODEL=''; python cli.py qasper ctxab --n-papers 30
 - **B 保留**（+0.0341，方向为正、p=0.452 不显著）。两处都是有原理的修正：
   绝对词频让最长的页恒赢（真库 83% 的情况选中的就是该篇最长页，往往是相关工作/参考文献），
   从页首硬截会把页中部的证据切掉（中位数只保留 29%）。
-- **C 否决**（-0.0568，且**保留空白口径下腰斩** 0.2614→0.1136）。
-  根因不是「章节 vs 页」这个单元本身，而是 **`chunks` 表的文本是 `pages` 的有损再推导**：
-  同一篇论文 pages=24 而 chunks=20、pages=19 而 chunks=31，文本已不是原文逐字。
-  这会直接打断本项目的机械回取校验（证据句必须能在原文里逐字找到）。
+- **C 第一次测是 -0.0568，且保留空白口径下腰斩**（0.2614→0.1136）。
+  当时判断根因是 `chunks` 文本不逐字保真——**这个判断后来被证实了**：
+  修掉 `structure.join_spans` 吃空格并重切全库之后重测，
+  **保真缺口归零**（两个口径 0.2500 == 0.2500），差距收敛到 **-0.0114（1 道题，p=1.0）**。
+- **最终仍不改默认值**：修完保真之后 chunk 与 page **实质持平，没有可测量的收益**。
+  没有收益就不动主问答路径的默认口径——而不是因为「换单元不好」。
 - 「保留空白」是**新加的口径**：旧的 `_norm` 把全部空白删掉再比对，
   对「词间空格被吃掉」完全不敏感。两个口径一起报，才能看见文本保真度的损失。
 
@@ -778,7 +823,7 @@ python cli.py demo                           # 离线演示：无外网 / 无 ke
 python cli.py serve                          # http://127.0.0.1:8765
 ```
 
-跑测试（1155 条，全部离线确定性，不联网不花钱）：
+跑测试（1165 条，全部离线确定性，不联网不花钱）：
 
 ```bash
 PYTHONPATH=. python -m unittest discover -s tests -t tests
@@ -978,7 +1023,7 @@ python cli.py recard && python cli.py embed && python cli.py serve
 
 | 数字 | 值 | 复现方式 |
 |---|---|---|
-| 代码 / 接口 / 测试 | 20.6k 行 Python（53 个文件）· 83 个 API 端点 · **1155 条离线确定性测试全绿（约 99s）** | `$env:PYTHONPATH='.'; python -m unittest discover -s tests -t tests` |
+| 代码 / 接口 / 测试 | 20.6k 行 Python（53 个文件）· 83 个 API 端点 · **1165 条离线确定性测试全绿（约 94s）** | `$env:PYTHONPATH='.'; python -m unittest discover -s tests -t tests` |
 | 库规模 | 503 篇论文 · 566 页全文 · 784 个章节块 · 1235 条向量（784 chunk / 60 paper / 391 sent）· 2243 条引文边 | `python cli.py stats` · `python cli.py graph stats` · `python cli.py vec status` |
 | **向量覆盖率** | **503/503（100%）** 篇能被语义检索命中 | `python cli.py health --offline`（低于 95% 报失败） |
 | 自建集 Recall@5 / @10（线上口径 · 关键词串形态） | **0.9427** / 0.9740 | `python cli.py eval --retrieval auto --k 5` |

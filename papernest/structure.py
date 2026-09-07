@@ -184,12 +184,67 @@ def _open(pdf_path):
 
 # ── ① 块抽取 ──
 
+#: 判定「这里本来有个空格」的水平间距阈值，按字号取比例。
+#: 字间距（kerning）接近 0，词间空格通常 0.25~0.33 em，取 0.12 em 有足够裕量。
+SPACE_GAP_RATIO = 0.12
+
+
+def join_spans(spans) -> str:
+    """按几何间距把一行的 span 拼成文本，**该有空格的地方补回空格**。
+
+    不能直接 `"".join`：PyMuPDF 在字体切换处会把一行切成多个 span，词间空格
+    要么是独立的空白 span（会被 `.strip()` 过滤掉），要么根本不在文本里、
+    只体现为 bbox 之间的水平间距。两种情况下 `"".join` 都会把相邻的词粘死。
+
+    真库实测：走这条路的 `chunks` 里 **435/784（55.5%）** 含 25 字母以上的粘连词
+    （`pioNER:DatasetsandBaselinesforArmenian`），而同一批 PDF 走
+    `page.get_text("text")` 的 `pages` 表是 **0%**。
+
+    粘连文本对三处都是毒：trigram FTS 匹配不到正常词、embedding 语义变差、
+    以及**打断机械回取校验**——本项目要求证据句能在原文里逐字找到。
+    """
+    out: list[str] = []
+    prev = None
+    for s in spans or []:
+        t = s.get("text") or ""
+        if not t:
+            continue
+        if prev is not None and out:
+            joined_tail = out[-1]
+            pb = prev.get("bbox") or (0.0, 0.0, 0.0, 0.0)
+            cb = s.get("bbox") or (0.0, 0.0, 0.0, 0.0)
+            try:
+                gap = float(cb[0]) - float(pb[2])
+            except (TypeError, IndexError, ValueError):
+                gap = 0.0
+            size = 0.0
+            for cand in (s.get("size"), prev.get("size")):
+                try:
+                    size = float(cand or 0.0)
+                except (TypeError, ValueError):
+                    size = 0.0
+                if size:
+                    break
+            size = size or 10.0
+            # 已经有空白、或断词连字符结尾，就不再补
+            if (not joined_tail.endswith((" ", "\t", "-", "­"))
+                    and not t[:1].isspace()
+                    and gap > SPACE_GAP_RATIO * size):
+                out.append(" ")
+        out.append(t)
+        prev = s
+    return "".join(out)
+
+
 def _line_of(ln: dict, page_no: int) -> dict | None:
     """一行 = 若干 span 合并。字号取行内最大（上标/角标会把均值拉低）。"""
-    spans = [s for s in ln.get("spans", []) if (s.get("text") or "").strip()]
+    raw_spans = ln.get("spans", []) or []
+    # 统计（字号/粗体）只看有实字的 span；**拼文本要看全部 span**——
+    # 纯空白的 span 恰恰是词边界的证据，先过滤再拼就是把空格丢掉。
+    spans = [s for s in raw_spans if (s.get("text") or "").strip()]
     if not spans:
         return None
-    text = _clean("".join(s.get("text") or "" for s in spans))
+    text = _clean(join_spans(raw_spans))
     if not text:
         return None
     total = sum(len((s.get("text") or "").strip()) for s in spans) or 1
