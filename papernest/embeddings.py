@@ -23,7 +23,7 @@ from typing import NamedTuple
 
 import numpy as np
 
-from . import config, db, degrade, http, llm
+from . import config, db, deadline, degrade, http, llm
 
 
 class EmbedUnavailable(Exception):
@@ -34,20 +34,111 @@ def available() -> bool:
     return bool(config.EMBED_API_KEY and config.EMBED_MODEL)
 
 
+#: 单请求条数。批越大越省往返，但也越容易读超时（实测长文本 16 条一批会 ReadTimeout）。
+BATCH_SIZE = int(os.environ.get("PAPERNEST_EMBED_BATCH", "8"))
+#: 瞬态失败的退避（秒）。**必须有**：原来一次读超时就让整条 `cli.py embed` 挂掉，
+#: 而这条命令要跑几百次调用——没有重试等于「跑到哪算哪，全靠运气」。
+_EMBED_DELAYS = (3, 8, 20)
+#: 单请求读超时。成功的调用实测 0.6~1.0s，20s 已经非常宽松——
+#: 而超时在这里是**探测信号**（端点对超限输入是挂起而不是报错），
+#: 所以它必须便宜：60s 一次的话，几百条超限文本就是几小时。
+_EMBED_TIMEOUT = int(os.environ.get("PAPERNEST_EMBED_TIMEOUT", "20"))
+
+
+#: 单条输入的初始字符上限，以及自适应缩短时的下限。
+#: **不能只靠一个固定上限**：token 与字符的比例随语言差好几倍（英文约 4 字符/token、
+#: 中文常常 1 字符/token），同一个字符数在两种文本下的 token 数完全不同。
+INPUT_CHARS = int(os.environ.get("PAPERNEST_EMBED_CHARS", "6000"))
+MIN_INPUT_CHARS = 400
+
+#: 超时被当成「可能是输入过长」的信号：某些端点（实测 qwen3.7-text-embedding-flash）
+#: 在输入超过其 token 上限时**挂起而不是返回 400**——重试多少次都是同一个超时。
+#: 实测：同一篇摘要截到 1870 字符正常返回、1878 字符必定超时（连测 4 次），
+#: 而另外两篇在 2100 字符处完全正常。所以这不是固定的字符阈值，只能自适应。
+_SHRINK_ON_TIMEOUT = True
+
+#: 进程内「学到的」输入上限。一旦某个上限被证明可用，**后续批次直接从它开始**——
+#: 否则每批都要重新从 6000 往下踩一遍超时，几百条长文本就是几小时。
+#: 这是 16/804 条 chunk 跑了十几分钟的直接原因。
+_LEARNED_CAP: list[int] = [INPUT_CHARS]
+
+
+def _post_once(url: str, batch: list[str]):
+    with http.client(timeout=_EMBED_TIMEOUT) as client:
+        return client.post(
+            url, json={"model": config.EMBED_MODEL, "input": batch},
+            headers={"Authorization": f"Bearer {config.EMBED_API_KEY}"})
+
+
+def _post_with_retry(url: str, batch: list[str], bi: int, total: int
+                     ) -> tuple[object, int | None]:
+    """发一批嵌入请求。返回 (response, 生效的字符上限或 None)。
+
+    三层处理，对应三类不同的失败：
+    - **永久错误立即失败**：400（模型名错、额度耗尽）、401/403 —— 重试只是把同一个
+      错再犯几遍。口径与 `llm.chat` 一致。
+    - **瞬态错误退避重试**：429/5xx 与网络抖动。
+    - **超时则缩短输入再试**：某些端点在输入超限时挂起而不是报错，此时退避多久都没用，
+      只能把输入截短。截短会改变语义，所以**必须如实返回生效的上限**，由调用方上报。
+
+    每一步都尊重 `deadline`：超时的步骤不该继续烧钱。
+    """
+    cap = _LEARNED_CAP[0]
+    last = None
+    while True:
+        cur = [t[:cap] for t in batch]
+        for delay in (*_EMBED_DELAYS, None):
+            deadline.check()
+            try:
+                r = _post_once(url, cur)
+            except Exception as e:                              # noqa: BLE001
+                last = f"{type(e).__name__}: {str(e)[:80]}"
+                if "Timeout" in type(e).__name__ and _SHRINK_ON_TIMEOUT:
+                    break                                       # 交给外层缩短输入
+                if delay is None:
+                    break
+                deadline.sleep(delay)
+                continue
+            if r.status_code == 200:
+                _LEARNED_CAP[0] = cap        # 记住这个上限，后续批次直接用
+                return r, (cap if cap < INPUT_CHARS else None)
+            if r.status_code in (429, 500, 502, 503, 504):
+                last = f"HTTP {r.status_code}"
+                if delay is None:
+                    break
+                deadline.sleep(delay)
+                continue
+            raise EmbedUnavailable(
+                f"embeddings 接口失败 HTTP {r.status_code}：{r.text[:200]}")
+        if not (_SHRINK_ON_TIMEOUT and cap > MIN_INPUT_CHARS
+                and max((len(t) for t in batch), default=0) > MIN_INPUT_CHARS):
+            break
+        cap = max(MIN_INPUT_CHARS, cap // 2)                     # 缩短后重来一轮
+    raise EmbedUnavailable(
+        f"embeddings 第 {bi + 1} 批（共 {-(-total // BATCH_SIZE)} 批）失败："
+        f"{last}（已尝试把单条输入缩到 {cap} 字符）")
+
+
+#: 最近一次 embed_texts 里发生的截断：[最小生效上限, 被截短的批数]。空 = 没有截断。
+#: 调用方（如 cli.py embed）据此如实提示，而不是让「向量只覆盖了半篇」悄悄发生。
+LAST_TRUNCATION: list[int] = []
+
+
 def embed_texts(texts: list[str], purpose: str = "embed") -> list[list[float]]:
     if not available():
         raise EmbedUnavailable("未配置 LLM_API_KEY / EMBED_MODEL")
     import time
     out: list[list[float]] = []
     url = config.EMBED_API_BASE.rstrip("/") + "/embeddings"
-    for i in range(0, len(texts), 16):  # 分批，规避单请求条数上限
+    shrunk: list[int] = []
+    for i in range(0, len(texts), BATCH_SIZE):  # 分批，规避单请求条数上限
         t0 = time.perf_counter()
-        batch = [t[:6000] for t in texts[i:i + 16]]
-        with http.client(timeout=60) as client:
-            r = client.post(url, json={"model": config.EMBED_MODEL, "input": batch},
-                            headers={"Authorization": f"Bearer {config.EMBED_API_KEY}"})
-        if r.status_code != 200:
-            raise EmbedUnavailable(f"embeddings 接口失败 HTTP {r.status_code}：{r.text[:200]}")
+        batch = [t[:INPUT_CHARS] for t in texts[i:i + BATCH_SIZE]]
+        r, cap = _post_with_retry(url, batch, i // BATCH_SIZE, len(texts))
+        if cap is not None:
+            # 被截短过就要留痕：向量代表的不再是完整文本，静默截断会让人
+            # 以为「这条向量覆盖了整篇」。
+            shrunk.append(cap)
         data = sorted(r.json()["data"], key=lambda d: d["index"])
         usage = r.json().get("usage") or {}
         with db.conn() as c:
@@ -56,6 +147,10 @@ def embed_texts(texts: list[str], purpose: str = "embed") -> list[list[float]]:
                             latency_ms=round((time.perf_counter() - t0) * 1000, 1))
             c.commit()
         out.extend(d["embedding"] for d in data)
+    if shrunk:
+        LAST_TRUNCATION[:] = [min(shrunk), len(shrunk)]
+    else:
+        LAST_TRUNCATION.clear()
     return out
 
 
