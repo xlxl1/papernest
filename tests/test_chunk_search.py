@@ -23,7 +23,7 @@ class ChunkSearchTests(unittest.TestCase):
         config.DATA_DIR = Path(self._tmp) / "data"
         self._embed = mock.patch("papernest.embeddings.available", return_value=False)
         self._embed.start()
-        self._old_weight = embeddings.PAGE_WEIGHT
+        self._old_weight = embeddings.CHUNK_WEIGHT
         db.init_db()
         with db.conn() as c:
             # 标题/摘要里完全没有 "quantization"，只有正文里有
@@ -52,7 +52,7 @@ class ChunkSearchTests(unittest.TestCase):
                  "start_page": 2, "end_page": 2}])
 
     def tearDown(self):
-        embeddings.PAGE_WEIGHT = self._old_weight
+        embeddings.CHUNK_WEIGHT = self._old_weight
         self._embed.stop()
         config.DB_PATH, config.DATA_DIR = self._old_db, self._old_dir
 
@@ -163,8 +163,14 @@ class ChunkSearchTests(unittest.TestCase):
         self.assertNotIn("chunks", mode)
 
     def test_title_match_still_outranks_body_match_at_default_weight(self):
-        """默认权重 0.2 下正文命中不能盖过标题命中——权重调高会反转，实测让自建集掉分。"""
-        embeddings.PAGE_WEIGHT = 0.2
+        """默认权重 0.2 下正文命中不能盖过标题命中——权重调高会反转，实测让自建集掉分。
+
+        这条原来写的是 `embeddings.PAGE_WEIGHT = 0.2`，而 `search_hybrid` 读的是
+        `CHUNK_WEIGHT`——`PAGE_WEIGHT` 只是 import 时的一个浮点副本，写它是纯 no-op。
+        也就是说这条「守护默认权重」的用例过去**什么都没断言**：把 CHUNK_WEIGHT 改成
+        任何值它照样绿。旧名现已删除，只能写真正生效的那个。
+        """
+        embeddings.CHUNK_WEIGHT = 0.2
         with db.conn() as c:
             db.replace_chunks(c, self.p_body, [
                 {"text": "We also discuss retrieval systems at length.",

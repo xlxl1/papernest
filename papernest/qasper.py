@@ -23,7 +23,8 @@ import re
 import time
 from pathlib import Path
 
-from . import config, db, http
+from . import config, db, http, structure
+from .stats import sign_flip_test
 
 QASPER_DIR = config.DATA_DIR / "qasper"
 # AI2 官方 S3（QASPER 论文与 qasper-led-baseline 仓库给的就是这个地址）。
@@ -176,6 +177,100 @@ def _norm(s: str) -> str:
     return re.sub(r"\s+", "", (s or "")).lower()
 
 
+#: QASPER 的 gold 证据抽自论文的 **LaTeX 源码**，引用/公式/图表交叉引用在那里
+#: 是占位 token；而我们的正文抽自 **PDF**，同一处渲染出来的是
+#: `(Zoph et al., 2016)` / `[19]` / 真实公式。两边永远对不上。
+_LATEX_PLACEHOLDER = re.compile(
+    r"BIBREF\d+|INLINEFORM\d+|DISPLAYFORM\d+|FIGREF\d+|SECREF\d+|TABLEREF\d+"
+    r"|FLOAT SELECTED|FORMULA"
+    # 行内数学同理：gold 里是 `$p(w_i|t_j)$`，PDF 里是渲染好的字形。
+    # 实测含数学记号的探针达成率只有 **3.9%（13/334）**——不切开等于白留。
+    r"|\$[^$]{0,200}\$|\\[a-zA-Z]+(?:\{[^{}]{0,80}\})?"
+    # DBLP 引用键：QASPER 的 LaTeX 抽取把部分引用留成了 `dblp:conf/naacl/xxx18`
+    r"|(?i:dblp:[^\s]+)")
+
+#: 切开之后，片段短于这个长度就没有判别力（"the results show" 到处都是）。
+MIN_PROBE_CHARS = 20
+
+
+def gold_probes(span: str) -> list[str]:
+    """把一条 gold 证据切成**可在 PDF 文本里匹配**的片段（已归一化）。
+
+    2026-09-09 实测（真库 25 篇 / 69 题 / 405 条 gold）：
+
+      · **35.3% 的 gold 片段含 LaTeX 占位符**
+        （BIBREF×265、INLINEFORM×23、FIGREF×19、SECREF×17、FLOAT SELECTED×10）；
+      · 整段逐字匹配时，切块后的全文里只找得到 **148 条（36.5%）**；
+        按占位符切开、取最长片段匹配，找得到 **218 条（53.8%）**。
+
+    也就是说**光这一处口径就压掉了 17.3 个百分点的可达上界**——
+    而 `span_recall` 是拿这个天花板去除的。据它调检索参数，等于在追一个假象。
+
+    只取最长的那一段：一条 gold 被引用切成好几截时，短截片（"we compare our
+    approaches with"）到处都能命中，会把指标反向灌水。
+    """
+    probes = [_norm(x) for x in _LATEX_PLACEHOLDER.split(span or "")]
+    probes = [x for x in probes if len(x) >= MIN_PROBE_CHARS]
+    return [max(probes, key=len)] if probes else []
+
+
+#: 评测用 PDF 的存放目录（`tools/fetch_qasper_pdfs.py` 下载）。
+#: **故意不进用户的文献库**：它们是评测夹具，不是用户的文献；
+#: 混进去会污染检索、也会让 `papers` 表凭空多出几百篇。
+EVAL_PDF_DIR = config.ROOT / "data" / "qasper_pdf"
+
+
+def eval_tasks(pdf_dir=None) -> list[tuple[str, str, list[str]]]:
+    """构造 `[(pdf_path, question, gold_probes)]`。
+
+    两个来源，按 **arXiv ID 精确对应**（QASPER dev 的键就是 arXiv id）：
+      ① `EVAL_PDF_DIR` 下下载来的评测 PDF；
+      ② 用户库里恰好也有的那些（按标题归一化匹配，历史口径，保留兼容）。
+
+    为什么必须用真 PDF 而不是 QASPER 自带的 `full_text`：要评的正是**我们自己的
+    PDF 抽取与切块**，用结构化正文等于把待测环节换成了完美输入。
+
+    **样本量就是这个评测的命门**：2026-09-09 之前只有本地 26 份 PDF 与 QASPER
+    的交集（25 篇 / 69 题），任何检索改动都只动 5~10 道题，一律过不了显著性
+    ——IDF 加权 p=0.219、per_paper 2→3 p=0.343，方向都对却都判不出来。
+    补齐 PDF 之后是 274 篇 / 920 题。
+    """
+    import pathlib as _pl
+    import re as _re
+    raw = json.loads(dev_path().read_text(encoding="utf-8"))
+    src: dict[str, str] = {}
+    d = _pl.Path(pdf_dir or EVAL_PDF_DIR)
+    if d.exists():
+        for f in d.glob("*.pdf"):
+            if f.stem in raw:
+                src[f.stem] = str(f)
+    nt = lambda t: _re.sub(r"[^0-9a-zA-Z]+", "", (t or "").lower())   # noqa: E731
+    by_title = {nt(v.get("title", "")): k for k, v in raw.items()}
+    try:
+        from . import db
+        with db.conn() as c:
+            for r in c.execute("SELECT title,pdf_path FROM papers "
+                               "WHERE pdf_path IS NOT NULL ORDER BY id"):
+                aid = by_title.get(nt(r["title"]))
+                if aid and aid not in src and _pl.Path(r["pdf_path"] or "").exists():
+                    src[aid] = r["pdf_path"]
+    except Exception:                                   # noqa: BLE001
+        pass                                # 没有库也能只用下载来的评测 PDF
+
+    tasks = []
+    for aid, path in sorted(src.items()):
+        for _qid, (question, golds) in _evidence_map(raw[aid]).items():
+            probes = [x for g in golds for x in gold_probes(g)]
+            if probes:
+                tasks.append((path, question, probes))
+    return tasks
+
+
+def gold_found(span: str, haystack_norm: str) -> bool:
+    """这条 gold 证据在（已归一化的）文本里能不能算命中。"""
+    return any(p in haystack_norm for p in gold_probes(span))
+
+
 def _evidence_map(paper: dict) -> dict[str, tuple[str, list[str]]]:
     """qid → (question, gold 证据片段列表)。
 
@@ -233,7 +328,9 @@ def run_eval(k: int = 5, sec_k: int = 2, max_papers: int = 30,
                 n_q += 1
                 if max_questions and n_q > max_questions:
                     break
-                gold_norms = [_norm(g) for g in golds if len(_norm(g)) >= 20]
+                # 按 LaTeX 占位符切开再匹配——gold 抽自 LaTeX 源码，
+                # 引用在那里是 BIBREF19，PDF 里却是 (Zoph et al., 2016)（见 gold_probes）
+                gold_norms = [p for g in golds for p in gold_probes(g)]
                 if not gold_norms:
                     continue
 
@@ -278,6 +375,108 @@ def _norm_ws(s: str) -> str:
     只报 `_norm` 会把「文本被粘连」这类缺陷记成零损失。
     """
     return re.sub(r"\s+", " ", (s or "")).strip().lower()
+
+
+def chunk_sweep(sizes=(1000, 2000, 4000, 6000), overlaps=(0.0, 0.10, 0.25),
+                budget: int = 2400, per_paper: int = 2) -> dict:
+    """切片参数扫描：`max_chars` × `overlap` 对**证据召回**的影响。0 token、0 外网。
+
+    样本是「同时有真实 PDF 与 QASPER gold 证据」的论文（真库 25 篇 / 69 道题 /
+    405 条 gold 片段）——必须用真 PDF，因为切法的差异只在真实版面上才显出来。
+
+    口径与生产完全一致：`rag._rank_chunks` 选块、`rag._window` 取窗口、
+    `_norm` 判命中，**等预算**（默认 2400 字符，与 `rag` 的 page_cap 同量级）。
+    所以量到的差异只来自切法本身。
+
+    `overlap` 在这里是**后处理模拟**（把下一块的头部接到当前块尾）——
+    先量清楚有没有用，再决定要不要真给 `section_chunks` 加这个参数。
+    结论是不用加：见下面 `cli.py qasper chunksweep` 的实测。
+    """
+    import json
+    import pathlib as _pl
+    import re as _re
+    from . import db, rag
+
+    raw = json.loads(dev_path().read_text(encoding="utf-8"))
+    nt = lambda t: _re.sub(r"[^0-9a-zA-Z]+", "", (t or "").lower())      # noqa: E731
+    by_title = {nt(v.get("title", "")): v for v in raw.values()}
+
+    tasks = []
+    with db.conn() as c:
+        for r in c.execute("SELECT id,title,pdf_path FROM papers "
+                           "WHERE pdf_path IS NOT NULL ORDER BY id"):
+            path = r["pdf_path"]
+            if not (path and _pl.Path(path).exists()):
+                continue
+            entry = by_title.get(nt(r["title"]))
+            if not entry:
+                continue
+            for _qid, (question, golds) in _evidence_map(entry).items():
+                gs = [p for g in golds for p in gold_probes(g)]
+                if gs:
+                    tasks.append((path, question, gs))
+
+    cache: dict = {}
+
+    def _chunks(path, size):
+        if (path, size) not in cache:
+            try:
+                cache[(path, size)] = structure.section_chunks(path, size)
+            except Exception:                                   # noqa: BLE001
+                cache[(path, size)] = []
+        return cache[(path, size)]
+
+    def _overlapped(chunks, frac):
+        if frac <= 0:
+            return chunks
+        out = []
+        for i, ch in enumerate(chunks):
+            text = ch.get("text") or ""
+            if i + 1 < len(chunks):
+                nxt = chunks[i + 1].get("text") or ""
+                text = text + chr(10) + nxt[:int(len(text) * frac)]
+            out.append({**ch, "text": text})
+        return out
+
+    rows, per_q = [], {}
+    for size in sizes:
+        for ov in overlaps:
+            hit_q = hit_s = tot_s = 0
+            outcomes = []
+            for path, question, golds in tasks:
+                base = _chunks(path, size)
+                tot_s += len(golds)
+                if not base:
+                    outcomes.append(0)
+                    continue
+                chs = _overlapped(base, ov)
+                for i, ch in enumerate(chs, 1):
+                    ch.setdefault("chunk_no", i)
+                block, _ = rag._chunk_context(chs, [], rag._query_terms(question),
+                                              per_paper, budget)
+                n = sum(1 for g in golds if g in _norm(block))
+                hit_s += n
+                outcomes.append(1 if n else 0)
+                hit_q += 1 if n else 0
+            per_q[(size, ov)] = outcomes
+            rows.append({"max_chars": size, "overlap": ov,
+                         "question_recall": round(hit_q / max(len(tasks), 1), 4),
+                         "span_recall": round(hit_s / max(tot_s, 1), 4)})
+
+    base_key = (4000, 0.0) if (4000, 0.0) in per_q else sorted(per_q)[0]
+    for row in rows:
+        key = (row["max_chars"], row["overlap"])
+        if key == base_key:
+            row["p_vs_default"] = None
+            continue
+        res = sign_flip_test(per_q[base_key], per_q[key])
+        row["p_vs_default"] = res["p_value"]
+        row["n_changed"] = res["n_changed"]
+    return {"n_questions": len(tasks),
+            "n_spans": sum(len(t[2]) for t in tasks),
+            "budget": budget, "per_paper": per_paper,
+            "baseline": {"max_chars": base_key[0], "overlap": base_key[1]},
+            "rows": rows}
 
 
 def context_ab(budgets=(2000, 4000, 8000, 16000), max_papers: int = 30,

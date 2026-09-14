@@ -706,14 +706,104 @@ def _attach_to_existing(exist, data: bytes, sha: str, key: str, ex: dict,
                    ex, warnings, sha, path, card_model, safe_name)
 
 
+NO_TEXT_LAYER_WARNING = (
+    "⚠ 这份 PDF **没有文本层**（多半是扫描件或图片版），全文一个字都没有入库："
+    "它在库里只是一条元数据，问答/检索都引用不到它的内容。"
+    "可以开 OCR 补救：`PAPERNEST_OCR=local`（本地 RapidOCR，不花钱、约 17s/页）"
+    "或 `PAPERNEST_OCR=cloud`（更准，约 4850 token/页）。"
+    "**默认关闭**——两样都不该在你没说话时发生。")
+
+#: OCR 成功之后给的提示。三件事都得说：补了多少、识别有错字、
+#: 以及上面那一串「元数据抽取失败」是**预期的**——元数据在 OCR 之前就抽过了。
+#: 不说最后一条的话，用户会把它读成两个独立故障，然后怀疑 OCR 也没成。
+OCR_APPLIED_NOTE = (
+    "这份 PDF 没有文本层，已用 OCR 补出 {n} 页正文（引擎：{mode}），"
+    "正文现在检索得到了。两点提醒："
+    "① 识别结果**有错字**（实测词面召回约 91~94%），逐字引用请回看原件；"
+    "② 上面那些「标题/作者/摘要抽取失败」是预期的——元数据在 OCR 之前就抽过了，"
+    "那时还没有文字可读。用 `cli.py fix-meta` 补上即可。")
+
+
+def _has_text_layer(path: str) -> bool | None:
+    """这份 PDF 有没有文本层。判断不了（读不开、没装 pymupdf）返回 None。
+
+    只抽前几页判断：扫描件是整份没有文本层，不会前几页是图、后面突然有字。
+    """
+    try:
+        import pymupdf
+    except ImportError:
+        return None
+    try:
+        doc = pymupdf.open(path)
+    except Exception:                                   # noqa: BLE001
+        return None
+    try:
+        if doc.page_count == 0:
+            return None
+        for i in range(min(3, doc.page_count)):
+            if (doc[i].get_text("text") or "").strip():
+                return True
+        return False
+    finally:
+        doc.close()
+
+
+def _ocr_rescue(path: str, paper_id: int, warnings: list[str]) -> int:
+    """没有文本层时，如果用户开了 OCR，就用 OCR 补出正文页。
+
+    **默认不做**：云端要花钱（约 4850 token/页），本地要 17s/页，两样都不该在
+    用户没说话的时候发生。开关是 `PAPERNEST_OCR=local|cloud`。
+
+    OCR 失败不抛：这条路本来就是补救，补不成就退回原来的大声报错。
+    """
+    from . import ocr
+    if not ocr.enabled():
+        return 0
+    try:
+        pages = ocr.ocr_pdf(path, max_pages=MAX_PAGES, paper_id=paper_id)
+    except ocr.OcrUnavailable as e:
+        warnings.append(f"OCR 已开启但用不了：{e}")
+        return 0
+    except Exception as e:                              # noqa: BLE001
+        warnings.append(f"OCR 失败（论文元数据已入库）：{type(e).__name__}: {e}")
+        return 0
+    if not pages:
+        return 0
+    with db.conn() as c:
+        for pno, text in pages:
+            c.execute("INSERT OR REPLACE INTO pages(paper_id,page_no,text) "
+                      "VALUES(?,?,?)", (paper_id, pno, text))
+        db.reindex_pages(c, paper_id)
+        db.replace_chunks(c, paper_id, db.chunks_from_pages(c, paper_id))
+    warnings.append(OCR_APPLIED_NOTE.format(n=len(pages), mode=ocr.MODE))
+    return len(pages)
+
+
 def _extract_pages_safe(path: str, paper_id: int, warnings: list[str]) -> int:
-    """抽页失败不该让整次上传回滚——论文行已经有价值，如实记 warning 即可。"""
+    """抽页失败不该让整次上传回滚——论文行已经有价值，如实记 warning 即可。
+
+    **0 页有两种完全不同的成因，必须分开说**：
+      · 抽页过程抛异常（损坏文件、加密…）——原来就有 warning；
+      · PDF 本身没有文本层（扫描件）——原来**一句话都没有**。
+        实测：造一个无文本层的 PDF 走完整条路，返回 papers=1 / pages=0 / chunks=0，
+        而 warnings 里只有「标题抽取失败 / 作者抽取失败 / 摘要抽取失败…」——
+        用户会读成「元数据要手工补」，而不是「这份文档整个检索不到」。
+        这是本项目最贵的一种静默失败：文件在库里、看起来导入成功了。
+    """
     try:
         fulltext.extract_pages(path, paper_id, max_pages=MAX_PAGES)
     except Exception as e:
         warnings.append(f"全文抽页失败（论文元数据已入库）：{e}")
         return 0
-    return _pages_count(paper_id)
+    n = _pages_count(paper_id)
+    if n == 0 and _has_text_layer(path) is False:
+        n = _ocr_rescue(path, paper_id, warnings)
+    if n == 0 and _has_text_layer(path) is False:
+        warnings.append(NO_TEXT_LAYER_WARNING)
+    elif n == 0:
+        warnings.append("全文抽页得到 0 页（文件可能已损坏或被加密），"
+                        "这篇论文的正文检索不到")
+    return n
 
 
 def _result(paper_id, title, key, pages, dup, dup_by, ex, warnings, sha, path,

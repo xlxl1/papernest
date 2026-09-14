@@ -21,6 +21,7 @@ from urllib.parse import quote
 import httpx
 
 from . import config, db, http
+from . import normalize
 from .normalize import norm_key
 
 # 错误信息前缀：带这个标记的表示「有一条文献真的没进来」，不带的只是警告
@@ -286,7 +287,7 @@ _ARXIV_URL_RE = re.compile(r"arxiv\.org/(?:abs|pdf)/(" + _ARXIV_NEW + "|" + _ARX
 _ARXIV_TAG_RE = re.compile(r"arxiv\s*:\s*(" + _ARXIV_NEW + "|" + _ARXIV_OLD + ")", re.I)
 _ARXIV_BARE_RE = re.compile(r"^\s*(?:arxiv:)?(" + _ARXIV_NEW + "|" + _ARXIV_OLD + r")\s*$", re.I)
 _YEAR_RE = re.compile(r"\b(1[5-9]\d{2}|20\d{2}|21\d{2})\b")
-_DOI_PREFIX_RE = re.compile(r"^\s*(?:https?://)?(?:dx\.)?doi\.org/", re.I)
+_DOI_PREFIX_RE = normalize._DOI_PREFIX_RE   # 唯一真源，别再抄第五份
 _DOI_IN_TEXT_RE = re.compile(r"\b(10\.\d{4,9}/[^\s,;\"'{}<>]+)")
 
 _VENUE_KEYS = ("journal", "journaltitle", "booktitle", "publisher",
@@ -701,13 +702,28 @@ def _s2_get(ident: str) -> dict | None:
     raise RuntimeError(f"Semantic Scholar 单篇查询连续 {len(ENRICH_DELAYS) + 1} 次失败：{last}")
 
 
+#: 连续失败多少条之后放弃补全。
+#: 每条 `_s2_get` 内部是 4 次尝试 + 3 段退避（20/45/90 = 155 秒），而外层
+#: `except Exception: continue` 把每条失败都当成「已跳过，不影响导入」吞掉、继续下一条。
+#: 于是 S2 整体不可用时代价不是失败一次，而是失败 N 次：一份 500 条的 Zotero 导出
+#: 要跑 500 × 155s ≈ **21 小时**，而且全程独占 3 个任务槽之一。
+#: 「补全」本来就是尽力而为的增强（补不上只是摘要留空），不值得为它把导入拖死。
+#: 取 5：单条偶发失败（S2 未收录、限流抖动）不该触发熔断，而真正的整体不可用
+#: 连续 5 条必然全中——代价上限 5 × 155s ≈ 13 分钟。
+ENRICH_FAILURE_STREAK = 5
+
+
 def enrich_entries(entries: list[dict]) -> list[str]:
     """给「有 doi/arxiv_id 但缺 abstract」的条目补摘要，返回错误说明列表。
 
     只填条目里本来就空的字段——用户 .bib 里的人工修订优先于外部源。
     补到 doi/arxiv_id 后会重算 norm_key，让同一篇在库里仍只占一个键。
+
+    **连续失败 `ENRICH_FAILURE_STREAK` 条就停手**：补全是尽力而为的增强，
+    外部源整体挂掉时应该尽快把导入还给用户，而不是逐条陪跑到天亮。
     """
     errs: list[str] = []
+    streak = 0
     for e in entries:
         if e.get("abstract"):
             continue
@@ -715,14 +731,22 @@ def enrich_entries(entries: list[dict]) -> list[str]:
                  else f"arXiv:{e['arxiv_id']}" if e.get("arxiv_id") else None)
         if not ident:
             continue
+        if streak >= ENRICH_FAILURE_STREAK:
+            errs.append(f"连续 {streak} 条补全失败，已停止补全（其余条目照常导入，"
+                        f"摘要留空）——外部源多半整体不可用，稍后可重跑一次导入补上")
+            break
         try:
             data = _s2_get(ident)
         except Exception as ex:
+            streak += 1
             errs.append(f"补全 {ident} 失败（已跳过，不影响导入）：{type(ex).__name__}: {ex}")
             continue
         if not data:
+            # 「未收录」是**正常应答**，不是故障：它说明网络是通的，不该计进熔断。
+            streak = 0
             errs.append(f"补全 {ident}：Semantic Scholar 未收录，摘要保持为空")
             continue
+        streak = 0
         ext = data.get("externalIds") or {}
         oa = data.get("openAccessPdf") or {}
         for key, val in (("abstract", data.get("abstract")),

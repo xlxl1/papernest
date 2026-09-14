@@ -127,6 +127,43 @@ CREATE TABLE IF NOT EXISTS chunks (
 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
   paper_id UNINDEXED, chunk_no UNINDEXED, text, tokenize='trigram'
 );
+-- 表格摘要：模型给每张表写的一段自然语言说明。
+-- **按表的内容哈希存，不存进 chunks.text**：重切块（`replace_chunks`）会把 chunks
+-- 整篇换掉，摘要跟着存就等于每次重切都要重新花钱买一遍。表的识别是确定性的，
+-- 同一张表重切前后哈希不变，所以这张表能跨重切复用。
+-- `is_model_written` 这一列不是装饰：它是模型生成的文本，绝不能被当成论文原文
+-- 去做逐字核验的证据（核验读的是 `pages`，见 matrix/rcs）。
+CREATE TABLE IF NOT EXISTS table_summaries (
+  table_hash TEXT PRIMARY KEY,
+  paper_id INTEGER NOT NULL,
+  page_no INTEGER,
+  n_rows INTEGER,
+  n_cols INTEGER,
+  summary TEXT NOT NULL,
+  model TEXT,
+  is_model_written INTEGER NOT NULL DEFAULT 1,
+  -- 0 = 这张表的列结构在抽取中塌了（多级表头被压平），摘要里**没有结论**。
+  -- 真库 86 张表里有 24 张（28%）是这样；在那种表上让模型判「谁最好」，
+  -- 实测会把论文的论点说反（见 tablesum.looks_mangled）。
+  structure_ok INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT DEFAULT (datetime('now','localtime'))
+);
+CREATE INDEX IF NOT EXISTS idx_table_summaries_paper ON table_summaries(paper_id);
+-- 插图说明：模型看图写的一段文字。和表格摘要同一套理由（按内容哈希存、
+-- 不进 chunks.text、标明是模型生成的），区别只在锚是图题不是单元格。
+-- caption 单独存一列：它是**论文原文**，而 summary 是模型写的，两者不能混。
+CREATE TABLE IF NOT EXISTS figure_summaries (
+  figure_hash TEXT PRIMARY KEY,
+  paper_id INTEGER NOT NULL,
+  page_no INTEGER,
+  label TEXT,
+  caption TEXT,
+  summary TEXT NOT NULL,
+  model TEXT,
+  is_model_written INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT DEFAULT (datetime('now','localtime'))
+);
+CREATE INDEX IF NOT EXISTS idx_figure_summaries_paper ON figure_summaries(paper_id);
 CREATE TABLE IF NOT EXISTS symbols (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   paper_id INTEGER NOT NULL,
@@ -183,6 +220,14 @@ CREATE TABLE IF NOT EXISTS document_sources (
   FOREIGN KEY(document_id) REFERENCES documents(id) ON DELETE CASCADE,
   FOREIGN KEY(paper_id) REFERENCES papers(id) ON DELETE CASCADE
 );
+-- 上面那个复合主键里 page_no 可空，而这张表不是 WITHOUT ROWID，SQLite 会把主键
+-- 实现成普通 UNIQUE 索引——**UNIQUE 索引里 NULL 互不相等**，于是
+-- `attach_source`（page_no 默认就是 None）的 ON CONFLICT 永远不触发，
+-- 同一条引用挂几次就存几行。实测：(1,1,NULL) 插 3 次得 3 行。
+-- 用 COALESCE 表达式索引把 NULL 折成 -1，它才是真正生效的唯一性约束，
+-- 也是 upsert 的冲突目标（SQLite 允许表达式索引当 ON CONFLICT target）。
+CREATE UNIQUE INDEX IF NOT EXISTS ux_document_sources_nullsafe
+  ON document_sources(document_id, paper_id, COALESCE(page_no, -1));
 CREATE TABLE IF NOT EXISTS writing_runs (
   id TEXT PRIMARY KEY,                    -- uuid hex（写作流水线一次全程）
   project_id INTEGER,
@@ -321,7 +366,7 @@ def conn(immediate: bool = False):
 # 每个版本一个「幂等」迁移函数；PRAGMA user_version 记录已应用到哪一版。
 # 旧库（user_version=0）会顺序补齐，新库建表后直接盖到最新版。
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 9
 
 
 def _columns(c: sqlite3.Connection, table: str) -> set[str]:
@@ -388,8 +433,71 @@ def _migrate_6(c: sqlite3.Connection):
     _add_column(c, "chat_messages", "degraded_json", "TEXT NOT NULL DEFAULT '[]'")
 
 
+def _migrate_7(c: sqlite3.Connection):
+    """v7：给 document_sources 补一条 NULL-safe 的唯一索引。
+
+    老库里 `PRIMARY KEY(document_id, paper_id, page_no)` 对 page_no 为 NULL 的行
+    形同虚设（UNIQUE 索引里 NULL 互不相等），所以建索引之前要先把已有的重复行去掉，
+    否则 CREATE UNIQUE INDEX 直接失败。保留每组 rowid 最大的那一行——
+    `attach_source` 的语义是 upsert（后写覆盖 quote/relation），最后写入的那条才对。
+    """
+    c.execute("""DELETE FROM document_sources WHERE rowid NOT IN (
+                   SELECT MAX(rowid) FROM document_sources
+                   GROUP BY document_id, paper_id, COALESCE(page_no, -1))""")
+    c.execute("""CREATE UNIQUE INDEX IF NOT EXISTS ux_document_sources_nullsafe
+                 ON document_sources(document_id, paper_id, COALESCE(page_no, -1))""")
+
+
+def _migrate_8(c: sqlite3.Connection):
+    """v8：把 jobs 的「同键同时只允许一个在跑」变成**数据库保证**。
+
+    原来它只是 `create_job` 里的一次 SELECT-then-INSERT，而连接默认 autocommit、
+    `idx_jobs_active` 又不是 UNIQUE——实测 16 线程并发建同一 dedupe_key 的任务
+    建成了 2 个。注释里说它要防的「前端连点两次开写让两个线程交错写同一批 sections」
+    因此从来没被真正防住。
+
+    部分唯一索引才是真正的约束：`WHERE status IN ('queued','running')` 让已结束的
+    任务不占键位（同一个 run 可以先后写很多次），而 UNIQUE 索引里 NULL 互不相等，
+    所以不带 dedupe_key 的任务不受影响。
+    建索引前先清理历史违例：同键多条在跑时保留最新那条，其余标 failed 并说明原因。
+    """
+    c.execute("""UPDATE jobs SET status='failed',
+                   error='并发去重闸门修复前的重复任务（迁移 v8 清理）'
+                 WHERE dedupe_key IS NOT NULL
+                   AND status IN ('queued','running')
+                   AND id NOT IN (
+                     SELECT id FROM jobs j2 WHERE j2.dedupe_key = jobs.dedupe_key
+                       AND j2.status IN ('queued','running')
+                     ORDER BY j2.created_at DESC LIMIT 1)""")
+    c.execute("""CREATE UNIQUE INDEX IF NOT EXISTS ux_jobs_active_dedupe
+                 ON jobs(dedupe_key) WHERE status IN ('queued','running')""")
+
+
+def _migrate_9(c: sqlite3.Connection):
+    """v9：给 `table_summaries` 补上 `structure_ok` 列。
+
+    **为什么需要一条迁移**：`table_summaries` 是加在 SCHEMA 里的新表，靠
+    `CREATE TABLE IF NOT EXISTS` 自动出现，不用改版本——这没错。但后来往这张表
+    **加列**时我又只改了 SCHEMA：`IF NOT EXISTS` 对已经建好的表是空跑，
+    列压根不会加上去。实测就是这么炸的：
+    `sqlite3.OperationalError: table table_summaries has no column named structure_ok`
+    ——而那批摘要已经花了钱、跑到一半。
+
+    口径：**新表进 SCHEMA 就够了，改已有表的结构必须走迁移。**
+
+    `structure_ok=0` 表示这条摘要出自「列结构在抽取中塌了」的表，里面**没有结论**
+    （见 `tablesum.looks_mangled`）。历史行默认 1，因为它们生成时还没有这个区分——
+    真要复核，用 `looks_mangled` 重新过一遍表就能把它们捞出来（首轮就是这么
+    捞出 17 条、作废其中 14 条带结论措辞的）。
+    """
+    cols = {r[1] for r in c.execute("PRAGMA table_info(table_summaries)")}
+    if "structure_ok" not in cols:
+        c.execute("ALTER TABLE table_summaries "
+                  "ADD COLUMN structure_ok INTEGER NOT NULL DEFAULT 1")
+
+
 MIGRATIONS = {1: _migrate_1, 2: _migrate_2, 3: _migrate_3, 4: _migrate_4,
-              5: _migrate_5, 6: _migrate_6}
+              5: _migrate_5, 6: _migrate_6, 7: _migrate_7, 8: _migrate_8, 9: _migrate_9}
 
 _init_lock = threading.Lock()
 _initialized: set[str] = set()
@@ -616,23 +724,62 @@ def replace_chunks(c: sqlite3.Connection, paper_id: int, chunks: list[dict]):
         if not text:
             continue
         n += 1
+        kind = ch.get("kind") or "text"
         c.execute("""INSERT INTO chunks(paper_id,chunk_no,section_path,level,
                        start_page,end_page,kind,text) VALUES(?,?,?,?,?,?,?,?)""",
                   (paper_id, n, ch.get("section_path") or "", int(ch.get("level") or 1),
-                   ch.get("start_page"), ch.get("end_page"),
-                   ch.get("kind") or "text", text))
-        c.execute("INSERT INTO chunks_fts(paper_id,chunk_no,text) VALUES(?,?,?)",
-                  (paper_id, n, text))
+                   ch.get("start_page"), ch.get("end_page"), kind, text))
+        # 参考文献块留在 chunks 里（引文图 / 找相关工作要读原文），但**不进检索索引**：
+        # 它是别人论文的条目，不是本篇的证据。真库实测 13.9% 的可检索文本是这种条目，
+        # 64 条真实查询里 16 条的块级 top-5 含参考文献块，最坏一条 5/5。
+        if kind != "reference":
+            c.execute("INSERT INTO chunks_fts(paper_id,chunk_no,text) VALUES(?,?,?)",
+                      (paper_id, n, text))
     return n
 
 
+#: 检索单元的字符上限，与 `structure.section_chunks(max_chars=4000)`、
+#: `docimport.MAX_CHUNK_CHARS` 是同一个值。**必须严格小于嵌入侧的
+#: `embeddings.INPUT_CHARS` / `chunkembed.MAX_CHARS`（都是 6000）**：超过那条线的块
+#: 在嵌入时会被静默截到前 6000 字，块尾内容不进向量，而 `LAST_TRUNCATION` 只记录
+#: 自适应缩短、盖不到这一刀。真库实测 804 块里 17 块（2.11%）超过 4000、4 块超过
+#: 6000，**全部**出自 `chunks_from_pages`；那 4 块的 34553 字里丢了 10553（30.5%），
+#: 最差一块丢 49.7%。丢掉的尾巴在 chunks_fts 里仍有索引（英文词面能命中），
+#: 但中文提问词面恒 0，向量又不含尾部——跨语言时真的抓不回来。
+#: 收口在这里之后，嵌入侧那两处 [:6000] 对正文块恒为空操作，只有一处真在切。
+MAX_CHUNK_CHARS = 4000
+
+
+def cap_chunks(chunks: list[dict], max_chars: int = MAX_CHUNK_CHARS) -> list[dict]:
+    """把超长的正文块按 structure 那把刀切开；已合规的原样返回（幂等）。
+
+    **`kind='table'` 的块不切**：`tables.chunk_table` 有自己的行级口径（整行切分、
+    表头跨块重复、超长行宁可超限也不从中间截），在这里按字符再切一次会把行劈开、
+    让续块丢掉表头——那正是它存在的理由。表格块的上限由 `chunk_table(max_chars=)` 管。
+    """
+    from .structure import _split_paragraph      # 与章节路同一把刀，不做第二套切法
+    out: list[dict] = []
+    for ch in chunks:
+        text = ch.get("text") or ""
+        if (ch.get("kind") or "text") == "table" or len(text) <= max_chars:
+            out.append(ch)
+            continue
+        out.extend({**ch, "text": p} for p in _split_paragraph(text, max_chars))
+    return out
+
+
 def chunks_from_pages(c: sqlite3.Connection, paper_id: int) -> list[dict]:
-    """没有 PDF 可切时的兜底：pages 一行一块（QASPER 这类按节导入的本来就是节）。"""
-    return [{"text": r["text"] or "", "section_path": "", "level": 1,
-             "start_page": r["page_no"], "end_page": r["page_no"], "kind": "text"}
-            for r in c.execute(
-                "SELECT page_no,text FROM pages WHERE paper_id=? ORDER BY page_no",
-                (paper_id,)).fetchall()]
+    """没有 PDF 可切时的兜底：pages 一行一块（QASPER 这类按节导入的本来就是节）。
+
+    一页 / 一节可能远超 `MAX_CHUNK_CHARS`（真库最大 11924 字），所以出口要过
+    `cap_chunks`——否则块尾会在嵌入时被静默丢掉。切出来的每一片沿用同一页码。
+    """
+    return cap_chunks([
+        {"text": r["text"] or "", "section_path": "", "level": 1,
+         "start_page": r["page_no"], "end_page": r["page_no"], "kind": "text"}
+        for r in c.execute(
+            "SELECT page_no,text FROM pages WHERE paper_id=? ORDER BY page_no",
+            (paper_id,)).fetchall()])
 
 
 def search_chunks_fts(c: sqlite3.Connection, q: str, limit: int = 50) -> list:
@@ -719,9 +866,40 @@ def norm_query(query: str) -> str:
     return " ".join(query.lower().split())
 
 
-def get_query_cache(c: sqlite3.Connection, query: str):
-    return c.execute("SELECT * FROM query_cache WHERE query=?",
-                     (norm_query(query),)).fetchone()
+#: 查询结果集缓存的存活时长。缓存的目的是「同一次探索里反复检索不重复打外网」，
+#: 不是「这个课题的结果集从此定格」——原来它**只有写入没有过期**，于是同一关键词
+#: 第二次检索永远返回第一次的结果集、`new_papers` 恒为 0，而 ingest 的模块 docstring
+#: 恰恰把「同一课题第二次检索只增量入库」当成去重的验收证据。
+#: 24 小时是按数据源的更新节奏定的：arXiv 每个工作日放新论文一次，S2/OpenAlex 的
+#: 元数据回填以天计，比一天更短只是多打外网、更长就会错过当天的新文献。
+QUERY_CACHE_TTL_HOURS = config._env_int(24, "PAPERNEST_QUERY_CACHE_TTL_HOURS")
+
+
+def papers_without_vectors(c: sqlite3.Connection, model: str) -> int:
+    """还没有 paper 级向量的论文数。
+
+    **只有 `ingest` 那条路会建向量**（`jobs._ingest_runner` 末尾那段补建）：
+    上传 PDF、导入 .bib、多格式入库都不建，而且一声不吭。真库 443 篇无向量
+    就是这么攒出来的——向量路权重 1.0，这些论文拿不到那一路的分，
+    是结构性排序偏置而不只是「覆盖不全」。
+    把这个数报出来，用户才知道该跑一次 `cli.py embed`。
+    """
+    return int(c.execute(
+        "SELECT COUNT(*) n FROM papers WHERE id NOT IN "
+        "(SELECT DISTINCT paper_id FROM vectors WHERE kind='paper' AND model=?)",
+        (model,)).fetchone()["n"])
+
+
+def get_query_cache(c: sqlite3.Connection, query: str,
+                    ttl_hours: int | None = None):
+    """命中且**未过期**的缓存行；`ttl_hours=0` 表示不使用缓存。"""
+    ttl = QUERY_CACHE_TTL_HOURS if ttl_hours is None else int(ttl_hours)
+    if ttl <= 0:
+        return None
+    return c.execute(
+        "SELECT * FROM query_cache WHERE query=? "
+        "AND ts >= datetime('now','localtime',?)",
+        (norm_query(query), f"-{ttl} hours")).fetchone()
 
 
 def put_query_cache(c: sqlite3.Connection, query: str, source: str, keys: list[str]):

@@ -517,12 +517,104 @@ def _repeated_texts(blocks: list[dict], n_pages: int) -> set[str]:
     return {k for k, v in pages.items() if len(v) >= need}
 
 
+def _visual_line_count(b: dict) -> int:
+    r"""块里有多少条**视觉行**（按基线聚合，容差 1pt）。
+
+    LaTeX 的 \section 把节号排成一个独立的行盒，与标题首行**同基线**
+    （482.pdf：'4.4' 与 'Unsupervised Dependency Parsing' 都是 y0=65.4）。
+    MuPDF 按行盒计数，于是一个两行标题报成 `n_lines=3`，被 `MAX_HEADING_LINES`
+    挡掉，整节正文并进上一节，`section_path` 从此给出错误出处。
+    按基线聚合才是 `MAX_HEADING_LINES`（「标题不会折成一整段」）的本意。
+
+    只对**带编号**的块生效：同基线多行盒在分类图的标签行里同样常见，
+    无差别放开会把 462.pdf 的 'L-PER B-PER O O'（size 4.9）和 463.pdf 的
+    'HT G HT G'（size 7.3）当成标题——实测 26 份真实 PDF 上多 2 个假标题；
+    加上 `_numbering` 这道闸之后，10 个真标题一个不少、假标题 0 个。
+    """
+    if not _numbering(b["text"]):
+        return b["n_lines"]
+    ys: list[float] = []
+    for ln in b["lines"]:
+        if not any(abs(ln["y0"] - y) <= 1.0 for y in ys):
+            ys.append(ln["y0"])
+    return len(ys) or b["n_lines"]
+
+
+def _fill_numbering_gaps(blocks: list[dict], sections: list[dict],
+                         body_size: float, repeated: set[str]) -> list[dict]:
+    """编号连续性补漏：已检出 N.k 与 N.(k+2)，中间那个块就按标题收进来。
+
+    **为什么不是「降低 HEADING_MIN_SCORE」**（审计给的修法）：实测把门槛降到 2，
+    26 份真实 PDF 多出 436 个「章节」（第 2 页分类图里 size=6.6 的图元标签整批进来），
+    误检从 67 涨到 409（6.1 倍），而真正漏掉的那 5 个标题**一个都救不回来**——
+    它们根本没走到评分那一步，是被前面的否决项拦掉的。
+    编号连续性是定位到具体缺口的信号，不是把闸门整体放松。
+
+    收得很紧，四个条件同时满足才认：
+    ① 前一个兄弟编号 N.(k-1) 已检出且在它前面；
+    ② 后一个兄弟编号 N.(k+1) 已检出且在它后面（**两侧都要夹住，单侧不认**）；
+    ③ 字号与前一个兄弟标题一致（±0.1）；
+    ④ 仍要过题注 / 页眉 / 长度三道否决。
+    实测 26 份真实 PDF：补回 5 个真标题、新增假标题 0 个。
+
+    这条路径**故意跳过** `_looks_like_sentence` 与 `n_lines` 两道否决——那正是要修的
+    东西（「6.1 在前、6.3 在后、中间摆着一个同字号的 6.2」这个证据比「末尾有个句号」
+    强得多）。代价是它不受评分门槛保护，所以用两侧夹 + 同字号锁死，并在 `matched_by`
+    里写上 `numbering_continuity`，让「凭什么认定它是标题」照样可审计。
+    """
+    seen: dict[str, dict] = {}
+    for sec in sections:
+        m = _NUM_ARABIC_RE.match(sec["title"])
+        if m and m.group(1) not in seen:
+            seen[m.group(1)] = sec
+    if not seen:
+        return sections
+
+    def sib(num: str, delta: int) -> str | None:
+        parts = num.split(".")
+        k = int(parts[-1]) + delta
+        return None if k < 1 else ".".join(parts[:-1] + [str(k)])
+
+    add: list[dict] = []
+    taken = {sec["block_index"] for sec in sections}
+    for b in blocks:
+        if b["block_index"] in taken:
+            continue
+        text = b["text"]
+        m = _NUM_ARABIC_RE.match(text)
+        if not m or m.group(1) in seen:
+            continue
+        prev, nxt = sib(m.group(1), -1), sib(m.group(1), +1)
+        if not prev or prev not in seen or seen[prev]["block_index"] >= b["block_index"]:
+            continue
+        if not nxt or nxt not in seen or seen[nxt]["block_index"] <= b["block_index"]:
+            continue
+        if abs(b["size"] - seen[prev]["font_size"]) > 0.1:
+            continue
+        if len(text) > MAX_HEADING_CHARS or _CAPTION_RE.match(text):
+            continue
+        if _PAGENO_RE.sub("#", text) in repeated:
+            continue
+        score, matched, level = _score_heading(b, body_size)
+        add.append({
+            "title": text, "level": level, "page_no": b["page_no"],
+            "block_index": b["block_index"],
+            "matched_by": matched + ["numbering_continuity"],
+            "font_size": b["size"], "score": score,
+        })
+        seen[m.group(1)] = add[-1]
+        taken.add(b["block_index"])
+    if not add:
+        return sections
+    return sorted(sections + add, key=lambda sec: sec["block_index"])
+
+
 def _detect_sections(blocks: list[dict], body_size: float, n_pages: int) -> list[dict]:
     repeated = _repeated_texts(blocks, n_pages)
     out: list[dict] = []
     for b in blocks:
         text = b["text"]
-        if not text or b["n_lines"] > MAX_HEADING_LINES:
+        if not text or _visual_line_count(b) > MAX_HEADING_LINES:
             continue
         if len(text) > MAX_HEADING_CHARS:
             continue
@@ -546,6 +638,7 @@ def _detect_sections(blocks: list[dict], body_size: float, n_pages: int) -> list
             "font_size": b["size"],
             "score": score,
         })
+    out = _fill_numbering_gaps(blocks, out, body_size, repeated)
     return _drop_paper_title(blocks, out)
 
 
@@ -579,7 +672,9 @@ def detect_sections(pdf_path) -> list[dict]:
 
     返回 [{title, level, page_no, block_index, matched_by, font_size, score}]，
     按出现顺序排列。matched_by 是命中的判据名（font_size / bold / all_caps /
-    numbering / keyword / short_line），让「凭什么认定它是标题」可审计。
+    numbering / keyword / short_line / numbering_continuity），让「凭什么认定它是
+    标题」可审计。`numbering_continuity` 表示这个标题是靠编号连续性补回来的，
+    它**没有**经过评分门槛与 `_looks_like_sentence` / `n_lines` 两道否决。
     一个都识别不出来时返回空列表（调用方据此走降级）。
     """
     blocks, n_pages = _read(pdf_path)
@@ -632,7 +727,7 @@ def _pack(items: list[tuple[str, int]], max_chars: int) -> list[list[tuple[str, 
 
 
 def _emit(groups, title: str, path: str, level: int, start_at: int,
-          degraded: str | None) -> list[dict]:
+          degraded: str | None, kind: str = "text") -> list[dict]:
     out: list[dict] = []
     for part, grp in enumerate(groups, 1):
         text = "\n\n".join(t for t, _ in grp)
@@ -648,6 +743,7 @@ def _emit(groups, title: str, path: str, level: int, start_at: int,
             "part": part,
             "n_parts": len(groups),
             "n_chars": len(text),
+            "kind": kind,
         }
         if degraded:
             chunk["degraded"] = degraded
@@ -658,12 +754,16 @@ def _emit(groups, title: str, path: str, level: int, start_at: int,
 PAGE_FALLBACK_NOTE = "未识别到章节结构，已退化为按页切分"
 
 
-def _page_chunks(blocks: list[dict], max_chars: int) -> list[dict]:
+def _page_chunks(blocks: list[dict], max_chars: int,
+                 drop: set[int] | None = None) -> list[dict]:
     """降级路径：按页切。扫描件 / 纯图片 / 无标题排版是常态，必须优雅降级。"""
     out: list[dict] = []
+    drop = drop or set()
     by_page: dict[int, list[tuple[str, int]]] = {}
     order: list[int] = []
     for b in blocks:
+        if b["block_index"] in drop:
+            continue
         if b["page_no"] not in by_page:
             by_page[b["page_no"]] = []
             order.append(b["page_no"])
@@ -674,23 +774,87 @@ def _page_chunks(blocks: list[dict], max_chars: int) -> list[dict]:
     return out
 
 
+#: 默认切块上限。**1000 是量出来的，不是拍的。**
+#:
+#: 长期是 4000，而那个数出自 2026-09-07 的扫描——当时评测集只有 25 篇 / 69 题，
+#: gold 口径还没修（35% 的证据含 LaTeX 占位符，永远匹配不上），选块还被块长主导。
+#: 三个前提全换掉之后重扫（274 篇 / **924 题** / 4566 条 gold 探针，等预算 2400）：
+#:
+#:     块上限   平均块数   问题召回   片段召回   vs 4000
+#:       300     158.2    0.1894    0.0655   p=5e-05 显著更差
+#:       500      94.9    0.2532    0.1067   p=0.110
+#:       700      68.6    0.3149    0.1432   p=0.038 显著
+#:      1000      49.1   **0.3366  0.1656**  p=0.0004 显著   ← 峰值
+#:      1500      34.7    0.3236    0.1551   p=0.0024 显著
+#:      4000      19.5    0.2803    0.1334   ← 原默认
+#:
+#: 倒 U 形，峰值在 1000。机制是**截窗**：单块窗口 800 字，4000 字的块要丢掉 80%，
+#: 而 1000 字的块基本能整块进上下文。小到 300/500 反而更差——块比窗口还小，
+#: 每块贡献不足 800 字，总文本量下降，gold 片段也更容易跨块被切断。
+#:
+#: 第二个评测集（自建中文集，纯 FTS 口径）改前改后**逐项一致**
+#: （Recall@5 0.7552 / 核验率 0.9 / precision@5 0.225），零回归。
+#:
+#: 改这个数之前先重跑 `tools/*` 里的扫描——它和 `rag.TARGET_WINDOW_CHARS`
+#: 是一对：窗口变了，最优块长也会变。
+DEFAULT_CHUNK_CHARS = 1000
+
 #: max_chars 的下限。再小的切分只会把句子剁碎，对检索没有意义；
 #: 传入更小的值会被抬到这里（调用方据此不能假设 n_chars <= 任意小的 max_chars）。
 MIN_CHUNK_CHARS = 200
 
 
+def _ref_block_span(blocks: list[dict], sections: list[dict]) -> tuple[int, int]:
+    """参考文献段覆盖的 block 区间 [lo, hi)。定位不到时返回空区间。
+
+    起点复用 `_ref_lines()`——它已经是本模块认定「哪里开始是参考文献」的唯一判据，
+    切块再写一套只会让两处分叉（这正是本缺陷的成因：抽条目和切块有两套不连通的判据，
+    其中一套是空的）。
+    终点取「References 之后第一个不是参考文献标题的已识别章节」，而不是 `_REF_END_RE`：
+    实测真 PDF 的附录常叫 "A Related work" / "B Mutually Exclusive Rules"，
+    `_REF_END_RE` 只认 appendix/附录，只靠它会把整个附录（16 个块、约 2.9 万字符）
+    一起扔出检索。宁可少标，不可误杀附录。
+    """
+    seg, _, _ = _ref_lines(blocks)
+    if not seg:
+        return len(blocks), len(blocks)
+    lo = seg[0]["block_index"]
+    later = [s["block_index"] for s in sections
+             if s["block_index"] >= lo and not _REF_HEAD_RE.match(s["title"])]
+    return lo, (min(later) if later else len(blocks))
+
+
+def _runs_by_kind(body: list[dict], lo: int, hi: int) -> list[tuple[str, list[dict]]]:
+    """把一节的 block 按「是否落在参考文献区间」切成连续段，保持原顺序。
+
+    绝大多数论文 References 自己就是一节，这里只产出一段；但标题没被识别成章节时
+    （25 篇真 PDF 里有 2 篇）正文与条目挤在同一节，必须切开——否则要么放走条目，
+    要么把正文一起丢出检索。
+    """
+    runs: list[tuple[str, list[dict]]] = []
+    for b in body:
+        kind = "reference" if lo <= b["block_index"] < hi else "text"
+        if not runs or runs[-1][0] != kind:
+            runs.append((kind, []))
+        runs[-1][1].append(b)
+    return runs
+
+
 def _section_chunks(blocks: list[dict], sections: list[dict],
-                    max_chars: int) -> list[dict]:
+                    max_chars: int, drop: set[int] | None = None) -> list[dict]:
     max_chars = max(MIN_CHUNK_CHARS, int(max_chars))
     if not blocks:
         return []
+    drop = drop or set()
     if not sections:
-        return _page_chunks(blocks, max_chars)
+        return _page_chunks(blocks, max_chars, drop)
 
     out: list[dict] = []
     bounds = [s["block_index"] for s in sections] + [len(blocks)]
+    ref_lo, ref_hi = _ref_block_span(blocks, sections)
 
-    head = [(b["text"], b["page_no"]) for b in blocks[:bounds[0]]]
+    head = [(b["text"], b["page_no"]) for b in blocks[:bounds[0]]
+            if b["block_index"] not in drop]
     if head:
         # 首个标题之前的内容（题名/作者/摘要）不能丢，单独成块并如实标注它没有章节归属
         out.extend(_emit(_pack(head, max_chars), "", "（文首，章节之前）", 0, 0, None))
@@ -703,15 +867,18 @@ def _section_chunks(blocks: list[dict], sections: list[dict],
         stack.append((level, sec["title"]))
         path = " > ".join(t for _, t in stack)
         body = blocks[sec["block_index"] + 1: bounds[i + 1]]
-        items = [(b["text"], b["page_no"]) for b in body]
-        if not items:
-            continue  # 父标题下紧跟子标题：没有正文就不产 chunk，但仍留在 path 上
-        out.extend(_emit(_pack(items, max_chars), sec["title"], path, level,
-                         len(out), None))
+        for kind, run in _runs_by_kind(body, ref_lo, ref_hi):
+            items = [(b["text"], b["page_no"]) for b in run
+                     if b["block_index"] not in drop]
+            if not items:
+                continue  # 父标题下紧跟子标题：没有正文就不产 chunk，但仍留在 path 上
+            out.extend(_emit(_pack(items, max_chars), sec["title"], path, level,
+                             len(out), None, kind))
     return out
 
 
-def section_chunks(pdf_path, max_chars: int = 4000) -> list[dict]:
+def section_chunks(pdf_path, max_chars: int = DEFAULT_CHUNK_CHARS,
+                   detected_tables: list[dict] | None = None) -> list[dict]:
     """按章节切 chunk。
 
     每个 chunk：section_title / section_path（"3 Method > 3.2 Training"）/ level /
@@ -721,13 +888,26 @@ def section_chunks(pdf_path, max_chars: int = 4000) -> list[dict]:
     每个 chunk 带 degraded="未识别到章节结构，已退化为按页切分"。
     无文本层时返回空列表。
 
+    传了 `detected_tables`（`tables.detect_tables` 的结果）时，落在表格区的 block
+    不进正文块——表格文本由 `tables.chunk_table` 单独成块，两边都留就是**存两份**。
+    不传则保持原样（留重复），调用方可以按需选择。
+
     注意：max_chars 有下限 MIN_CHUNK_CHARS(=200)，传更小的值会被静默抬到下限；
     章节标题本身不进 chunk 的 text（在 section_title / section_path 里），
     因此把所有 chunk 的 text 拼起来 ≠ 全文（少了标题行）。
     """
     blocks, n_pages = _read(pdf_path)
     sections = _detect_sections(blocks, body_font_size(blocks), n_pages)
-    return _section_chunks(blocks, sections, max_chars)
+    drop: set[int] = set()
+    if detected_tables:
+        # 表格行不进正文块——它们已经由 `tables.chunk_table` 单独成块（带表头重复）。
+        # 判据在 `tables.table_owned_blocks`，那里同时用几何与文本两条，并放过表题。
+        from . import tables as _tables
+        try:
+            drop = _tables.table_owned_blocks(blocks, detected_tables)
+        except Exception:
+            drop = set()      # 去重是优化，坏了就退回「留着重复」，不能拖垮切块
+    return _section_chunks(blocks, sections, max_chars, drop)
 
 
 # ── ④ 参考文献抽取（0 token，纯正则）──

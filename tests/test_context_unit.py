@@ -188,7 +188,7 @@ class NegativeResultIsPinned(unittest.TestCase):
     def test_default_context_unit_is_page(self):
         self.assertEqual(
             rag.CONTEXT_UNIT, "page",
-            "2026-09-03 修完 span 拼接吃空格、重切全库之后重测："
+            "修完 span 拼接吃空格、重切全库之后重测："
             "保真缺口已归零（strip 与保留空白两个口径逐位相同），"
             "但 page→chunk 仍是 0.2614→0.2500（-0.0114，17/88 题变化，p=1.0）——"
             "**实质持平，没有可测量的收益**。没有收益就不改主路径的默认值。"

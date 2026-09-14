@@ -115,6 +115,7 @@ def pending(model: str | None = None) -> list[dict]:
                    ON v.paper_id = c.paper_id AND v.kind = 'chunk'
                       AND v.idx = c.chunk_no AND v.model = ?
                 WHERE v.id IS NULL AND c.text IS NOT NULL
+                      AND c.kind IS NOT 'reference'
                 ORDER BY c.paper_id, c.chunk_no""", (m,)).fetchall()
     out = []
     for r in rows:

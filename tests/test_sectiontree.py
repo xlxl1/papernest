@@ -558,8 +558,12 @@ class TwoStageTests(SectionTreeBase):
         self.assertEqual(res["mode"], "degraded_full")
         self.assertEqual(res["paper_ids"], [])
         self.assertEqual(res["passages"], [])
-        self.assertEqual(st.build_all(),
-                         {"indexed": 0, "skipped": 0, "failed": 0, "errors": []})
+        self.assertEqual(
+            st.build_all(),
+            # 新增的两个键是纯增量：build_all 原来把 build_index 的 degraded
+            # 整个丢在栈里，cli 打出来是「建索引 45 篇 · 跳过 0 · 失败 0」一片祥和。
+            {"indexed": 0, "skipped": 0, "failed": 0, "errors": [],
+             "degraded": None, "degraded_detail": []})
 
     def test_two_runs_give_identical_results(self):
         """跨次确定性：本项目踩过「同一评测集连跑两次两个 Recall」的坑。"""

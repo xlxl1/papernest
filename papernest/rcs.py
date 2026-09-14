@@ -29,7 +29,16 @@ POOL_FACTOR = 3
 MAX_POOL = 15
 #: 单篇喂给重排/摘要的原文上限（重排只需要判相关性，不用看全文）
 RERANK_CHARS = 700
-SUMMARY_CHARS = 3000
+SUMMARY_CHARS = 6000
+#: 定向摘要一次给几页。预算按真库的证据分布反推，不是拍脑袋的倍数：
+#: abstract+卡片（head）长度 p90=1223 字符，gold 证据段长度 p90=864 字符
+#: ⇒ cap >= head_p90 + SUMMARY_PAGES × span_p90 = 1223 + 4×864 ≈ 4679，取整到 6000。
+#: 旧的 3000 下单页窗口只有 (3000-1223)/4 ≈ 444 字符 < 证据段 p75(580)——
+#: **选对了页也要把证据腰斩**。这条是本次改动里唯一显著的部分：
+#: 前3页@3000 → 前3页@6000 的问题级证据覆盖 10.2% → 29.7%，b=23 c=0、p=2.4e-07
+#: （QASPER n=118，零退化）。上限不再往上加：8000 档增益已明显收窄，而 SUMMARY_CHARS
+#: 是**每篇一次**（rag.MAX_CONTEXT_CHARS=24000 是整轮一次），代价按 top_k 倍增。
+SUMMARY_PAGES = 4
 
 RERANK_SYSTEM = """你在给文献按「能否回答用户的问题」排序。
 给你一个问题和若干候选文献（编号 + 标题 + 摘要片段）。
@@ -73,17 +82,50 @@ def _load(paper_ids: list[int]) -> dict[int, dict]:
     return out
 
 
-def _body_text(item: dict, cap: int) -> str:
-    """候选的可读文本：摘要 + 卡片要点 + 全文前若干页（有的话）。"""
+def _body_text(item: dict, cap: int, question: str = "") -> str:
+    """候选的可读文本：摘要 + 卡片要点 + **问句命中的若干页**（有的话）。
+
+    原来是 `list(pages.items())[:3]` —— 恒定前 3 页。pages 的 key 顺序确实是页序
+    （`_load` 的 SQL 带 ORDER BY page_no，真库 40 篇里 0 篇乱序），所以那真的就是
+    全文的前 3 页：库里唯一一篇真实 PDF（26 页、17.8 万字符）实测只有 **0.69%** 的
+    正文进得来，head 就占掉 3000 预算的 59%。
+
+    两层截断是**串联**的，必须一起解——但因子分解的结论和直觉相反，
+    **显著的那一半是预算，不是选页**（QASPER dev × 真库，n=118 题 / 422 条 gold 证据，
+    问题级覆盖率，McNemar 精确二项）：
+
+      前3页@3000（改前） 10.2%  |  挑页@3000  11.0%  |  前3页@6000 29.7%
+      挑页@6000（上线）  39.0%  |  前3页@8000 37.3%  |  挑页@8000  44.1%
+
+      预算 3000→6000（前3页不变）      b=23 c=0   p=2.4e-07  **显著且零退化**
+      挑页 vs 前3页 @3000（等预算）    b=10 c=9   p=1.0      不显著
+      挑页 vs 前3页 @6000（等预算）    b=25 c=14  p=0.108    不显著
+      挑页 vs 前3页 @8000（等预算）    b=28 c=20  p=0.312    不显著
+
+    所以对外只能说「放开预算显著提升了证据覆盖」，**不能说「按问句挑页更准」**。
+    仍然改用 `rag._pick_pages`（密度归一 + 命中窗口，已在 `_page_context` 上验过）
+    的理由是三条工程判断，不是实测收益：三档预算上它在两个口径都不退化；
+    它零 token 成本；而且 QASPER 的一「页」只是一节（中位 1227 字符），
+    对真实 PDF（单页 5.7k~8.9k 字符）`[:3]` 的危害要大得多——cap=6000 扣掉 head
+    只够装真 PDF 的第 1 页，库里只有 1 篇真实 PDF，这一点测不出来。
+    选不出页时原样退回 `[:3]`，不引入新的空上下文。
+    """
+    from . import rag
     row, card = item["row"], item["card"]
     parts = [row.get("abstract") or ""]
     for k in ("tldr", "method", "results", "limitations"):
         v = card.get(k)
         if isinstance(v, str) and v.strip():
             parts.append(v.strip())
-    for _pno, text in list(item["pages"].items())[:3]:
-        parts.append(text)
-    return re.sub(r"\s+", " ", " ".join(p for p in parts if p)).strip()[:cap]
+    head = re.sub(r"\s+", " ", " ".join(p for p in parts if p)).strip()
+    terms = rag._query_terms(question)
+    picked: list[str] = []
+    budget = cap - len(head)
+    if terms and budget > 0:
+        picked = rag._pick_pages(item["pages"], terms, SUMMARY_PAGES, budget)
+    if not picked:          # 无问句 / 词面全不命中 / 预算已被 head 吃光：维持原行为
+        picked = [t for _pno, t in list(item["pages"].items())[:3]]
+    return re.sub(r"\s+", " ", " ".join([head] + [p for p in picked if p])).strip()[:cap]
 
 
 # ── ① 重排 ──
@@ -149,6 +191,9 @@ def rerank(question: str, paper_ids: list[int], top_k: int) -> tuple[list[int], 
 #: PDF 抽出来的文本自带一堆排版伪影，逐字比对前必须先抹平，否则模型明明照抄了
 #: 也验不过（假阴性比假阳性更隐蔽：它会把真证据标成「未核验」，让人不敢用）。
 _SOFT_HYPHEN = dict.fromkeys(map(ord, "­‐‑‒–—-"), None)
+#: `rag._pick_pages` 往上下文里插的页标记（与截断省略号）。它们是**我们自己插进去的**、
+#: 不在原文里，模型逐字照抄时会连着抄回来，比对前必须剔除，否则真证据被判「未核验」。
+_PAGE_MARK = re.compile(r"【第\s*\d+\s*页】|…")
 
 
 def _norm_quote(s: str) -> str:
@@ -158,7 +203,10 @@ def _norm_quote(s: str) -> str:
     ② 连字 ﬁ/ﬂ（NFKC 展开成 fi/fl）；③ 全角/半角标点混用。
     """
     import unicodedata
-    text = unicodedata.normalize("NFKC", s or "")
+    # 页标记与截断省略号是我们自己插进去的，不在原文里。模型按「逐字摘抄」的要求
+    # 照抄时会连它们一起抄回来 —— 验不过就是**假阴性**（把真证据标成「未核验」，
+    # 让人不敢用），正是本文件上面那段注释点名要避免的失效。先抹掉。
+    text = unicodedata.normalize("NFKC", _PAGE_MARK.sub("", s or ""))
     return re.sub(r"\s+", "", text).translate(_SOFT_HYPHEN).lower()
 
 
@@ -191,7 +239,7 @@ def summarize_for(question: str, paper_ids: list[int]) -> tuple[dict[int, dict],
         it = items.get(pid)
         if not it:
             continue
-        body = _body_text(it, SUMMARY_CHARS)
+        body = _body_text(it, SUMMARY_CHARS, question)
         if not body:
             continue
         user = (f"问题：{question}\n\n"

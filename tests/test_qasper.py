@@ -135,3 +135,97 @@ class QasperTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class GoldProbesStripWhatPdfCanNeverContainTests(unittest.TestCase):
+    """QASPER 的 gold 证据抽自论文的 **LaTeX 源码**，我们的正文抽自 **PDF**。
+
+    LaTeX 里的占位 token 在 PDF 里是渲染好的东西，两边**永远对不上**：
+
+        BIBREF19        → (Zoph et al., 2016)
+        $p(w_i|t_j)$    → 排版好的公式字形
+        DBLP:conf/...   → 正常的引用文字
+
+    真库实测（405 条 gold）：35.3% 含 BIBREF 一类占位符；含数学记号的探针
+    达成率只有 **3.9%（13/334）**。不切开就等于把这些条目白白算进分母——
+    **`span_recall` 的天花板被自己压低了**，据它调检索参数就是在追假象。
+
+    切开之后（274 篇 / 4542 条探针）：相对上界的达成率 **55.8% → 59.9%**，
+    问题召回 0.2704 → 0.2803，片段召回 0.1247 → 0.1306。
+
+    只取**最长**的那一段是防灌水：一条 gold 被引用切成几截时，
+    短截片（"we compare our approaches with"）到处都能命中。
+    """
+
+    def test_bibref_is_stripped(self):
+        p = qasper.gold_probes(
+            "we compare with BIBREF19, and cross-lingual transfer without pretraining")
+        self.assertTrue(p)
+        self.assertNotIn("bibref", p[0])
+
+    def test_inline_math_is_stripped(self):
+        p = qasper.gold_probes(
+            "sorted by $p(w_i|t_j)$, the probability of word i in topic j here")
+        self.assertTrue(p)
+        self.assertNotIn("$", p[0])
+
+    def test_latex_commands_are_stripped(self):
+        p = qasper.gold_probes(
+            r"we set \alpha to 0.5 and evaluate on the standard benchmark suite")
+        self.assertTrue(p)
+        self.assertNotIn("alpha", p[0])
+
+    def test_dblp_keys_are_stripped_case_insensitively(self):
+        p = qasper.gold_probes(
+            "DBLP:conf/naacl/AnastasopoulosC18 proposed a triangle multi-task strategy")
+        self.assertTrue(p)
+        self.assertNotIn("dblp", p[0])
+
+    def test_a_bracketed_reference_is_not_mistaken_for_latex(self):
+        r"""`\[a-zA-Z]+` 少写一个反斜杠就会把 `table [3]` 当成 LaTeX 命令切掉。"""
+        p = qasper.gold_probes(
+            "results in table [3] show a clear improvement over the baseline system")
+        self.assertTrue(p)
+        self.assertIn("table[3]", p[0])
+
+    def test_plain_prose_is_untouched(self):
+        s = "a perfectly ordinary sentence of sufficient length with nothing special"
+        self.assertEqual(qasper.gold_probes(s), [qasper._norm(s)])
+
+    def test_only_the_longest_fragment_is_kept(self):
+        """短截片到处都能命中，留着会把指标灌水。"""
+        p = qasper.gold_probes(
+            "we show BIBREF1 that the proposed multilingual transfer approach "
+            "consistently improves over every baseline we tried BIBREF2 ok")
+        self.assertEqual(len(p), 1)
+        self.assertIn("consistentlyimproves", p[0])
+
+    def test_a_span_that_is_all_placeholders_yields_nothing(self):
+        self.assertEqual(qasper.gold_probes("BIBREF1 BIBREF2 FLOAT SELECTED"), [])
+
+    def test_fragments_below_the_floor_are_dropped(self):
+        self.assertGreaterEqual(qasper.MIN_PROBE_CHARS, 20)
+        self.assertEqual(qasper.gold_probes("BIBREF1 short bit BIBREF2"), [])
+
+
+class EvalFixturesStayOutOfTheLibraryTests(unittest.TestCase):
+    """274 份评测 PDF **不进用户的文献库**。
+
+    它们是夹具：混进 `papers` 表会污染检索（凭空多出几百篇 NLP 论文参与召回），
+    也会让库里的统计口径失真。`eval_tasks()` 直接从目录按 arXiv id 读。
+    """
+
+    def test_eval_tasks_reads_the_directory_directly(self):
+        import inspect
+        src = inspect.getsource(qasper.eval_tasks)
+        self.assertIn("EVAL_PDF_DIR", src)
+        self.assertIn("glob", src)
+
+    def test_the_fetcher_does_not_tell_you_to_import_them(self):
+        src = (config.ROOT / "tools" / "fetch_qasper_pdfs.py").read_text(encoding="utf-8")
+        self.assertNotIn("cli.py import-pdf", src,
+                         "又在提示把评测夹具导进文献库了")
+
+    def test_the_directory_is_gitignored(self):
+        gi = (config.ROOT / ".gitignore").read_text(encoding="utf-8")
+        self.assertIn("data/qasper_pdf", gi)

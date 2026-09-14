@@ -10,9 +10,9 @@ from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Str
 from pydantic import BaseModel, Field
 
 from . import (agent, bibimport, cards, chat, cite, config, db, deepsearch, degrade,
-               embeddings, fulltext, graph, jobs, llm, matrix, pdfimport, pipeline,
-               pptgen, rag, structure, subscribe, survey, symbols, tablegen,
-               workspace, writing)
+               embeddings, fulltext, graph, jobs, llm, log, matrix, pdfimport,
+               pipeline, pptgen, rag, structure, subscribe, survey, symbols,
+               tablegen, workspace, writing)
 from .schemas import (
     AgentRequest,
     DocumentCreate,
@@ -27,6 +27,8 @@ from .schemas import (
     WriteTopicSelect,
     WritingRequest,
 )
+
+_log = log.get("api")
 
 app = FastAPI(title="PaperNest", docs_url=None, redoc_url=None)
 WEB = Path(__file__).resolve().parent.parent / "web"
@@ -96,6 +98,20 @@ async def _auth(request: Request, call_next):
         if not hmac.compare_digest(got.encode("utf-8"), API_KEY.encode("utf-8")):
             return JSONResponse({"detail": "缺少或错误的 API key"}, status_code=401)
     return await call_next(request)
+
+
+@app.exception_handler(Exception)
+async def _log_unhandled(request: Request, exc: Exception):
+    """未捕获的异常：**先记下来**，再返回 500。
+
+    没有这个处理器时，traceback 只会被 uvicorn 打到控制台——后台起服务
+    （`serve &`、docker、开机自启）时那份输出根本没人接，出了事只剩一句
+    「500 Internal Server Error」。本机单用户不需要告警，但需要**事后查得到**。
+    响应体保持 FastAPI 默认的形状，不把内部错误文本透给客户端。
+    """
+    _log.exception("未处理的异常 %s %s", request.method, request.url.path)
+    return JSONResponse({"detail": "服务器内部错误，详见 data/papernest.log"},
+                        status_code=500)
 
 
 @app.on_event("startup")
@@ -463,8 +479,12 @@ def upload_pdfs(files: list[UploadFile] = File(...), topic: str = "",
         except Exception as exc:                      # 解析层的意外不该 500 掉整批
             failed.append({"filename": f.filename,
                            "error": f"{type(exc).__name__}: {str(exc)[:200]}"})
-    return {"imported": len(results), "failed": len(failed),
-            "papers": results, "errors": failed}
+    out = {"imported": len(results), "failed": len(failed),
+           "papers": results, "errors": failed}
+    # 上传这条路**不建向量**（建向量要花钱，不该在用户没同意时偷偷花），
+    # 但必须说出来——真库 443 篇无向量正是这么攒出来的，而向量路权重 1.0。
+    jobs._note_missing_vectors(out)
+    return out
 
 
 @app.get("/api/papers/uploads")
@@ -582,7 +602,12 @@ def graph_local_references(paper_id: int):
 
 @app.get("/api/paper/{paper_id}/neighbors")
 def graph_neighbors(paper_id: int, depth: int = 1, limit: int = 50):
-    return graph.neighbors(paper_id, depth, limit)
+    # graph.neighbors 对不在库的 paper_id 抛 GraphError。不接就是 500 + 裸 traceback，
+    # 而同一模块紧邻的另外两个路由都规规矩矩映射成 400——同一类错误两种口径。
+    try:
+        return graph.neighbors(paper_id, depth, limit)
+    except graph.GraphError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 class RelatedBody(BaseModel):
@@ -593,7 +618,10 @@ class RelatedBody(BaseModel):
 @app.post("/api/graph/related")
 def graph_related(body: RelatedBody):
     """共被引 + 文献耦合推荐（纯读库，不联网、不调 LLM）。"""
-    return {"related": graph.related(body.paper_ids, body.top_k)}
+    try:
+        return {"related": graph.related(body.paper_ids, body.top_k)}
+    except graph.GraphError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.get("/api/graph/gaps")
@@ -829,7 +857,11 @@ def paper_detail(paper_id: int):
 
 class ChatBody(BaseModel):
     messages: list[dict]
-    top_k: int = 5
+    # 必须有上下界。`top_k` 一路传到 SQL 的 LIMIT，而 **SQLite 的 `LIMIT -1` 是
+    # 「不限」**（实测：10 行的表 `LIMIT -1` 返回 10 行）——传 -1 会让一次请求
+    # 把全库拉回来拼进 prompt。上界与 `/api/answer/deep` 的 DeepBody 对齐（le=20）：
+    # 同一个参数在相邻端点上两套口径本身就是坑。
+    top_k: int = Field(5, ge=1, le=20)
     session_id: str | None = None   # 传了就启用服务端会话记忆；不传行为与以前一致
 
 
@@ -840,6 +872,9 @@ def do_chat(body: ChatBody):
             if body.session_id is not None else None
         return rag.answer(body.messages, body.top_k, session_id=sid)
     except Exception as e:
+        # 形状不改：前端把 answer 渲染成气泡里的 ⚠，改成非 2xx 会打坏它。
+        # 但异常必须留痕——否则 traceback 连同栈帧一起消失，事后无从复盘。
+        _log.exception("chat 失败 session=%s", body.session_id)
         return {"answer": f"⚠ {e}", "sources": [], "error": True}
 
 
@@ -929,7 +964,10 @@ def chat_session_delete(session_id: str):
 
 class SurveyBody(BaseModel):
     topic: str
-    top_k: int = 10
+    # 综述比问答吃更多篇，但同样不能无界：`survey._context_blocks` 没有字符预算，
+    # top_k 大到一定程度就会拼出十几万字符的 prompt，而 `llm.chat` 对 400 不重试
+    # ——用户看到的是一句透传的 provider 英文报错。
+    top_k: int = Field(10, ge=1, le=30)
 
 
 @app.post("/api/survey")
@@ -937,6 +975,7 @@ def do_survey(body: SurveyBody):
     try:
         return survey.generate(body.topic, body.top_k)
     except Exception as e:
+        _log.exception("survey 生成失败 topic=%s", body.topic)
         return {"survey": f"⚠ {e}", "sources": [], "checks": [], "error": True}
 
 
@@ -965,7 +1004,7 @@ def do_export(body: ExportBody):
         return str(e)
 
 
-# ── 写作流水线（二期：选题/大纲/撰写/文献/润色 五 Agent 确定性流水线）──
+# ── 写作流水线（选题/大纲/撰写/文献/润色 五 Agent 确定性流水线）──
 # 两个人工检查点：定题（选题后）、改纲（大纲后）。检查点 = 任务结束等指令，
 # 确认即提交下一阶段任务——断点续跑天然成立。文献 Agent 实施引用白名单制。
 
@@ -1154,6 +1193,7 @@ def do_extract_symbols(paper_id: int):
     try:
         return symbols.extract_for_paper(paper_id)
     except Exception as e:
+        _log.exception("符号抽取失败 paper_id=%s", paper_id)
         return {"error": str(e)}
 
 
@@ -1175,6 +1215,7 @@ def do_table(body: TableBody):
     try:
         return tablegen.compare(body.paper_ids, body.aspect)
     except Exception as e:
+        _log.exception("对比表生成失败 paper_ids=%s", body.paper_ids)
         return {"error": str(e)}
 
 

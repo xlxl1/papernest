@@ -13,6 +13,9 @@
   · 抽不到就留空，并在 cell.note 写明「卡片与全文均未覆盖」——空格是结论，不是遗漏。
 
 coverage / verified_rate 是这张表的自证指标：用户一眼能看出「这表有多少格子真有依据」。
+verified_rate 的分母只含**需要**回取校验的格子（模型或卡片写的句子）；离线按关键词从
+原文逐字摘录的格子 verified=None、单独计进 cells_excerpted——它们的出处由「切片就是原文」
+构造性保证，拿它去做回取是恒真，混进比例里会把这个指标变成空转读数。
 """
 import csv
 import io
@@ -150,14 +153,40 @@ def _split_sentences(text: str) -> list[str]:
     return [s.strip() for s in _SENT_SPLIT.split(text or "") if s and s.strip()]
 
 
-def _clip(sent: str, kw: str) -> str:
+_KW_RE_CACHE: dict[str, "re.Pattern"] = {}
+
+
+def _kw_re(kw: str) -> "re.Pattern":
+    """关键词匹配器：只挡**左**边界，不挡右边界。
+
+    裸子串（`k in text.lower()`）会让 'f1' 命中引文占位符 'BIBREF1' / 'TABREF1' /
+    'FIGREF1'、'accuracy' 命中 bibkey 'flickinger2011accuracy'、
+    'limitation' 命中 'delimitation'。真库 45 篇有全文的论文里 38 篇含 BIBREF 占位符，
+    而占位符几乎总在第 1 页 Introduction，`_locate` 又是最先命中即返回——
+    于是坏命中系统性地压在 p.1 上（实测 18/172 个离线格子，「评测指标」列 17/42）。
+
+    右边界不能挡：真库 39 个 dataset 格子里 38 个命中的是 'datasets'，
+    outperform→outperforms、limitation→limitations 同理，挡了会把真实命中一起打没。
+    规则读作「前缀被更长的 token 吞掉 = 噪声；后缀生长 = 词形变化，放行」。
+    中日韩关键词不含 [0-9a-z]，这条左边界断言对它们自动放行。
+    """
+    k = kw.lower()
+    pat = _KW_RE_CACHE.get(k)
+    if pat is None:
+        pat = _KW_RE_CACHE[k] = re.compile(r"(?<![0-9a-z])" + re.escape(k))
+    return pat
+
+
+def _clip(sent: str, kw: str, at: int = -1) -> str:
     """长句（PDF 里常见一整段没有句号）截成关键词附近的窗口。
 
-    只做「取子串」不做改写——截出来的仍是原文逐字片段，回取校验才验得上。
+    只做「取子串」不做改写——截出来的仍是原文逐字片段。
+    `at` 是调用方已经算出的命中下标：不传就退回裸 find，但那会把窗口对准句子里第一个
+    **词面**巧合（比如 BIBREF1 里的 f1），而不是 `_kw_re` 认可的那一次真命中。
     """
     if len(sent) <= _MAX_SENT:
         return sent
-    i = sent.lower().find(kw.lower())
+    i = at if at >= 0 else sent.lower().find(kw.lower())
     if i < 0:
         return sent[:_MAX_SENT]
     start = max(0, i - _MAX_SENT // 3)
@@ -235,8 +264,13 @@ EMPTY_NOTE = "卡片与全文均未覆盖"
 
 def _cell(value=None, source=None, page=None, quote=None,
           verified=False, note=None) -> dict:
-    return {"value": value, "source": source, "page": page,
-            "quote": quote, "verified": bool(verified), "note": note}
+    """`verified` 是**三态**：True=回取通过 / False=回取失败 / None=这条路径上无从断言。
+
+    None 只用在离线 `_locate` 路径：那里的 quote 就是原文切片，回取自己恒真
+    （见 `_offline_cell`），报一个恒真的布尔值会把 `verified_rate` 变成 mode 的函数。
+    """
+    return {"value": value, "source": source, "page": page, "quote": quote,
+            "verified": None if verified is None else bool(verified), "note": note}
 
 
 def empty_cell(note: str = EMPTY_NOTE) -> dict:
@@ -418,20 +452,22 @@ def _locate(pages: dict[int, str], abstract: str,
     """
     ordered = [(no, pages[no] or "") for no in sorted(pages)]
     for kw in keywords:
-        k = kw.lower()
+        pat = _kw_re(kw)
         for page_no, text in ordered:
-            if k not in text.lower():
+            if not pat.search(text.lower()):
                 continue
             for sent in _split_sentences(text):
-                if k in sent.lower():
-                    return _clip(sent, k), page_no, f"page:{page_no}"
+                m = pat.search(sent.lower())
+                if m:
+                    return _clip(sent, kw, m.start()), page_no, f"page:{page_no}"
     for kw in keywords:  # 没有全文时退到摘要：没有页码，如实标 source=abstract
-        k = kw.lower()
-        if k not in (abstract or "").lower():
+        pat = _kw_re(kw)
+        if not pat.search((abstract or "").lower()):
             continue
         for sent in _split_sentences(abstract):
-            if k in sent.lower():
-                return _clip(sent, k), None, "abstract"
+            m = pat.search(sent.lower())
+            if m:
+                return _clip(sent, kw, m.start()), None, "abstract"
     return None
 
 
@@ -456,12 +492,17 @@ def _offline_cell(col: dict, paper: dict, ctx: dict) -> dict:
     hit = _locate(paper["pages"], paper["abstract"], _keywords_for(col))
     if hit:
         sent, page_no, source = hit
-        # 原句是从库内那一页/摘要里切出来的，就拿那一段做回取，口径与在线路径一致
-        scope = ctx["abstract"] if page_no is None else ctx["by_page"].get(page_no, "")
+        # 这句是从库内那一页/摘要里**逐字切出来**的：`_norm` 是逐字符映射（删空白 + 小写），
+        # 对拼接同态，而 `_locate` 返回的必然是该页文本的连续切片，所以 _norm(sent) 必然是
+        # _norm(page) 的连续子串 —— `verify_quote(sent, 同一页)` **构造上恒为 True**
+        # （真库 566 页 13876 句 + 478 篇摘要 3616 句穷举，零反例）。
+        # 恒真的断言不是校验：这条路径不报 verified（None = 不适用），出处改由
+        # source/page 承载，导出层标【逐字摘录】。
+        # 「它是否真的回答了这一列」仍然未经验证 —— 那正是这个标记要提示的事。
         note = (f"全文中按列名「{col['key']}」词面命中的原句（仅词面匹配，非语义判定，请人工确认）"
                 if _derived_keywords(col) else None)
         return _cell(value=sent, source=source, page=page_no, quote=sent,
-                     verified=verify_quote(sent, scope), note=note)
+                     verified=None, note=note)
     return empty_cell()
 
 
@@ -631,9 +672,13 @@ def extract_llm(paper_ids, columns=None, progress=None, topic: str | None = None
 def _finish(cols: list[dict], rows: list[dict], errors: list[dict],
             mode: str, degraded: str | None) -> dict:
     total = len(rows) * len(cols)
-    filled = sum(1 for r in rows for c in r["cells"].values() if c.get("value"))
-    verified = sum(1 for r in rows for c in r["cells"].values()
-                   if c.get("value") and c.get("verified"))
+    cells = [c for r in rows for c in r["cells"].values() if c.get("value")]
+    filled = len(cells)
+    # 分母只算「回取校验有内容可断言」的格子。离线逐字摘录的 verified 是 None：
+    # 把它算进分子分母，这个比例就成了 mode 的函数、而不是数据质量的函数
+    # （真库离线全表 176 个非空格子里，verify_quote 真正做过工作的只有 4 个）。
+    checkable = [c for c in cells if c.get("verified") is not None]
+    verified = sum(1 for c in checkable if c["verified"])
     return {
         "columns": cols,
         "rows": rows,
@@ -641,10 +686,15 @@ def _finish(cols: list[dict], rows: list[dict], errors: list[dict],
         "cells_total": total,
         "cells_filled": filled,
         "cells_verified": verified,
+        "cells_checkable": len(checkable),           # 需要回取校验的非空格子
+        "cells_excerpted": filled - len(checkable),  # 逐字摘录，校验对其不适用
         "coverage": round(filled / total, 4) if total else 0.0,
-        # 分母是「非空单元格」而不是全部格子：空格代表原文没写，拿它去摊薄
-        # 校验通过率会把「诚实留空」惩罚成「质量差」，读数就没意义了。
-        "verified_rate": round(verified / filled, 4) if filled else 0.0,
+        # 分母是「**需要**回取校验的非空单元格」：空格代表原文没写，拿它去摊薄通过率
+        # 会把「诚实留空」惩罚成「质量差」；而逐字摘录格子的回取恒真，算进去会把通过率
+        # 顶成一个与数据质量无关的常数（真库实测 0.983，其中 171/173 是恒真产物）。
+        # 没有可校验格子时给 None（显示「—」）而不是 0.0——一张全是逐字摘录的离线表
+        # 报 0% 会被读成「全都没通过校验」，那比报恒真的 100% 更糟。
+        "verified_rate": round(verified / len(checkable), 4) if checkable else None,
         "degraded": degraded,
         "errors": errors,
     }
@@ -716,7 +766,9 @@ LEAD_HEADERS = ["ID", "文献", "年份"]
 EMPTY_LEGEND = "空格 = 原文未覆盖，非遗漏（PaperNest 不编造缺失内容）"
 _TRUNC_NOTE = ("末尾「…」= 该格已截断至 {n} 字以内便于横向对比；"
                "完整内容见 CSV 导出或 /api/matrix 的 JSON")
-MARK_LEGEND = "【p.N】= 依据句所在页；【未核验】= 未通过原文机械回取校验"
+MARK_LEGEND = ("【p.N】= 依据句所在页；【未核验】= 未通过原文机械回取校验；"
+               "【逐字摘录】= 该格是按关键词从该页原文逐字切出的句子——出处由构造保证，"
+               "但「它是否回答了这一列」未经校验，请人工确认")
 
 
 def _pct(x: float) -> str:
@@ -766,19 +818,29 @@ def _cell_text(cell: dict, with_marks: bool = True, max_chars: int = 0) -> str:
     page = cell.get("page")
     if page:
         marks.append(f"p.{page}")
-    if not cell.get("verified"):
+    v = cell.get("verified")
+    if v is None:      # 逐字摘录：既不能不标（读者会当成已核验），也不能标未核验（那是诬告）
+        marks.append("逐字摘录")
+    elif not v:
         marks.append("未核验")
     return f"{text}【{' '.join(marks)}】" if marks else text
 
 
 def _footnotes(matrix: dict, with_marks: bool = True) -> list[str]:
+    rate = matrix.get("verified_rate")
+    checkable = matrix.get("cells_checkable", matrix.get("cells_filled", 0))
+    excerpted = matrix.get("cells_excerpted", 0)
     notes = [
         f"覆盖率 {_pct(matrix.get('coverage', 0.0))}"
         f"（非空 {matrix.get('cells_filled', 0)}/{matrix.get('cells_total', 0)} 格）",
-        f"回取校验通过率 {_pct(matrix.get('verified_rate', 0.0))}"
-        f"（通过 {matrix.get('cells_verified', 0)}/{matrix.get('cells_filled', 0)} 非空格）",
+        (f"回取校验通过率 {_pct(rate)}"
+         f"（通过 {matrix.get('cells_verified', 0)}/{checkable} 个需要回取校验的格子）"
+         if rate is not None else "回取校验通过率 —（本表没有需要回取校验的格子）"),
         EMPTY_LEGEND,
     ]
+    if excerpted:
+        notes.append(f"另有 {excerpted} 格是按关键词从原文逐字摘录的，出处由构造保证，"
+                     "不计入回取校验通过率的分子与分母")
     if with_marks:  # with_marks=False 的表里根本没有标记，再解释一遍标记就是噪声
         notes.append(MARK_LEGEND)
     return notes
@@ -887,7 +949,7 @@ def to_latex(matrix: dict, with_marks: bool = True,
         r"\begin{table}[htbp]", r"\centering", r"\footnotesize",
         rf"\caption{{{_tex_escape(caption)}"
         rf"（覆盖率 {_tex_escape(_pct(matrix.get('coverage', 0.0)))}，"
-        rf"回取校验通过率 {_tex_escape(_pct(matrix.get('verified_rate', 0.0)))}）}}",
+        rf"回取校验通过率 {_tex_escape('—' if matrix.get('verified_rate') is None else _pct(matrix['verified_rate']))}）}}",
         r"\label{tab:papernest-matrix}",
         rf"\begin{{tabular}}{{{spec.strip()}}}",
         r"\toprule",

@@ -1,9 +1,9 @@
-"""多 Agent 写作流水线（二期）：选题 → 大纲 → 撰写⇄文献 → 润色 → 机械终检。
+"""多 Agent 写作流水线：选题 → 大纲 → 撰写⇄文献 → 润色 → 机械终检。
 
 五个 Agent 是职责分离（各自 prompt / 产物落库 / 缓存键 / 模型档位），不是自由对话：
-- 编排是确定性固定 DAG + 两个人工检查点（定题、改纲），复用一期任务基建
+- 编排是确定性固定 DAG + 两个人工检查点（定题、改纲），复用既有任务基建
   （每个阶段 = jobs.kind='write' 的一个异步任务；检查点 = 任务结束、等用户指令）；
-- 文献 Agent 是一期 cite.recommend 在写作循环内的化身——引用白名单制：
+- 文献 Agent 是 cite.recommend 在写作循环内的化身——引用白名单制：
   生成稿每条 [n] 必须来自「证据句机械回取校验通过」的文献，防引用幻觉下移到写作；
 - 节级内容寻址缓存：hash(prompt 版本, 标题, 论点, 术语表) 为键（不含大纲版本——
   改别处不影响本节），重跑未变节 0 token；单节强制重跑绕过缓存。
@@ -110,9 +110,18 @@ def _update_run(run_id: str, **fields):
 
 # ── Agent 0：文献 Agent（引用白名单）─────────────────────────────
 
-def _verify_quote(paper_id: int, quote: str) -> bool:
-    """机械回取：quote 必须逐字存在于该文献的卡片/摘要原文（归一化后包含）。"""
-    if not (quote or "").strip():
+def _verify_quote(paper_id, quote) -> bool:
+    """机械回取：quote 必须逐字存在于该文献的卡片/摘要原文（归一化后包含）。
+
+    两个入参都来自**模型输出**，类型不可信：实测模型给过 `quote: 123`
+    （AttributeError: 'int' has no 'strip'）和 `paper_id: "abc"`（int() ValueError）。
+    这里就地收口，不让类型问题冒到调用方去。
+    """
+    if not isinstance(quote, str) or not quote.strip():
+        return False
+    try:
+        paper_id = int(paper_id)
+    except (TypeError, ValueError):
         return False
     with db.conn() as c:
         r = c.execute("SELECT abstract, card_json FROM papers WHERE id=?",
@@ -229,6 +238,25 @@ def _topic_context(run: dict, limit: int = 20) -> tuple[list[dict], str]:
     return papers, "\n\n".join(blocks)
 
 
+def _as_list_of_dicts(value) -> list[dict]:
+    """把模型返回的「一堆东西」规整成 list[dict]，规整不出来就给空列表。
+
+    模型的形状是会漂的：同一个 prompt，这次给 `{"topics": [{...}]}`，
+    下次可能给 `{"topics": 4}`（把数量当答案）、`{"topics": {...}}`（只给一个）、
+    或者列表里混进字符串。而下游是 `for t in topics` + `len(t["evidence"])`——
+    实测真模型上崩过一次：`TypeError: object of type 'int' has no len()`，
+    烧掉 9657 token 之后整个选题阶段失败，而旁边就摆着写好的 `_offline_topics` 兜底。
+
+    规整而不是抛异常，是因为调用方紧接着就有「空了就走离线」的分支——
+    让形状问题落进那条既有的兜底路，比多一条异常路径简单。
+    """
+    if isinstance(value, dict):
+        value = [value]
+    if not isinstance(value, list):
+        return []
+    return [x for x in value if isinstance(x, dict)]
+
+
 def stage_topic(run_id: str, progress=None) -> dict:
     """选题 Agent：库内缺口聚类 → 带证据的选题候选。产物 = topics_json，状态到检查点①。"""
     run = get_run(run_id)
@@ -249,20 +277,40 @@ def stage_topic(run_id: str, progress=None) -> dict:
         user = (f"我的课题：{run['topic']}\n\n文献卡片（[id] 为文献编号，paper_id 用它）：\n{context}")
         raw = llm.chat(TOPIC_SYSTEM, user, purpose="write_topic", temperature=0.4)
         try:
-            topics = llm.extract_json(raw).get("topics") or []
-        except llm.LLMError:
-            degraded = "选题输出未按 JSON 解析，走离线缺口候选"
+            topics = _as_list_of_dicts(llm.extract_json(raw).get("topics"))
+            if not topics:
+                degraded = "选题输出的 topics 不是可用的对象列表，走离线缺口候选"
+        except llm.LLMError as exc:
+            degraded = f"选题输出未按 JSON 解析（{exc}），走离线缺口候选"
     if not topics:
         topics, degraded2 = _offline_topics(papers)
         degraded = degraded or degraded2
 
     # 机械核验：每条 evidence 的 quote 必须逐字回取到原文
+    # 模型产物的后处理**整段兜住**。上面已经把 topics / evidence 规整成 list[dict]，
+    # 但字段值的类型仍然不可信（title 是数字、quote 是数字、paper_id 是乱码…），
+    # 而这一段每加一个字段就多一处可能崩的地方。与其逐个形状打补丁，
+    # 不如让任何意外都落进下面既有的「空了就走离线」那条路——
+    # 那条兜底就写在旁边，被一个 TypeError 炸掉等于白写。
+    clean: list[dict] = []
     for t in topics:
-        ok = 0
-        for ev in t.get("evidence") or []:
-            ev["verified"] = _verify_quote(int(ev.get("paper_id", 0)), ev.get("quote", ""))
-            ok += bool(ev["verified"])
-        t["evidence_ok"] = f"{ok}/{len(t.get('evidence') or [])}"
+        try:
+            evs = _as_list_of_dicts(t.get("evidence"))
+            for ev in evs:
+                ev["verified"] = _verify_quote(ev.get("paper_id"), ev.get("quote"))
+            t["evidence"] = evs
+            t["title"] = str(t.get("title") or "").strip()
+            t["evidence_ok"] = f"{sum(1 for e in evs if e['verified'])}/{len(evs)}"
+            if t["title"]:
+                clean.append(t)
+        except Exception as exc:                        # noqa: BLE001
+            degraded = degraded or f"有选题候选的字段形状异常已丢弃（{type(exc).__name__}）"
+    if len(clean) < len(topics):
+        degraded = degraded or f"{len(topics) - len(clean)} 个选题候选字段异常已丢弃"
+    topics = clean
+    if not topics:
+        topics, degraded2 = _offline_topics(papers)
+        degraded = degraded or degraded2
     if progress:
         progress(0.95, "topic", f"产出 {len(topics)} 个候选，等待人工定题")
     _update_run(run_id, topics=topics, status="pending_user_topic", stage="选题完成，等待定题",
@@ -374,10 +422,12 @@ def stage_outline(run_id: str, progress=None) -> dict:
         raw = llm.chat(OUTLINE_SYSTEM, user, purpose="write_outline", temperature=0.35)
         try:
             data = llm.extract_json(raw)
+            # sections 也会漂形状；不规整的话 `validate_outline` 与
+            # `len(outline["sections"])` 会拿到 int 直接崩。
             outline = {"title": data.get("title") or run["title"],
-                       "sections": data.get("sections") or []}
-        except llm.LLMError:
-            degraded = "大纲输出未按 JSON 解析，走离线模板"
+                       "sections": _as_list_of_dicts(data.get("sections"))}
+        except llm.LLMError as exc:
+            degraded = f"大纲输出未按 JSON 解析（{exc}），走离线模板"
     if not outline or not outline.get("sections"):
         outline = {"title": run["title"], "sections": _offline_outline(papers)}
         degraded = degraded or "未配置 LLM：大纲为离线模板"

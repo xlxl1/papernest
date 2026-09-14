@@ -1,6 +1,6 @@
 """对**本批修复自身**引入的缺陷的回归。
 
-这些不是历史遗留问题，是 2026-09-03 那六项修复自己带进来的——由一次独立对抗审计
+这些不是历史遗留问题，是那六项修复自己带进来的——由一次独立对抗审计
 （7 维度、每条再核验）发现。留在这里是因为它们大多是「修 A 的时候踩出 B」，
 而 B 往往正是 A 声称要消灭的那个形状。
 """
@@ -8,12 +8,18 @@ from __future__ import annotations
 
 import hmac
 import io
+import re
 import unittest
 from pathlib import Path
 from unittest import mock
 
 from papernest import api, chat, db, degrade
 from papernest.stats import describe, sign_flip_test
+
+try:                                    # discover -s tests 时 tests/ 不当包用
+    from .support import make_tempdir
+except ImportError:
+    from support import make_tempdir
 
 try:
     from .support import TempDbTestCase
@@ -55,7 +61,23 @@ class NonAsciiApiKey(unittest.TestCase):
             self.assertIn("ASCII", str(cm.exception))
 
     def test_ascii_key_passes_and_authenticates(self):
+        """**必须先把库指到临时目录**：带对口令的那次请求会真的进 `/api/stats`，
+        而它开头就是 `db.init_db()`——那是写路径，会对用户的生产库执行
+        `executescript(SCHEMA)` + `_migrate()`。实测就是这条用例把新加的
+        `table_summaries` 建到了真库里（2026-09-09）。
+        `test_eval.py` 早就为同一件事栽过一次（user_version 5→6），
+        那次是直接调 init_db，这次是隔着 TestClient 的线程池，更难看出来。
+        """
         from fastapi.testclient import TestClient
+
+        from papernest import config
+        tmp = make_tempdir(self, "papernest_apikey")
+        old_db, old_dir = config.DB_PATH, config.DATA_DIR
+        self.addCleanup(lambda: (setattr(config, "DB_PATH", old_db),
+                                 setattr(config, "DATA_DIR", old_dir)))
+        config.DATA_DIR = tmp / "data"
+        config.DB_PATH = config.DATA_DIR / "test.db"
+
         with mock.patch.object(api, "API_KEY", "s3cret-ascii"):
             api._check_key_transportable()          # 不该抛
             client = TestClient(api.app)
@@ -268,3 +290,52 @@ class AssignIndicesLockScope(TempDbTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FrontendEscapingTests(unittest.TestCase):
+    """前端三条：作者字段 XSS、内联事件属性里的引号、流式出错不渲染。
+
+    **这三条的行为已在真浏览器里验过**（起 `cli.py serve`，在真页面上跑）：
+      · `onclick="openPaperByName(${jsArg(name)})"` 对
+        "Assessing BERT's Syntactic Abilities"（真库里就有这一篇）编译成功、逐字还原；
+        而仓库原来的写法 `esc(x).replace(/'/g,'&#39;')` **是坏的**——HTML 解析器会在
+        把属性值交给 JS 编译之前把 `&#39;` 解回单引号，实测 `el.onclick === null`，
+        点了没任何反应。所以那不是「漏打补丁」，是补丁本身不对。
+      · 作者串里的 `<img src=x onerror=...>` 现在渲染成**文本**（0 个 img 元素、
+        XSS 未触发）。
+      · 用假 SSE 流（sources → delta → error，之后不发 done）驱动真的 `doChat()`：
+        UI 不再停在「正在组织回答…」，半截答案 / 错误 / 来源都显示出来。
+
+    下面是静态守卫，只负责防止有人把这三处改回去；**它们不能替代上面那次真跑**
+    （本仓已经三次栽在「grep 过了就以为验证了」上）。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.html = _read(ROOT / "web" / "index.html")
+
+    def test_authors_go_through_esc(self):
+        self.assertNotIn("${(p.authors||[]).join(', ')}", self.html,
+                         "作者字段又裸进 innerHTML 了——来源是外部元数据与用户 prompt() 输入")
+        self.assertIn("${esc((p.authors||[]).join(', '))}", self.html)
+
+    def test_no_inline_attribute_builds_a_js_string_by_hand(self):
+        """内联事件属性里不许再出现 `f('${...}')` 这种手拼 JS 字符串。"""
+        bad = re.findall(r"on\w+=\"[^\"]*\('\$\{", self.html)
+        self.assertEqual(bad, [], f"这些内联属性还在手拼 JS 字符串：{bad[:3]}")
+        self.assertIn("const jsArg=", self.html, "jsArg 辅助函数没了")
+
+    def test_the_broken_quote_patch_is_gone_from_code(self):
+        """`replace(/'/g,'&#39;')` 这个写法必须绝迹（注释里解释它为什么错的不算）。"""
+        lines = [ln for ln in self.html.splitlines()
+                 if "replace(/'/g" in ln and not ln.strip().startswith("//")]
+        self.assertEqual(lines, [], f"还有 {len(lines)} 处在用那个坏写法")
+
+    def test_stream_error_branch_finishes_the_message(self):
+        """服务端发完 error 就 return、**不再发 done**，前端必须自己收尾。"""
+        i = self.html.index("else if(ev==='error')")
+        j = self.html.index("else if(ev==='done')", i)
+        branch = self.html[i:j]
+        self.assertIn("done(", branch,
+                      "error 分支没有调用 done()：UI 会永远停在「正在组织回答…」")
+        self.assertIn("hist.push(", branch, "半截答案没有进历史，下一轮就丢了上下文")

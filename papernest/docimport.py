@@ -19,7 +19,7 @@ from . import cards, config, db, docparse, llm
 from .normalize import norm_key
 
 MIN_CHARS = 200          # 少于这个字数的文档进库没有检索价值，跳过
-MAX_CHUNK_CHARS = 4000   # 与 structure.section_chunks 同一口径
+MAX_CHUNK_CHARS = db.MAX_CHUNK_CHARS   # 与 structure.section_chunks 同一口径
 
 
 class DocImportError(ValueError):
@@ -88,7 +88,10 @@ def _chunks_of(parsed: dict) -> list[dict]:
         if sum(len(x) for x in buf) >= MAX_CHUNK_CHARS:
             flush()
     flush()
-    return out
+    # 缓冲是「先 append 再判」，flush 出来的块最多能到 (MAX_CHUNK_CHARS-1) + 最后
+    # 一段的长度；单段本身就超限时更是一刀都切不开。出口统一过 cap_chunks，
+    # 与 db.chunks_from_pages 同一层收口。
+    return db.cap_chunks(out, MAX_CHUNK_CHARS)
 
 
 def _pages_of(parsed: dict) -> list[str]:

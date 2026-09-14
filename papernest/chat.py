@@ -33,6 +33,22 @@ _REF_MARKERS = (
     "上面", "上述", "刚才", "前面", "之前", "继续", "再说", "展开", "详细讲",
     "为什么呢", "怎么做的", "有什么区别", "对比一下", "第一篇", "第二篇", "第三篇",
 )
+# 上面这张表里混着两类词，判定口径不能一样：
+# **硬标记**是光杆代词与篇级指示词，出现就一定依赖上文，句子里还剩多少实词都不改变
+# 这一点（「它的局限是什么」「这篇论文的方法是什么」）。「其它」不是代词，必须排除，
+# 否则「还有其它 Massive MIMO 信道估计方法吗」被判成追问。
+_HARD_REF = re.compile(
+    r"(?<!其)它们?|他们|此文|这篇|那篇|上述|刚才"
+    # 指示词**紧跟通用名词**时同样是光杆回指：「这些论文里哪个效果最好」
+    # 「这个方法的复杂度呢」——剩下的实词（论文/效果、方法/复杂度）看着像检索信号，
+    # 其实指向的是上一轮的东西。要求名词紧跟指示词（只允许空白），所以
+    # 「这个 IP-MCMC-PF 目标跟踪方法…」不受影响：那里跟着的是一个具体型号。
+    r"|[这那][些个]\s*(?:论文|文章|方法|模型|工作|研究|结果|实验|数据集)")
+# **软标记**（其余的）既是指代词、又是常见学术实词/句式：「展开说说 RIS 辅助的宽带
+# 信道估计」「对比一下 ZF 和 MMSE 检测器」「继续讲 SC-FDMA 的半盲信道估计」都是自足
+# 查询。它们只能在句子本身**没有**检索信号时才算追问。表以 _REF_MARKERS 为唯一真源，
+# 派生而来，不需要两处同步。
+_SOFT_MARKERS = tuple(m for m in _REF_MARKERS if not _HARD_REF.fullmatch(m))
 _ASCII_REF = re.compile(
     r"\b(it|its|they|them|these|those|the above|this paper|that paper)\b", re.I)
 
@@ -40,11 +56,19 @@ _ASCII_REF = re.compile(
 #: 这替代了原来的 `len(q) <= 12 一律判追问`——「近场信道估计的最新进展」11 个字，
 #: 是一条完整的独立查询，却被当成追问拼上了上一轮的问题。
 _FILLER = re.compile(
-    r"为什么|怎么样|怎么做|怎么|如何|什么|哪些|讲讲|说说|展开|继续|详细|一下|"
+    r"为什么|怎么样|怎么做|怎么|如何|什么|哪些|讲讲|说说|展开|继续|详细|一下|一点|"
     r"\b(why|how|what|which|compare|more|detail|details|explain|again|continue|please)\b|"
     r"[的了吗呢吧啊呀嘛，。？！、,.?!\s]", re.I)
 # 「第 3 篇」「[2]」这类明确回指某条来源的说法
-_ORDINAL_RE = re.compile(r"\[(\d{1,2})\]|第\s*([0-9一二三四五六七八九十]{1,3})\s*篇")
+#: 会话编号只增不减，上界是库内论文数（当前 503 篇）。原来这里和前端 7 处渲染
+#: 正则都写的是 `\d{1,2}`——编号一过 99，引用渲染与「[n]」回指**同时静默失效**。
+#: 放宽到 3 位（覆盖到 999）；再往上会被 `MAX_RENDERABLE_INDEX` 的降级如实报出来，
+#: 不会像原来那样悄悄不认。不写 `\d+` 是为了不把正文里的年份「[2024]」当成引用。
+_ORDINAL_RE = re.compile(r"\[(\d{1,3})\]|第\s*([0-9一二三四五六七八九十]{1,3})\s*篇")
+
+#: 渲染层能认的最大编号（前端与上面的正则都是 3 位）。超过就不是「不好看」，
+#: 而是引用角标和回指一起失效——必须上报，不能静默。
+MAX_RENDERABLE_INDEX = 999
 _CN_NUM = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5,
            "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
 
@@ -112,7 +136,11 @@ def history(session_id: str, max_turns: int = 12) -> list[dict[str, Any]]:
 
 
 def last_sources(session_id: str) -> list[dict]:
-    """上一轮回答实际用到的来源——追问回指（「第 2 篇」）要落到它们身上。"""
+    """上一轮回答实际用到的来源（会话回放 / 调试用）。
+
+    **不要拿它反查 [n]**：编号是会话全局的（`source_map_json`），这里只看得见
+    最近一条有来源的 assistant 消息里出现过的那几个。回指要用 `papers_by_index`。
+    """
     with db.conn() as c:
         row = c.execute(
             """SELECT sources_json FROM chat_messages
@@ -197,6 +225,22 @@ def assign_indices(session_id: str | None, paper_ids: list[int]) -> dict[int, in
     return {pid: mapping[pid] for pid in paper_ids}
 
 
+def papers_by_index(session_id: str | None) -> dict[int, int]:
+    """会话内 [n] → paper_id 的反查：`assign_indices` 的读取侧。
+
+    `source_map_json` 存的是 {paper_id: 编号}，而用户说「第 2 篇」时要的是反方向。
+    编号是**会话全局**的，所以回指只能查这张表——查 `last_sources()` 只看得见
+    最近一轮出现过的编号，中间隔一轮换话题就查不到（合成多轮会话上实测：
+    第 3 轮起平均只剩 34.8% 的编号还解析得到，且完全静默）。
+    """
+    if not session_id:
+        return {}
+    with db.conn() as c:
+        row = c.execute("SELECT source_map_json FROM chat_sessions WHERE id=?",
+                        (session_id,)).fetchone()
+    return {idx: pid for pid, idx in _load_map(row).items()}
+
+
 # ── 追问识别与检索查询改写 ──
 
 def _has_retrieval_signal(q: str) -> bool:
@@ -209,11 +253,28 @@ def is_followup(question: str, prior_user_turns: list[str]) -> bool:
     if not prior_user_turns or not q:
         return False
     low = q.lower()
-    if any(m in low for m in _REF_MARKERS) or _ASCII_REF.search(low):
+    # 1) 显式回指某条来源（「[3] 这篇」「第 2 篇」）：无条件算追问。
+    #    漏判这一类最贵——用户点了名，检索却按字面去找「第 2 篇」。
+    if referenced_indices(q):
         return True
-    # 没有指代标记时，只有「去掉疑问词和虚词后什么都不剩」的句子才算追问
-    # （「为什么？」「展开讲讲」「why?」）——按字数一刀切会把独立查询误判进来。
-    return not _has_retrieval_signal(q)
+    # 2) 光杆代词 / 英文代词：同样无条件，句子里还剩多少实词都不改变它依赖上文这件事。
+    if _HARD_REF.search(low) or _ASCII_REF.search(low):
+        return True
+    # 3) 软标记必须**让位给检索信号**：把标记本身抠掉，剩下的句子还能独立检索
+    #    （「对比一下 ZF 和 MMSE 检测器」去掉「对比一下」还剩两个型号）就不是追问。
+    #    原来这里是「标记命中即 return True」，把下面这条判断整个短路了——
+    #    上面第 39 行注释声称检索信号判断替代了 `len(q)<=12` 的一刀切，
+    #    但它对**带标记的句子根本不生效**。真库实测 14 条自足查询误判 8 条（57%），
+    #    其中两条被拼上上一轮问题后 top10 存活率 0/10：整个候选集换成了上一轮的主题。
+    rest = low
+    for m in _SOFT_MARKERS:
+        if m in rest:
+            rest = rest.replace(m, " ")
+    # 只有「去掉疑问词和虚词后什么都不剩」的句子才算追问（「为什么？」「展开讲讲」「why?」）。
+    # 判错的代价是不对称的：误判追问会把好好的查询整体换成上一轮的主题、还自信地引
+    # [n]；漏判时历史块仍在 system prompt 里（模型能自己解指代），显式 [n] 也另有
+    # `rag._carry_over` 兜底，且检索 0 行是**响的**失败。所以偏向「宁可不当追问」。
+    return not _has_retrieval_signal(rest)
 
 
 def referenced_indices(question: str) -> list[int]:

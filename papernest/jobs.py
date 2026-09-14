@@ -14,13 +14,14 @@ import uuid
 from collections.abc import Callable
 from typing import Any
 
-from . import db
+from . import config, db
 
 PROGRESS = Callable[[float, str, str], None]  # (0~1, stage, message)
 
 # 同时在跑的任务上限。任务多是 LLM 密集型，无上限地铺开只会一起超时；
 # 也避免占满 Starlette 线程池导致 HTTP 请求饿死。
-MAX_CONCURRENT = max(1, int(os.environ.get("PAPERNEST_MAX_JOBS", "3")))
+# 非法值降级到默认，不在 import 期抛 ValueError 把整个包（连同 uvicorn / cli）拖死。
+MAX_CONCURRENT = config._env_int(3, "PAPERNEST_MAX_JOBS")
 
 _executor: concurrent.futures.ThreadPoolExecutor | None = None
 _executor_lock = threading.Lock()
@@ -47,7 +48,12 @@ def create_job(kind: str, params: dict, dedupe_key: str | None = None) -> str:
     """
     job_id = uuid.uuid4().hex[:12]
     db.init_db()
-    with db.conn() as c:
+    # **必须是写事务**：这是一次读-改-写（先查同键有没有在跑、再插）。
+    # 默认连接是 autocommit，SELECT 在锁外做，两个线程会同时看到「没人在跑」。
+    # 实测 16 线程并发建同一 dedupe_key 的任务：建成 2 个（应为 1）。
+    # 真正的保证在 `_migrate_8` 的部分唯一索引上，这里的事务只是让错误变成
+    # 干净的 JobConflict 而不是 IntegrityError。
+    with db.conn(immediate=True) as c:
         if dedupe_key:
             busy = c.execute(
                 """SELECT id FROM jobs WHERE dedupe_key=? AND status IN ('queued','running')
@@ -240,6 +246,7 @@ def _bibimport_runner(params: dict, progress: PROGRESS) -> dict:
     result = bibimport.import_text(params.get("text", ""), params.get("fmt", "auto"),
                                    enrich=bool(params.get("enrich")),
                                    source_name=params.get("source_name", ""))
+    _note_missing_vectors(result)
     progress(1.0, "done",
              f"新增 {result['imported']} · 跳过 {result['skipped']} · 失败 {result['failed']}")
     return result
@@ -315,6 +322,26 @@ def _write_runner(params: dict, progress: PROGRESS) -> dict:
     """
     from . import pipeline
     return pipeline.run_stage(params["run_id"], params, progress)
+
+
+def _note_missing_vectors(result: dict) -> None:
+    """把「还有多少篇没有向量」写进任务结果。
+
+    只有 `ingest` 那条路会补建向量，其余入库路径（上传 PDF / 导入 .bib /
+    多格式入库）都不建。**不建是对的**——建向量要花钱，不该在用户没同意时偷偷花；
+    但**不说**就不对了：真库 443 篇无向量正是这么攒出来的，而向量路权重 1.0，
+    这些论文等于被系统性地排在后面。
+    """
+    try:
+        with db.conn() as c:
+            n = db.papers_without_vectors(c, config.EMBED_MODEL)
+    except Exception:                                   # noqa: BLE001
+        return
+    if n:
+        result["papers_without_vectors"] = n
+        result["hint"] = (f"库里还有 {n} 篇没有向量索引（只有「检索入库」那条路会自动补建）。"
+                          f"跑 `python cli.py embed` 补上——**会产生嵌入调用费用**。"
+                          f"在那之前这些论文只能靠关键词被检索到。")
 
 
 RUNNERS: dict[str, Callable[[dict, PROGRESS], dict]] = {

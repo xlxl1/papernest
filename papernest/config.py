@@ -1,9 +1,65 @@
 import os
+import re
+import warnings
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = ROOT / "data"
 DB_PATH = DATA_DIR / "papernest.db"
+
+
+def _strip_env_value(v: str) -> str:
+    """`.env` 的值：剥掉行内注释与外层引号。
+
+    原来是原样 `v.strip()`，于是 `KEY=value  # 注释` 会把整串注释一起塞进
+    `os.environ`。这不是假想：项目自己的 `.env.example` 就有这种写法
+    （`PAPERNEST_RERANK=off          # api | llm | bm25 | off…`），而 README 明确让人
+    `copy .env.example .env`——「照文档做」这条路径本身就会产出被污染的值，且全程静默。
+
+    口径与通行的 dotenv 一致，两条都必要：
+    · 带引号的值**整体取引号内的内容**、不再剥注释（值里本来就可能有 ` #`，
+      比如口令；引号就是「我要字面量」的显式声明）；
+    · 不带引号时，`#` 只有**前面是空白**才算注释起点——URL 片段
+      （`https://x/y#frag`）里的 `#` 不该被当注释。
+    """
+    v = v.strip()
+    if len(v) >= 2 and v[0] in "\"'" and v[-1] == v[0]:
+        return v[1:-1]
+    return re.split(r"\s#", v, maxsplit=1)[0].strip()
+
+
+def _env_float(default: float, *names: str) -> float:
+    """读环境变量里的浮点数；**非法值降级到默认，不在 import 期把整个包炸掉**。
+
+    原来是模块级裸 `float(os.environ.get(...))`：`PAPERNEST_CHUNK_WEIGHT=abc` 会在
+    import 阶段抛 ValueError，把 papernest 连同 uvicorn 与 cli.py 一起拖死——
+    一个排序权重配错，整个服务起不来。而且原来的 `A or B` 链让「设成空串」
+    直接跳过 A 去拿 B 的默认值，看着像生效了其实没有。
+    """
+    for n in names:
+        raw = os.environ.get(n)
+        if raw is None or not raw.strip():
+            continue
+        try:
+            return float(raw)
+        except ValueError:
+            warnings.warn(f"{n}={raw!r} 不是合法的数，已按默认值 {default} 处理",
+                          RuntimeWarning, stacklevel=2)
+            return default
+    return default
+
+
+def _env_int(default: int, name: str, minimum: int = 1) -> int:
+    """同上，整数版；额外夹一个下界（0 或负数会让批大小/并发数变成死循环或崩溃）。"""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return max(minimum, int(raw))
+    except ValueError:
+        warnings.warn(f"{name}={raw!r} 不是合法的整数，已按默认值 {default} 处理",
+                      RuntimeWarning, stacklevel=2)
+        return default
 
 
 def _load_env():
@@ -16,7 +72,7 @@ def _load_env():
         if not line or line.startswith("#") or "=" not in line:
             continue
         k, v = line.split("=", 1)
-        os.environ.setdefault(k.strip(), v.strip())
+        os.environ.setdefault(k.strip(), _strip_env_value(v))
 
 
 _load_env()
@@ -36,6 +92,12 @@ LLM_MODEL = os.environ.get("LLM_MODEL", "")
 LLM_MODEL_HEAVY = os.environ.get("LLM_MODEL_HEAVY", "")
 # 向量模型（RAG 检索与证据句匹配）；不填则降级 FTS/词面重叠
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "")
+# 视觉模型（插图理解用）。**默认为空 = 关掉这个功能**：它按图片像素计费，
+# 悄悄给一个默认值等于替用户决定花钱。
+# 实测可选：qwen3-vl-plus（1168 token/图）、qwen3.5-omni-plus（809 token/图，更省
+# 且在「数曲线条数」上比另外两个准）、qwen3-vl-flash / qwen3.5-omni-flash（更便宜，
+# 但 flash 那两个都犯过「说五条列四条」的数量错误）。
+VISION_MODEL = os.environ.get("PAPERNEST_VISION_MODEL", "")
 
 # embedding 可以指向与 chat **不同的**端点。实测踩到：常见的中转站只转发
 # /chat/completions，/embeddings 与 /rerank 都是 404——而 embedding 又必须有，

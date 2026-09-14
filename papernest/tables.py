@@ -309,7 +309,24 @@ def _column_bands(lines: list[dict]) -> list[list[dict]]:
     right = [l for l in lines if l["x0"] >= a]
     cross = [l for l in lines if l["x0"] < a and l["x1"] > b]
     need = max(GUTTER_MIN_SIDE_LINES, GUTTER_MIN_SIDE_RATIO * n)
-    if len(left) < need or len(right) < need:
+
+    def _side_ok(side: list[dict]) -> bool:
+        """这一侧算不算一栏。
+
+        比例闸（占全页行数的 1/4）防的是「一小撮零散的行被当成一栏」。但它默认
+        两栏行数相当，而**一栏是密集表格、另一栏是正文**恰恰是最该分栏的情形，
+        也恰恰会被它毙掉：真 PDF 463 第 5 页左栏表格 229 行、右栏正文 61 行，
+        中缝宽 14pt、居中偏差 0.2pt、右栏填充率 0.95，却因 61 < 0.25*290 被放过，
+        于是右栏正文被当作表格的第 6 列粘了进去（含致谢与参考文献条目）。
+
+        所以：绝对行数下限照旧一票否决；比例不够时，只要这一侧**自己就是一栏
+        撑满宽度的正文**（填充率达标）就认。表格列永远撑不满，冒名不进来。
+        """
+        if len(side) < GUTTER_MIN_SIDE_LINES:
+            return False
+        return len(side) >= need or _fill_ratio(side) >= GUTTER_PROSE_FILL
+
+    if not (_side_ok(left) and _side_ok(right)):
         return [lines]
     # 最后一道闸：至少一侧要「像正文栏」——行宽中位数占该侧宽度的大半。
     # 没有这一条，一张占满整页的多列表会被它自己的列间空白当成中缝劈成两半，
@@ -907,6 +924,67 @@ def _line_owner(line: str, tokens: list[tuple[frozenset, frozenset]]) -> int | N
         if score > best_score:
             best, best_score = i, score
     return best
+
+
+#: 表题/图题：它们**贴着**表框、常被算进表区，但绝不能跟表格一起从正文里摘走。
+#: `chunk_table` 产出的表格块不带表题，摘掉就等于把「这张表是干什么的」弄丢了。
+_CAPTION_RE = re.compile(r"^\s*(表|图|Table|TABLE|Fig(?:ure)?|FIG)\s*\.?\s*\d", re.I)
+
+
+def table_owned_blocks(blocks: list[dict], tables: list[dict]) -> set[int]:
+    """`structure` 的哪些 block 是表格行（因此不该再进正文块）。返回 block_index 集合。
+
+    表格文本目前**在库里存两份**：`detect_tables` 出的表格块一份，章节正文块里
+    还有一份（真库实测：表格区 39,027 字符 = 表格块总字符，一字不差）。拿表头当
+    查询检索时，每篇取 3 块有 26% 的上下文含实质重复，取 5 块 45%，取 8 块 60%
+    ——正是问到表的时候最浪费上下文。这个函数就是给去重用的。
+
+    判据要**同时**满足三条，缺一不可：
+
+    ① **几何**：block 的垂直中心落在某张表的 bbox 内，且左边缘不在表框左侧太远。
+    ② **文本**：`_line_owner` 也认它属于那张表。
+    ③ **不是表题/图题**。
+
+    为什么要两个判据叠加而不是只用一个：单用文本判据时，参考文献条目和致谢会因为
+    词面偶然命中被摘走（真库上抓到 9 条）；单用几何判据时，表题会被连坐。两条叠加
+    后，630 个被丢弃的 block 里只剩 1 条是真正的正文误杀（0.16%），
+    而那一条的根子在 `detect_tables` 把绕排公式的正文读成了 5x3 表，不在这里。
+
+    **误杀不等于丢失**：被摘掉的只是 chunk，`pages` / `pages_fts` 里的整页原文不动，
+    词面那一路照样能召回它——丢的是语义检索，不是全部。这是这个取舍能接受的前提。
+    """
+    if not blocks or not tables:
+        return set()
+    by_page: dict[int, list[dict]] = {}
+    for t in tables:
+        by_page.setdefault(t.get("page_no"), []).append(t)
+    tok: dict[int, list[tuple[frozenset, frozenset]]] = {}
+    for pg, ts in by_page.items():
+        acc = []
+        for t in ts:
+            cells = [_squash(c) for r in (t.get("rows") or []) for c in (r or [])]
+            cells = [c for c in cells if c]
+            acc.append((frozenset(cells), frozenset(c for c in cells if len(c) >= 2)))
+        tok[pg] = acc
+
+    out: set[int] = set()
+    for b in blocks:
+        ts = by_page.get(b.get("page_no"))
+        if not ts:
+            continue
+        y0, y1 = b.get("y0"), b.get("y1")
+        if y0 is None or y1 is None:
+            continue
+        mid = (y0 + y1) / 2.0
+        if not any(bb[1] - 2.0 <= mid <= bb[3] + 2.0 and bb[0] - 12.0 <= b.get("x0", 0.0)
+                   for bb in (t.get("bbox") for t in ts) if bb):
+            continue
+        if _line_owner(b.get("text") or "", tok[b["page_no"]]) is None:
+            continue
+        if _CAPTION_RE.match(b.get("text") or ""):
+            continue
+        out.add(b["block_index"])
+    return out
 
 
 def split_page_text(page_text: str, tables: list[dict], max_chars: int = 4000) -> list[dict]:

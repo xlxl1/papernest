@@ -152,7 +152,9 @@ class OfflineTests(MatrixTestBase):
         self.assertEqual(cells["dataset"]["source"], "page:3")
         self.assertEqual(cells["dataset"]["page"], 3)
         self.assertIn("WikiText-103 dataset", cells["dataset"]["value"])
-        self.assertTrue(cells["dataset"]["verified"])
+        # 逐字摘录路径不报 verified：这句就是从该页切出来的，回校验同一页恒真，
+        # 报 True 是空转断言（真库穷举 17492 个候选，零反例）。
+        self.assertIsNone(cells["dataset"]["verified"])
         self.assertEqual(cells["metric"]["page"], 3)
         self.assertIn("Accuracy", cells["metric"]["value"])
         # 取到的必须是原文逐字片段
@@ -222,16 +224,22 @@ class MetricsTests(MatrixTestBase):
 
     def test_full_paper_metrics(self):
         m = matrix.extract_offline([self.p1])
+        # 6 格全满，但只有 4 格**需要**回取校验（走卡片路径，3 过 1 不过）；
+        # 另 2 格是从全文里逐字摘录的，校验对它们不适用，不进分子也不进分母。
         self.assertEqual((m["cells_total"], m["cells_filled"], m["cells_verified"]),
-                         (6, 6, 5))
+                         (6, 6, 3))
+        self.assertEqual(m["cells_checkable"], 4)
+        self.assertEqual(m["cells_excerpted"], 2)   # dataset / metric 走 _locate
         self.assertEqual(m["coverage"], 1.0)
-        self.assertEqual(m["verified_rate"], round(5 / 6, 4))
+        self.assertEqual(m["verified_rate"], round(3 / 4, 4))
 
     def test_empty_table_metrics_do_not_divide_by_zero(self):
         m = matrix.extract_offline([424242])
         self.assertEqual(m["rows"], [])
         self.assertEqual(m["coverage"], 0.0)
-        self.assertEqual(m["verified_rate"], 0.0)
+        # 没有可校验的格子 → None（显示「—」），不是 0.0：
+        # 报 0% 会被读成「全都没通过校验」，比报恒真的 100% 更糟。
+        self.assertIsNone(m["verified_rate"])
 
 
 # ── 输入校验 ──
@@ -793,7 +801,7 @@ class LexicalMatchTests(MatrixTestBase):
         self.assertIn("dataset", cell["value"].lower())
         self.assertIn(cell["value"], page)                   # 逐字子串，没被改写
         self.assertEqual(cell["page"], 2)
-        self.assertTrue(cell["verified"])
+        self.assertIsNone(cell["verified"])          # 逐字摘录，不报回取结论
 
 
 class RobustnessTests(MatrixTestBase):

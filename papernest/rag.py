@@ -5,6 +5,7 @@
 """
 import json
 import os
+import math
 import re
 from typing import NamedTuple
 
@@ -67,10 +68,31 @@ def _query_terms(text: str, limit: int = 12) -> list[str]:
 
 
 def _window(text: str, terms: list[str], cap: int) -> str:
-    """截到 cap 字符，但**围绕命中位置取窗口**，不是从页首硬切。
+    """截到 cap 字符，**名义上**围绕命中位置取窗口。
 
     原来是 `txt[:cap]`：选中一页之后从头截，实测中位数只保留了 29%——
     而命中往往在页中部，于是「选中了正确的页、却把证据切掉了」。
+
+    ## 但它多数时候并没有真的居中（2026-09-10 实测）
+
+    `terms` 来自 `_query_terms`，**带停用词**。`min(find(t))` 取的是任意词的首个
+    出现位置，而 the/of 几乎必然出现在开头：241 个真实块上量下来，
+    **首个命中的中位位置是 51 字符、68% 落在前 100 字符内**，
+    于是 `start = max(0, pos - cap//3)` = 0——等价于回到 `text[:cap]`。
+
+    ## 试过按「加权命中密度」选窗口，**没能证明更好**
+
+    每次出现按 1/tf 记分（在这块里出现 100 次的词每次只值 0.01），
+    取密度最高的一段。274 篇 / 924 题 / 4566 条 gold 探针：
+
+        截窗留存 42.7% → 45.4%   片段召回 0.1334 → 0.1419   问题召回 0.2803 → 0.3063
+        问题级 p=0.0667（160 题变化）   探针级 p=0.0834（**263 好 / 224 坏**）
+
+    263 对 224 基本是抛硬币。这次样本量是够的（n=4566），所以不能再说「判不出来」
+    ——**就是不可靠**。机制上明显更合理不等于实测更好，没有采用。
+
+    真要改善这一环，方向多半不在「窗口取哪一段」，而在**块本身有多大**：
+    4000 字的块截到 800 字，丢掉 80% 是结构性的。见 `qasper.chunk_sweep`。
     """
     if len(text) <= cap:
         return text
@@ -131,6 +153,12 @@ CONTEXT_UNIT = os.environ.get("PAPERNEST_CONTEXT_UNIT", "page").strip().lower()
 #: 第一版把上下文限制成「只有 chunks_fts 命中的那 ≤4 块」，实测证据召回
 #: 从 0.2614 掉到 0.1818：命中集之外的块再相关也进不来，而按密度扫全篇能捞到它们。
 #: 检索信号该用来「排得更准」，不该用来「把别的候选删掉」。
+#: 单个块窗口的目标字符数。QASPER 等预算扫描下片段召回在这里见顶
+#: （800 字 0.0961；600 字 0.0915；400 字 0.0832）。`per_paper` 由它反推。
+TARGET_WINDOW_CHARS = 800
+#: 一篇最多取几个块。再多只是把上下文剁碎——问题召回还在涨，片段召回已经在掉。
+MAX_CHUNKS_PER_PAPER = 3
+
 HIT_BOOST = 1.6
 
 
@@ -140,13 +168,52 @@ def _rank_chunks(chunks: list[dict], hits: list[dict], terms: list[str],
 
     返回 (选中的块, 是否只能靠检索信号)。后者为 True 时说明问句在这篇正文里
     词面命中恒为 0（典型是中文问句 × 英文正文）——此时检索命中是唯一的信号。
+
+    ## 为什么要 IDF：原来这里基本是在「按块长排序」
+
+    `terms` 来自 `_query_terms`，它**故意不过滤停用词**，理由是「均匀出现的词对
+    排序没有贡献、会自己抵消」。那句话对长度相近的页成立，对这里不成立：
+    原来的打分是 `count / sqrt(len)`，长块的停用词计数随长度线性涨、分母只涨 sqrt。
+
+    实测（真库 26 篇 / 692 块）：只喂十个停用词，选出的 50 个块里 **34 个（68%）
+    是该篇最长的前 5 块**（随机约 21%）；英文查询的词频命中里**中位 94%**
+    来自「出现在过半块里」的词（中文查询 0%）。
+
+    ## 这个改动一度被判「无效」——那是评测集太小
+
+    2026-09-09 第一次试时评测集只有 25 篇 / 69 题，`p=0.219`，按本仓口径没采用。
+    把 QASPER dev 的 PDF 补齐后（274 篇 / **917 题** / 4556 条 gold），
+    同一个改动 `p=5e-05`。**当时不是改动没用，是判不出来。**
+
+        per=2 无 IDF（原始）             问题 0.1723  片段 0.0904
+        per=3 无 IDF                    问题 0.1974  片段 0.0961
+        per=3 + log(1+N/(1+df))         问题 0.2203  片段 0.1036   ← 形式选错的那版
+        per=3 + BM25 式 IDF             问题 **0.2704**  片段 **0.1247**
+
+    IDF 的**形式**也试错过一次：`log(1+N/(1+df))` 在 df=N 时仍有 log(2)≈0.69，
+    压不住停用词的几百次重复，只拿到一半的收益（两者相差 p=5e-05）。
     """
     hit_nos = {h["chunk_no"] for h in hits}
+    lowered = [(ch, (ch.get("text") or "").lower()) for ch in chunks]
+    # IDF 在**候选集自身**上算：一个词若这篇的每个块都有，它就分不出块。
+    # 不用语料级 IDF——这个函数的任务就是「在这一篇里选块」，本篇的文档频率
+    # 才是对的归一化，而且不用额外扫全库。
+    #
+    # 形式用 BM25 的那一支。**这里试错过一次**：先写的是 `log(1 + N/(1+df))`，
+    # 它在 df=N 时仍有 log(2)≈0.69，压不住停用词的几百次重复——
+    # QASPER 917 题上只把问题召回从 0.1974 抬到 0.2203，而 BM25 式抬到 0.2704
+    # （两者相差 p=5e-05，显著）。`log(N/df)` 截 0 的效果与 BM25 式打平
+    # （0.2694 vs 0.2704），选后者是因为它不需要额外的截 0 补丁。
+    n_docs = len(lowered) or 1
+    idf = {}
+    for k in {t.lower() for t in terms}:
+        df = sum(1 for _, t in lowered if k in t)
+        idf[k] = math.log(1 + (n_docs - df + 0.5) / (df + 0.5))
     scored = []
-    for ch in chunks:
-        t = (ch.get("text") or "").lower()
-        raw = sum(t.count(k) for k in terms)
-        density = raw / ((len(t) or 1) ** 0.5)
+    for ch, t in lowered:
+        raw = sum(t.count(k) for k in idf)          # 仍按原始命中判「词面全 0」
+        weighted = sum(t.count(k) * idf[k] for k in idf)
+        density = weighted / ((len(t) or 1) ** 0.5)
         if ch["chunk_no"] in hit_nos:
             density *= HIT_BOOST
         scored.append((density, raw, ch["chunk_no"], ch))
@@ -197,11 +264,15 @@ def _evidence_context(paper_id: int, q: str, hits: list[dict] | None,
       "miss"     —— 有全文却一页都没选出，只有摘要进上下文
     """
     if unit != "chunk":          # A/B 用：强制走改造前的「按页选块」口径
-        return _page_context(paper_id, q, per_paper, cap)
+        return _page_context(paper_id, q, per_paper, cap, hits)
     with db.conn() as c:
         chunks = [dict(r) for r in c.execute(
             "SELECT chunk_no, section_path, start_page, text FROM chunks "
-            "WHERE paper_id=? ORDER BY chunk_no", (paper_id,))]
+            # 参考文献块不是本篇的证据。这里必须单独挡一道：`_rank_chunks` 是直接
+            # 从 chunks 表拉全部块按词频密度排的，不靠 FTS 命中，所以把它们排除出
+            # chunks_fts 并不足以阻止它们被当成证据写进 LLM 上下文。
+            "WHERE paper_id=? AND kind IS NOT 'reference' "
+            "ORDER BY chunk_no", (paper_id,))]
     if chunks:
         block, blind = _chunk_context(chunks, hits or [], _query_terms(q),
                                       per_paper, cap)
@@ -209,28 +280,66 @@ def _evidence_context(paper_id: int, q: str, hits: list[dict] | None,
             # 词面全 0 时选出来的块只由检索信号决定——与按页选块的 "fallback"
             # 是同一类事实，同样要如实上报，不能因为换了单元就假装没降级。
             return block, ("fallback" if blind else None)
-    return _page_context(paper_id, q, per_paper, cap)
+    return _page_context(paper_id, q, per_paper, cap, hits)
 
 
-def _page_context(paper_id: int, q: str, per_paper: int = 2,
-                  cap: int = 2400) -> tuple[str, str | None]:
-    """论文已有 L2 全文时，挑关键词命中最多的几页，带页码进上下文。
+def _pages_from_hits(pages: dict[int, str], hits: list[dict] | None,
+                     terms: list[str], per_paper: int, cap: int) -> list[str]:
+    """用检索**语义**命中的块所在页来选页——跨语言时唯一有信号的那一路。
 
-    返回 (页块文本, 选页口径)。口径 None = 按问句正常选出；``"fallback"`` = 问句在
-    这篇正文里一个词都没命中（典型是中文问句 × 英文论文），退回按本篇自己的关键词选页；
-    ``"miss"`` = 两种口径都没选出页。**不再静默**：原来这三种情况一律返回空串，
-    调用方无从区分「这篇没有全文」和「有全文但一个词都没匹配上」。
+    `_pick_pages` 是纯字面 `t.count(k)`，中文问句在英文正文里恒为 0：真库实测
+    45 篇有全文的论文 × 50 条中文问句，**98.5% 走 fallback**（同一批英文问句只有
+    27.8%）。而 `search_hybrid` 早就把向量赢下的那一块取回来了（`chunk_hits` 里
+    via='vector' 的项，`db.chunks_by_no` 带 `start_page`），`embeddings.py` 那句注释
+    写得很清楚：「词面命中恒为 0 的跨语言场景下，这是唯一知道该喂哪段的信息来源」
+    ——只是这条信号一直没传到按页组装这条路上。
+
+    保持命中顺序（`_merge_hits` 已把语义命中排在词面命中前面），同一页只取一次。
+    窗口仍围绕问句词面开：跨语言时词面为空，`_window` 自会退回页首。
+    """
+    if not hits:
+        return []
+    out, seen = [], set()
+    for h in hits:
+        pno = h.get("start_page")
+        if pno is None or pno in seen or pno not in pages:
+            continue
+        seen.add(pno)
+        out.append(f"    【第 {pno} 页】{_window(pages[pno] or '', terms, cap // per_paper)}")
+        if len(out) >= per_paper:
+            break
+    return out
+
+
+def _page_context(paper_id: int, q: str, per_paper: int = 2, cap: int = 2400,
+                  hits: list[dict] | None = None) -> tuple[str, str | None]:
+    """论文已有 L2 全文时，挑与问句最相关的几页，带页码进上下文。
+
+    三级判据，依次退让：
+      ① 问句词面选页（`_pick_pages`）→ 口径 None；
+      ② 词面全 0 时用**检索的语义命中**定位页（`_pages_from_hits`）→ 口径同样是
+         None：选出来的页确实是**因为这次提问**才被选中的，不是降级；
+      ③ 都不行才退回按本篇自己的关键词选页 → ``"fallback"``，选出来的是「本篇核心」
+         而不是「问句相关」，必须标注让上层如实上报；
+      ④ 一页都没选出 → ``"miss"``。
+
+    **不再静默**：原来 ②③④ 一律返回空串，调用方无从区分「这篇没有全文」和
+    「有全文但一个词都没匹配上」。
     """
     with db.conn() as c:
         pages = {r["page_no"]: r["text"] for r in
                  c.execute("SELECT page_no,text FROM pages WHERE paper_id=?", (paper_id,))}
         if not pages:
             return "", None          # 这篇本来就没入 L2 全文，不是异常
-        blocks = _pick_pages(pages, _query_terms(q), per_paper, cap)
+        terms = _query_terms(q)
+        blocks = _pick_pages(pages, terms, per_paper, cap)
         if blocks:
             return "\n" + "\n".join(blocks), None
-        # 跨语言兜底：中文问句对英文正文的字面匹配必然为 0。退回按本篇关键词选页，
-        # 选出来的是「本篇核心」而不是「问句相关」——所以必须标注，让上层如实上报。
+        blocks = _pages_from_hits(pages, hits, terms, per_paper, cap)
+        if blocks:
+            return "\n" + "\n".join(blocks), None
+        # 连语义命中都没有：退回按本篇关键词选页——选出来的是「本篇核心」
+        # 而不是「问句相关」，所以必须标注，让上层如实上报。
         blocks = _pick_pages(pages, _paper_terms(c, paper_id), per_paper, cap)
     if blocks:
         return "\n" + "\n".join(blocks), "fallback"
@@ -238,23 +347,52 @@ def _page_context(paper_id: int, q: str, per_paper: int = 2,
 
 
 def _carry_over(session_id: str | None, question: str, ids: list[int],
-                top_k: int) -> list[int]:
-    """追问回指上一轮的来源时，把被指的论文拉回上下文并排在最前。
+                top_k: int) -> tuple[list[int], list[degrade.Degradation]]:
+    """追问回指会话里的某个 [n] 时，把被指的论文拉回上下文并排在最前。
 
     「第 2 篇的方法讲细一点」——如果本轮检索没召回那篇，模型就只能瞎编或者装傻。
+
+    编号按**会话全局**分配、落在 `chat_sessions.source_map_json`（`chat.assign_indices`），
+    所以反查也必须查那张表。原来查的是 `chat.last_sources()`——只有最近一条有来源的
+    assistant 消息里出现过的编号，中间隔一轮换话题 [2] 就查不到，且完全静默。
+
+    pin 是**无条件插队**的，而回指的编号个数由用户输入决定（粘一段带 [1]..[99] 的
+    相关工作就是几十个），所以必须封顶、并且至少给本轮检索留一个名额——否则
+    「[1][2][3] 和 X 比起来怎么样」里的 X 一篇都进不了上下文。这三种失败
+    （解析不到 / 被截断 / 把本轮检索挤空）都要如实上报，不许静默。
     """
     if not session_id:
-        return ids
-    prior = chat.last_sources(session_id)
-    if not prior:
-        return ids
+        return ids, []
     wanted = chat.referenced_indices(question)
-    by_idx = {s.get("idx"): s.get("paper_id") for s in prior}
-    pinned = [by_idx[i] for i in wanted if by_idx.get(i)]
+    if not wanted:                        # 没有回指：一次库都不用查
+        return ids, []
+    by_idx = chat.papers_by_index(session_id)
+    pinned = list(dict.fromkeys(pid for i in wanted if (pid := by_idx.get(i))))
     if not pinned:
-        return ids
+        # 会话里还一个编号都没有时不报：用户不可能见过任何 [n]，
+        # 多半是把正文里的引文角标（「[12] 是什么意思」）抄了进来。
+        if by_idx:
+            return ids, [degrade.Degradation(
+                degrade.REF_INDEX_UNRESOLVED,
+                f"回指的编号 {wanted} 不在本会话的引用表里"
+                f"（当前 1–{max(by_idx)}），未拉回任何文献")]
+        return ids, []
+
+    notes: list[degrade.Degradation] = []
+    cap = max(1, top_k - 1)               # 至少给本轮检索留一个名额
+    if len(pinned) > cap:
+        notes.append(degrade.Degradation(
+            degrade.REF_PIN_TRUNCATED,
+            f"回指了 {len(pinned)} 篇，上下文只放得下 {cap} 篇，"
+            f"其余未纳入"))
+        pinned = pinned[:cap]
     merged = list(dict.fromkeys(pinned + list(ids)))
-    return merged[:max(top_k, len(pinned))]
+    out = merged[:max(top_k, len(pinned))]
+    if ids and not set(out) & set(ids):
+        notes.append(degrade.Degradation(
+            degrade.REF_PIN_EVICTED,
+            "本轮检索到的文献被回指的论文全部挤出上下文"))
+    return out, notes
 
 
 class PreparedContext(NamedTuple):
@@ -296,10 +434,9 @@ def prepare(messages: list[dict], top_k: int = 5,
     search_q, rewrite_note = chat.rewrite_query(q, prior_qs)
     if candidate_ids is None:
         ids, notes, chunk_hits = _vector_candidates(search_q, top_k)
-        ids = _carry_over(session_id, q, ids, top_k)
+        ids, ref_notes = _carry_over(session_id, q, ids, top_k)
+        notes += ref_notes
     else:
-        # 上游（agent / deep_answer）已经检索过并把候选传进来，这里不重复检索。
-        # 上游那次检索自己的降级记录由上游负责上报，这里没有可报的。
         # 上游（agent / deep_answer / RCS 兜底）已经检索过并把候选传进来，这里不重复检索。
         # 上游那次检索自己的降级记录由上游负责上报，这里没有可报的。
         # **但块级命中要补一次**：不补的话这几条路径就退回按页猜，
@@ -311,15 +448,26 @@ def prepare(messages: list[dict], top_k: int = 5,
         chunk_hits = {p: h for p, h in hits.items() if p in set(ids)}
 
     numbering = chat.assign_indices(session_id, list(ids))
+    # 会话编号只增不减（`source_map_json`），而渲染层与回指解析都只认 3 位数。
+    # 越界不是「不好看」——引用角标和「[n]」回指会**同时**静默失效，所以要报出来。
+    if numbering and max(numbering.values()) > chat.MAX_RENDERABLE_INDEX:
+        notes.append(degrade.Degradation(
+            degrade.REF_INDEX_OVERFLOW,
+            f"本会话的来源编号已到 [{max(numbering.values())}]，超出渲染上限 "
+            f"{chat.MAX_RENDERABLE_INDEX}：引用角标与「第 n 篇」回指会失效，建议新开一段对话"))
     blocks, sources, page_notes = [], [], []
-    used, over_budget = 0, 0
+    used, over_budget = 0, []
     # 页块配额按篇数摊。宁可让每篇的原文引用短一些，也不要整篇论文连同它的 [n]
     # 一起被预算挤掉——丢一篇是丢掉一条可引用的来源，缩一篇只是证据少一点。
-    # 篇数多时把「每篇 2 个半截页」降成「每篇 1 个最相关的页」：同样的字符数下，
-    # 一个完整的页比两个各截一半的页更可能包含可直接引用的完整句子。
     # 0.55 是页块能占的份额，其余留给标题 / TL;DR / key_findings / 摘要。
-    per_paper = 2 if len(ids) <= 6 else 1
     page_cap = max(600, min(2400, int(max_context_chars * 0.55) // max(len(ids), 1)))
+    # 每篇取几个块：**由窗口下限反推**，不拍常数。QASPER 上等预算扫描
+    # （274 篇 / 917 题 / 4556 条 gold）：片段召回在每窗 800 字时见顶，
+    #   per=1 窗2400 → 0.0935 | per=2 窗1200 → 0.0904 | **per=3 窗800 → 0.0961**
+    #   per=4 窗600  → 0.0915 | per=6 窗400  → 0.0832
+    # 问题召回一路涨到 per=6（0.2159），但那是把上下文剁成 400 字碎片换来的——
+    # 证据总量反而在掉，而且短碎片更难支撑逐字引用。所以取「窗口不低于 800」这条线。
+    per_paper = max(1, min(MAX_CHUNKS_PER_PAPER, page_cap // TARGET_WINDOW_CHARS))
     with db.conn() as c:
         for pid in ids:
             r = c.execute("SELECT * FROM papers WHERE id=?", (pid,)).fetchone()
@@ -346,7 +494,10 @@ def prepare(messages: list[dict], top_k: int = 5,
             # sources 里会有一个上下文里没有对应块的 [n]，模型会去引用一个看不见的编号。
             # 首篇无条件保留——宁可超一点，也不能交出空上下文。
             if blocks and used + len(paper_block) > max_context_chars:
-                over_budget += 1
+                # 记下**是哪几篇**，不只是几篇。编号在预算过滤之前就分配好了
+                # （上面的 assign_indices），被挤掉的 [n] 会在 sources 里变成空洞，
+                # 只报篇数的话用户和运维都对不上号、事后无法复盘。
+                over_budget.append((i, r["title"]))
                 continue
             used += len(paper_block)
             if note:
@@ -362,9 +513,14 @@ def prepare(messages: list[dict], top_k: int = 5,
         sys += f"\n\n之前的对话（用于理解指代，不是事实来源）：\n{hist_block}"
     sys += f"\n\n检索到的文献上下文：\n{context}"
     if over_budget:
+        # 点名到具体哪几篇。标题截 24 字符、最多 3 篇、多于 3 篇补「等」——
+        # 前端是原样渲染这句中文的自由文本，长度必须自己封死。
+        # 前缀逐字保留，前端 10 处按字符串消费的地方与前缀匹配的脚本都不受影响。
+        who = "、".join(f"[{n}]{(t or '')[:24]}" for n, t in over_budget[:3])
         notes.append(degrade.Degradation(
             degrade.CONTEXT_OVER_BUDGET,
-            f"{over_budget} 篇超出上下文预算（{max_context_chars} 字符）未纳入"))
+            f"{len(over_budget)} 篇超出上下文预算（{max_context_chars} 字符）未纳入："
+            f"{who}{' 等' if len(over_budget) > 3 else ''}"))
     if page_notes.count("fallback"):
         notes.append(degrade.Degradation(
             degrade.PAGE_PICK_FALLBACK,

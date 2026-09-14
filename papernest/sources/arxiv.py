@@ -1,4 +1,5 @@
 """arXiv API —— 预印本与免费全文 PDF 的来源（官方 API，Atom XML）。"""
+import re
 import time
 import xml.etree.ElementTree as ET
 
@@ -30,13 +31,26 @@ def search(query: str, limit: int = 20) -> list[dict]:
     return papers
 
 
+# 合法 arXiv id：新式 2608.00011[v3]，旧式 math.GT/0309136[v1] / hep-th/9901001。
+# **必须校验**：arXiv 在查询非法时返回的不是 HTTP 错误，而是一个**形状完全合法的
+# Atom feed**，里面一条 id=http://arxiv.org/api/errors#... 、title=Error 的 entry。
+# 不校验的话这条会被当成一篇论文入库——标题「Error」、arxiv_id 是一整条 URL、
+# oa_pdf_url 拼成 https://arxiv.org/pdf/http://arxiv.org/api/errors#...。
+# subscribe.py 早就挡了这个（那里有 6 行注释解释原因），而平行实现的**采集路径**
+# 一直没挡——同一个数据源两套判据，其中一套是空的。
+_ARXIV_ID_RE = re.compile(
+    r"^(?:\d{4}\.\d{4,5}|[a-z][a-z\-]*(?:\.[A-Za-z]{2})?/\d{7})(?:v\d+)?$")
+
+
 def _parse(root: ET.Element) -> list[dict]:
     papers = []
     for e in root.findall("a:entry", NS):
         raw_id = (e.findtext("a:id", "", NS) or "")
+        if "/abs/" not in raw_id:
+            continue          # 不是论文条目（arXiv 的 error feed 走的就是这条）
         arxiv_id = raw_id.split("/abs/")[-1].strip()
-        title = (e.findtext("a:title", "", NS) or "").strip().replace("\n", " ")
-        if not arxiv_id or not title:
+        title = (e.findtext("a:title", "", NS) or "").strip().replace(chr(10), " ")
+        if not title or not _ARXIV_ID_RE.match(arxiv_id):
             continue
         published = (e.findtext("a:published", "", NS) or "")[:10]
         summary = (e.findtext("a:summary", "", NS) or "").strip()

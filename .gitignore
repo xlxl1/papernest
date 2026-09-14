@@ -33,3 +33,11 @@ Thumbs.db
 _chat.json
 _t.json
 _finish.py
+
+# 运行时日志（会轮转，data/ 下）
+data/papernest.log*
+
+# QASPER 评测用的 arXiv PDF（tools/fetch_qasper_pdfs.py 下载，~300MB，可重下）
+data/qasper_pdf/
+_pkg/
+_pkg2/

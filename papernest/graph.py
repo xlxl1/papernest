@@ -29,6 +29,7 @@ from pathlib import Path
 import httpx
 
 from . import config, db, http
+from . import normalize
 from .normalize import norm_key
 
 # ── 常量 ──
@@ -293,8 +294,7 @@ def s2_ref_id(row) -> str | None:
     if row["s2_id"]:
         return str(row["s2_id"])
     if row["doi"]:
-        doi = re.sub(r"^https?://(dx\.)?doi\.org/", "",
-                     str(row["doi"]).strip(), flags=re.I)
+        doi = normalize.bare_doi(row["doi"])
         if doi:
             return "DOI:" + doi
     if row["arxiv_id"]:

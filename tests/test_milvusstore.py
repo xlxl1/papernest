@@ -1281,3 +1281,40 @@ class ContractTests(_MilvusTestBase):
 
 if __name__ == "__main__":       # pragma: no cover
     unittest.main()
+
+
+class WhatTheseTestsCannotAnswerTests(_MilvusTestBase):
+    """把这套测试**答不了**的那个问题，写成机器可检的断言。
+
+    上面 1200 多行 Milvus 用例全部跑在 `FakeMilvusClient` 上，而这个假服务端对每一行
+    做 numpy 精确余弦、按分数排序取 limit——**没有 ANN 近似、没有 segment、
+    没有一致性滞后、写入即刻可见**。也就是说：
+
+        「换成 Milvus 会不会改变召回结果」——这套测试从结构上就回答不了。
+
+    这不是缺陷（本机连不上任何 Milvus，Milvus Lite 在 Windows 上不存在，见文件头），
+    而是**边界**。把它写成断言是为了让边界随代码一起活着：哪天有人给假服务端加了
+    ANN 近似或一致性滞后，下面这两条会红——那时就该回来把「召回等价性」重新问一遍。
+
+    在那之前对外只能说「Milvus 后端的**契约**（建集合 / 索引 / load / metric /
+    维度 / 错误码）已被覆盖」，**不能**说「换后端不改变检索结果」。
+    """
+
+    def test_the_fake_is_exact_not_approximate(self):
+        """真 Milvus 的 AUTOINDEX / HNSW 是近似最近邻；假服务端是精确暴力 kNN。"""
+        st = self.store()
+        self.seed(st, [(1, "chunk", 0, _basis(0), "a"),
+                       (2, "chunk", 0, _basis(1), "b"),
+                       (3, "chunk", 0, _basis(2), "c")])
+        got = st.search(_basis(0), top_k=3)
+        self.assertEqual(got[0]["paper_id"], 1,
+                         "假服务端不再是精确 kNN 了——上面那些排序断言的含义随之改变，"
+                         "该重新评估「换后端会不会改变召回」这个问题")
+
+    def test_the_fake_makes_writes_visible_immediately(self):
+        """真 Milvus 在 Bounded 一致性下允许读落后写几秒；假服务端写完就能搜到。"""
+        st = self.store()
+        self.seed(st, [(1, "chunk", 0, _basis(0), "a")])
+        self.assertEqual(len(st.search(_basis(0), top_k=1)), 1,
+                         "假服务端出现了写后不可见——说明它开始模拟一致性滞后，"
+                         "此时应当补一批「写后立刻读」的真实场景用例")

@@ -392,6 +392,8 @@ def cmd_sectiontree(args):
               f"失败 {r['failed']}")
         for e in (r.get("errors") or [])[:5]:
             print(f"  ⚠ {e}")
+        if r.get("degraded"):
+            print(f"  ⚠ {r['degraded']}")
     elif args.action == "stats":
         s = sectiontree.stats()
         print(f"[sectiontree] 已索引 {s['papers_indexed']} 篇 · 节点 {s['n_nodes']} 个 · "
@@ -444,17 +446,169 @@ def cmd_vec(args):
         print(f"  覆盖率 {cov['chunks_embedded']}/{cov['chunks_total']}（{cov['coverage']:.1%}）")
 
 
+def cmd_enrich(args):
+    """把「表格摘要 → 插图说明 → 重切 → 重嵌」四步的**账**一次算清楚。
+
+    这四步有严格的先后：摘要/说明先落库，重切才能把它们贴进检索块，
+    重嵌才能让新文本进向量空间。分开跑很容易漏掉后两步，
+    结果是「钱花了、检索没变」——所以这条命令先把全景摆出来。
+
+    **它自己不花钱**：只报账 + 给出每一步的命令。真跑请按提示逐条执行，
+    每一条都会再确认一次。
+    """
+    from papernest import config, db, figures, ocr, tablesum
+    db.init_db()
+
+    t_items = tablesum.pending()
+    t_est = tablesum.estimate(t_items)
+    f_items = figures.pending()
+    f_est = figures.estimate(f_items)
+
+    print("=" * 66)
+    print("① 表格摘要      待处理 %d 张（%d 篇）  约 %s token"
+          % (t_est["n_tables"], t_est["n_papers"], f"{t_est['est_total_tokens']:,}"))
+    mangled = sum(1 for i in t_items if i.get("mangled"))
+    if mangled:
+        print("                 其中 %d 张的列结构在抽取中塌了，"
+              "这些只写「比什么/用什么指标」，不下结论" % mangled)
+    print("② 插图说明      待处理 %d 张（%d 篇）  约 %s token"
+          % (f_est["n_figures"], f_est["n_papers"], f"{f_est['est_total_tokens']:,}"))
+    if not config.VISION_MODEL:
+        print("                 ⚠ 未配置 PAPERNEST_VISION_MODEL，这一步跑不了")
+    stale = tablesum.papers_with_unapplied_summaries()
+    print("③ 重切受影响的篇  %d 篇的检索块还没贴上摘要" % len(stale))
+    print("④ 重嵌            重切会作废这些篇的 chunk 向量，需要重新嵌入")
+    a = ocr.available()
+    print("   OCR 现状      模式=%s  本地引擎=%s  云端=%s"
+          % (a["mode"], "有" if a["local"] else "无", "可用" if a["cloud"] else "未配置"))
+    print("=" * 66)
+    print("按顺序跑（每条都会再确认一次）：")
+    print("  1) python cli.py table-summary --apply")
+    if config.VISION_MODEL:
+        print("  2) python cli.py figure-summary --apply")
+    else:
+        print("  2) 先在 .env 里设 PAPERNEST_VISION_MODEL=qwen3-vl-plus，"
+              "再 python cli.py figure-summary --apply")
+    ids = ",".join(str(i) for i in sorted(stale)[:40])
+    print("  3) python tools/migrate_chunks.py --apply%s"
+          % (f" --papers {ids}" if ids else ""))
+    print("     （--papers 只重切受影响的篇；不带它会全库重切，多花不少嵌入钱）")
+    print("  4) python cli.py vec embed-chunks")
+    print()
+    print("总计约 %s token（不含第 4 步的嵌入费用，那一步用 `vec embed-chunks` "
+          "的 --dry-run 单独看）" % f"{t_est['est_total_tokens'] + f_est['est_total_tokens']:,}")
+
+
+def cmd_figure_summary(args):
+    """给论文插图配说明，让图能被语义检索找到。默认只算账，不花钱。
+
+    以**图题**定位插图，不是 `page.get_images()`：真库 26 篇里，论文 460 有 4 条
+    图题却 0 张位图（矢量图），而论文 1 有 93 张位图只有 5 条图题（多是碎片）。
+    按图题抓才对得上「读者眼里的一张图」。
+
+    说明只写图的类型、成分、比较关系，**不读数值**——实测模型会把折线图的
+    结论说反（详见 papernest/figures.py 的模块注释）。
+    """
+    from papernest import config, db, figures
+    db.init_db()
+    if not config.VISION_MODEL:
+        print("[figure-summary] 未配置视觉模型。在 .env 里设 "
+              "PAPERNEST_VISION_MODEL=qwen3-vl-plus（或 qwen3-vl-flash）。")
+        print("[figure-summary] 没配也能看账：下面按默认渲染尺寸估。")
+    ids = [int(x) for x in (args.papers or "").replace(",", " ").split()] or None
+    print("[figure-summary] 正在按图题定位插图（读 PDF，不花钱）……")
+    items = figures.pending(ids)
+    est = figures.estimate(items)
+    if not items:
+        print("[figure-summary] 没有待处理的插图。")
+        return
+    print(f"[figure-summary] 待处理 {est['n_figures']} 张图（{est['n_papers']} 篇）")
+    print(f"[figure-summary]   粗估 token：入 {est['est_prompt_tokens']:,} + "
+          f"出 {est['est_completion_tokens']:,} = {est['est_total_tokens']:,}"
+          f"（{est['note']}）")
+    if not args.apply:
+        print("[figure-summary] 这是试算。确认后加 --apply 真正生成。")
+        return
+    if not config.VISION_MODEL:
+        print("[figure-summary] 没有视觉模型，无法生成。"); return
+    r = figures.describe(items, dry_run=False,
+                         progress=lambda f, m: print(f"[figure-summary] {f:5.0%} {m}"))
+    print(f"[figure-summary] 写入 {r['written']} 条，失败 {len(r['failed'])} 条")
+    for f in r["failed"][:10]:
+        print(f"[figure-summary]   x 论文 {f['paper_id']} p{f['page_no']}：{f['error']}")
+    print("[figure-summary] 说明要进检索还得重切一次块："
+          "`python tools/migrate_chunks.py --apply`，之后 `python cli.py vec embed-chunks`。")
+
+
+def cmd_table_summary(args):
+    """给每张表配一段自然语言说明，让表格能被语义检索找到。
+
+    表格块现在存的是原样 Markdown，整块拿去嵌入。「哪个方法效果最好」这类问题
+    跟一堆数字在语义空间里几乎没有距离——谁跟谁比、比什么、谁赢了，
+    表里一个字都没写。这条命令就是把那几件事写出来。
+
+    **默认只算账不花钱**，要真跑得加 `--apply`。摘要按表的内容哈希存，
+    重切块之后会自动贴回去，不用重新买。
+    """
+    from papernest import db, tablesum
+    db.init_db()
+    ids = [int(x) for x in (args.papers or "").replace(",", " ").split()] or None
+    print("[table-summary] 正在识别表格（读 PDF，不花钱）……")
+    items = tablesum.pending(ids)
+    est = tablesum.estimate(items)
+    if not items:
+        print("[table-summary] 没有待摘要的表格——要么都做过了，要么这些论文没有表。")
+    else:
+        print(f"[table-summary] 待摘要 {est['n_tables']} 张表（{est['n_papers']} 篇），"
+              f"共 {est['total_chars']:,} 字符")
+        print(f"[table-summary]   粗估 token：入 {est['est_prompt_tokens']:,} + "
+              f"出 {est['est_completion_tokens']:,} = {est['est_total_tokens']:,}"
+              f"（{est['note']}）")
+    if not args.apply:
+        print("[table-summary] 这是试算。确认后加 --apply 真正生成。")
+        return
+    def prog(frac, msg):
+        print(f"[table-summary] {frac:5.0%} {msg}")
+    r = tablesum.summarize(items, dry_run=False, progress=prog)
+    print(f"[table-summary] 写入 {r['written']} 条，失败 {len(r['failed'])} 条")
+    for f in r["failed"][:10]:
+        print(f"[table-summary]   × 论文 {f['paper_id']} 第 {f['page_no']} 页：{f['error']}")
+    stale = tablesum.papers_with_unapplied_summaries()
+    if stale:
+        print(f"[table-summary] ⚠ 摘要还没贴到检索块上：{len(stale)} 篇需要重切一次块。")
+        print(f"[table-summary]   跑 `python tools/migrate_chunks.py --apply --papers "
+              f"{','.join(str(i) for i in stale[:12])}`"
+              f"{' …' if len(stale) > 12 else ''}，")
+        print(f"[table-summary]   之后 `python cli.py vec embed-chunks` 重嵌受影响的块"
+              f"——那一步是要花钱的。")
+
+
 def cmd_rechunk(args):
     """把已有全文重切成章节级检索单元（有 PDF 的走章节切，没有的退化按页）。
 
     实测收益（25 篇真实 arXiv PDF、69 道 QASPER 带 gold 证据的题）：
     等上下文预算下证据召回是按页切的 2.2~3.2 倍。存量库跑一次即可。
     """
-    from papernest import db, fulltext
+    from papernest import config, db, fulltext
     db.init_db()
     with db.conn() as c:
         rows = c.execute("""SELECT DISTINCT p.id, p.pdf_path FROM papers p
                             JOIN pages g ON g.paper_id=p.id ORDER BY p.id""").fetchall()
+        # 先把账算给用户看：`db.replace_chunks` 会**作废这些论文的全部 chunk 向量**
+        # （重切之后 chunk_no 的含义变了，留着会「用旧向量匹配、回取新文本」）。
+        # 原来这条命令一个字都不提，跑完才发现要重嵌几千条。
+        ids = [r["id"] for r in rows]
+        marks = ",".join("?" * len(ids)) or "NULL"
+        drop = c.execute(
+            f"SELECT COUNT(*) n FROM vectors WHERE kind='chunk' AND paper_id IN ({marks})",
+            ids).fetchone()["n"] if ids else 0
+    if drop:
+        print(f"[rechunk] ⚠ 这会作废 {drop} 条 chunk 向量（{len(rows)} 篇），"
+              f"重切后需要跑 `python cli.py vectors embed-chunks` 重嵌——那是要花钱的。")
+        print(f"[rechunk]   只想修受影响的那几篇？用 `python tools/migrate_chunks.py`，"
+              f"它逐篇比对新旧切分、逐字相同的一律不动。")
+        if input("[rechunk] 确认全库重切？输入 yes 继续：").strip() != "yes":
+            print("[rechunk] 已取消"); return
     sect = paged = 0
     with db.conn() as c:
         for r in rows:
@@ -471,6 +625,9 @@ def cmd_rechunk(args):
                 paged += 1
         n = c.execute("SELECT COUNT(1) n FROM chunks").fetchone()["n"]
     print(f"[rechunk] {len(rows)} 篇有全文：按章节切 {sect} 篇 · 退化按页 {paged} 篇")
+    if drop:
+        print(f"[rechunk] 已作废 {drop} 条 chunk 向量；"
+              f"跑 `python cli.py vectors embed-chunks` 补回来（在那之前块级检索会退化）")
     print(f"[rechunk] chunks 共 {n} 条")
 
 
@@ -631,6 +788,20 @@ def cmd_qasper(args):
         r = qasper.import_papers(args.n_papers)
         print(r)
         return
+    if args.action == "chunksweep":
+        # 切片参数扫描（0 token）：max_chars × overlap 对证据召回的影响。
+        r = qasper.chunk_sweep()
+        print(f"[chunksweep] {r['n_questions']} 题 / {r['n_spans']} 条 gold 片段 · "
+              f"等预算 {r['budget']} 字符 · per_paper={r['per_paper']}")
+        print(f"{'max_chars':>10} {'overlap':>8} {'问题级':>8} {'片段级':>8} {'p vs 默认':>10}")
+        for row in r["rows"]:
+            pv = "—（基线）" if row["p_vs_default"] is None else f"{row['p_vs_default']:.3g}"
+            print(f"{row['max_chars']:>10} {row['overlap']:>7.0%}"
+                  f" {row['question_recall']:>7.1%} {row['span_recall']:>7.1%} {pv:>10}")
+        out = config.DATA_DIR / "qasper_chunksweep.json"
+        out.write_text(json.dumps(r, ensure_ascii=False, indent=1), encoding="utf-8")
+        print(f"[chunksweep] 明细 -> {out}")
+        return
     if args.action == "ctxab":
         r = qasper.context_ab(max_papers=args.n_papers, max_questions=args.limit)
         print(f"上下文组装 A/B（{r['n_questions']} 道带 gold 证据的题 · 等预算 · 0 token）")
@@ -771,7 +942,7 @@ def cmd_serve(args):
                 host=host, port=args.port, log_level="warning")
 
 
-# ── 二期：多 Agent 写作流水线（CLI 同步跑各阶段任务，检查点人工确认）──
+# ── 多 Agent 写作流水线（CLI 同步跑各阶段任务，检查点人工确认）──
 
 def _write_job(run_id: str, stage: str, extra: dict | None = None) -> dict:
     """同步执行一个流水线阶段任务（复用 jobs 基建，进度落库）。"""
@@ -993,6 +1164,19 @@ def main():
     vc.add_argument("--dry-run", action="store_true", help="只试算成本，不调接口")
     vc.set_defaults(fn=cmd_vec)
 
+    en_ = sub.add_parser("enrich",
+                         help="表格摘要/插图说明/重切/重嵌 四步的账一次看清（不花钱）")
+    en_.set_defaults(fn=cmd_enrich)
+    fs_ = sub.add_parser("figure-summary",
+                         help="给插图配说明，让图能被语义检索找到（默认只算账）")
+    fs_.add_argument("--papers", default="", help="只处理这几篇（逗号或空格分隔的 id）")
+    fs_.add_argument("--apply", action="store_true", help="真正调用视觉模型（要花钱）")
+    fs_.set_defaults(fn=cmd_figure_summary)
+    ts_ = sub.add_parser("table-summary",
+                         help="给表格配自然语言说明，让它能被语义检索找到（默认只算账）")
+    ts_.add_argument("--papers", default="", help="只处理这几篇（逗号或空格分隔的 id）")
+    ts_.add_argument("--apply", action="store_true", help="真正调用模型生成（要花钱）")
+    ts_.set_defaults(fn=cmd_table_summary)
     sub.add_parser("rechunk", help="把已有全文重切成章节级检索单元（存量库跑一次）"
                    ).set_defaults(fn=cmd_rechunk)
 
@@ -1093,7 +1277,7 @@ def main():
     sub.add_parser("demo").set_defaults(fn=cmd_demo)
 
     qp = sub.add_parser("qasper")
-    qp.add_argument("action", choices=["download", "import", "eval", "ctxab"])
+    qp.add_argument("action", choices=["download", "import", "eval", "ctxab", "chunksweep"])
     qp.add_argument("--n-papers", type=int, default=30)
     qp.add_argument("--k", type=int, default=5)
     qp.add_argument("--sec-k", type=int, default=2)

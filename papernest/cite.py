@@ -10,7 +10,7 @@ import re
 
 import numpy as np
 
-from . import db, embeddings
+from . import db, embeddings, normalize
 
 
 # ── 候选检索 ──
@@ -144,8 +144,12 @@ def to_bibtex(p: dict) -> str:
         lines.append(f"  journal = {{{_bib_escape(p['venue'])}}},")
     if p.get("year"):
         lines.append(f"  year = {{{p['year']}}},")
-    if p.get("doi"):
-        lines.append(f"  doi = {{{_bib_escape(p['doi'])}}},")
+    # 必须剥前缀：真库 242 篇有 DOI 的论文里 100 篇存的是 `https://doi.org/10.x`
+    # （openalex 源原样落库），直接写进去就是 `doi = {https://doi.org/10.x}`——
+    # BibTeX 的 doi 字段约定是裸 DOI，多数样式会再拼一次 https://doi.org/ 前缀。
+    doi = normalize.bare_doi(p.get("doi"))
+    if doi:
+        lines.append(f"  doi = {{{_bib_escape(doi)}}},")
     if p.get("arxiv_id"):
         lines.append(f"  eprint = {{{_bib_escape(p['arxiv_id'])}}},")
         lines.append("  archivePrefix = {arXiv},")
@@ -161,8 +165,9 @@ def to_ris(p: dict) -> str:
         lines.append(f"JO  - {p['venue']}")
     if p.get("year"):
         lines.append(f"PY  - {p['year']}")
-    if p.get("doi"):
-        lines.append(f"DO  - {p['doi']}")
+    doi = normalize.bare_doi(p.get("doi"))       # RIS 的 DO 字段同样是裸 DOI
+    if doi:
+        lines.append(f"DO  - {doi}")
     if p.get("arxiv_id"):
         lines.append(f"UR  - https://arxiv.org/abs/{p['arxiv_id']}")
     lines.append("ER  - ")

@@ -256,7 +256,11 @@ def attach_source(document_id: int, paper_id: int, page_no: int | None = None,
             raise ValueError("论文不存在")
         conn.execute(
             """INSERT INTO document_sources(document_id,paper_id,page_no,quote,relation)
-               VALUES(?,?,?,?,?) ON CONFLICT(document_id,paper_id,page_no)
+               VALUES(?,?,?,?,?)
+               -- 冲突目标必须用 COALESCE 那条表达式索引：复合主键里 page_no 可空，
+               -- 而 UNIQUE 索引里 NULL 互不相等，按主键做 upsert 永远不触发
+               -- （page_no 默认就是 None，同一条引用挂几次就存几行）。
+               ON CONFLICT(document_id,paper_id,COALESCE(page_no,-1))
                DO UPDATE SET quote=excluded.quote, relation=excluded.relation""",
             (document_id, paper_id, page_no, quote, relation or "support"),
         )

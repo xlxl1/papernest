@@ -10,13 +10,16 @@ from . import cards, db, llm
 from .sources import arxiv, openalex, semantic_scholar
 
 
-def _fetch_sources(query: str, limit: int) -> tuple[list[dict], str]:
+def _fetch_sources(query: str, limit: int,
+                   no_cache: bool = False) -> tuple[list[dict], str]:
     """查询路由三层：① 查询结果集缓存（同查询零外网请求）
     → ② S2 主源（arXiv 合并去重）→ ③ OpenAlex 兜底。
     全部失败才抛 RuntimeError（带每步死因与可行动建议）。
     """
     with db.conn() as c:
-        hit = db.get_query_cache(c, query)
+        # `no_cache=True` 是「我就是要看有没有新文献」这条路径的显式开关；
+        # 默认走 TTL（db.QUERY_CACHE_TTL_HOURS）。
+        hit = None if no_cache else db.get_query_cache(c, query)
         if hit:
             keys = json.loads(hit["keys_json"])
             rows = [db.get_by_norm_key(c, k) for k in keys]
@@ -74,14 +77,16 @@ def _fetch_sources(query: str, limit: int) -> tuple[list[dict], str]:
 
 def ingest(query: str, limit: int = 20, topic: str | None = None,
            year_from: int | None = None, year_to: int | None = None,
-           progress=None, make_cards: bool = True) -> dict:
+           progress=None, make_cards: bool = True,
+           no_cache: bool = False) -> dict:
     """query 为已合并的关键词串；年份筛选在检索结果上做（查询缓存存的原始结果集）。
 
     progress(frac, stage, message)：异步任务的进度回调，CLI/同步调用不传即可。
     make_cards=False 时不生成 L1 卡片（规模实验用：纯元数据入库，0 次 LLM）。
+    no_cache=True 强制绕过查询结果集缓存（「我就是要看这个课题有没有新文献」）。
     """
     db.init_db()
-    papers, source_tag = _fetch_sources(query, limit)
+    papers, source_tag = _fetch_sources(query, limit, no_cache=no_cache)
     year_filtered = 0
     if year_from or year_to:
         before = len(papers)

@@ -32,7 +32,7 @@ import math
 import re
 import threading
 
-from . import config, db
+from . import config, db, degrade
 
 # ── 建表：只加两张新表，不动 db.py 的 SCHEMA / MIGRATIONS ──
 
@@ -48,6 +48,10 @@ CREATE TABLE IF NOT EXISTS section_nodes (
   start_page INTEGER,
   end_page INTEGER,
   n_chars INTEGER NOT NULL DEFAULT 0,
+  -- 节点自己的正文。第二级原来是拿页区间回 pages 表**猜**这一节的正文，
+  -- 而结构化章节的页区间会互相重叠（父节的引言段与第一个子节共占一页），
+  -- 于是片段会被贴上不属于它的 section_path。存下正文之后这一级是精确的。
+  body TEXT NOT NULL DEFAULT '',
   UNIQUE(paper_id, node_id)
 );
 CREATE INDEX IF NOT EXISTS idx_section_nodes_paper ON section_nodes(paper_id);
@@ -78,6 +82,11 @@ def ensure_schema(force: bool = False):
             return
         with db.conn() as c:
             c.executescript(_SCHEMA)
+            # 老库补列（CREATE TABLE IF NOT EXISTS 不会给已有表加列）。
+            cols = {r[1] for r in c.execute("PRAGMA table_info(section_nodes)")}
+            if "body" not in cols:
+                c.execute("ALTER TABLE section_nodes ADD COLUMN "
+                          "body TEXT NOT NULL DEFAULT ''")
         _schema_done.add(key)
 
 
@@ -261,7 +270,7 @@ def _split_page(text: str) -> tuple[str, str, bool]:
     return "", (text or "").strip(), False
 
 
-def _nodes_from_pages(c, paper_id: int) -> tuple[list[dict], str | None]:
+def _nodes_from_pages(c, paper_id: int) -> tuple[list[dict], str | None, int]:
     rows = c.execute("SELECT page_no, text FROM pages WHERE paper_id=? ORDER BY page_no",
                      (paper_id,)).fetchall()
     out: list[dict] = []
@@ -286,7 +295,9 @@ def _nodes_from_pages(c, paper_id: int) -> tuple[list[dict], str | None]:
     if out and no_head:
         degraded = (f"{no_head}/{len(out)} 页首行不像节标题，已整页当作一节"
                     f"（这类论文建议传 structure.section_chunks 的结果）")
-    return out, degraded
+    # 同时带出**分子**：`build_all` 的守卫要区分「这篇有一页不像标题」和
+    # 「这篇整篇都没有标题」，只看 degraded 是不是空的会把前者也换成 chunks。
+    return out, degraded, no_head
 
 
 # ── 从 structure.py 的结构建节点 ──
@@ -379,11 +390,11 @@ def build_index(paper_id: int, sections=None) -> dict:
     _boot()
     with db.conn() as c:
         if sections is None:
-            nodes, degraded = _nodes_from_pages(c, int(paper_id))
+            nodes, degraded, no_head = _nodes_from_pages(c, int(paper_id))
             source = "pages"
         else:
             nodes, degraded = _nodes_from_chunks(sections)
-            source = "sections"
+            no_head, source = 0, "sections"
 
         # 先删后插。删除必须在同一个事务里，否则中途失败会留下「删了一半」的索引。
         c.execute("DELETE FROM section_terms WHERE paper_id=?", (int(paper_id),))
@@ -398,9 +409,10 @@ def build_index(paper_id: int, sections=None) -> dict:
             path = " > ".join(parts)
             c.execute(
                 """INSERT INTO section_nodes(paper_id,node_id,parent_id,level,title,
-                     section_path,start_page,end_page,n_chars)
-                   VALUES(?,?,?,?,?,?,?,?,?)""",
-                (int(paper_id), nid, parent_id, depth, title, path, start, end, len(body)))
+                     section_path,start_page,end_page,n_chars,body)
+                   VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                (int(paper_id), nid, parent_id, depth, title, path, start, end,
+                 len(body), body))
             n_rows += 1
             # 标题与**祖先**标题也进词项表：标题命中的节必须能被第一级捞到，
             # 只索引正文的话「标题写着信道估计、正文全用缩写」的节会直接从索引里消失。
@@ -427,15 +439,54 @@ def build_index(paper_id: int, sections=None) -> dict:
                  depth, n["title"], n["path_parts"],
                  n["start_page"], n["end_page"], n["text"] or "")
     return {"paper_id": int(paper_id), "nodes": n_rows, "terms": n_terms,
-            "source": source, "degraded": degraded}
+            "source": source, "degraded": degraded,
+            # 守卫用的分子分母：`build_all` 只在**一页标题都没有**时才换 chunks
+            "pages_without_heading": no_head, "pages_seen": len(nodes)}
+
+
+def sections_from_chunks(paper_id: int) -> list[dict] | None:
+    """取该篇**已落库**的结构化章节块（`structure.section_chunks()` 经
+    `db.replace_chunks` 存下来的那份），没有就返回 None。
+
+    为什么读 chunks 表而不是现场重跑 `structure.section_chunks(pdf_path)`：
+    ① 0 token、不读盘、不依赖 pymupdf，`build_all` 仍然是纯 SQL 的离线操作；
+    ② `papers.pdf_path` 是绝对路径，换机器就失效，chunks 是随论文一起入库的；
+    ③ 与检索链路用的是**同一份切分**——索引里的节和 chunks 里的块对不上才是灾难。
+
+    只要 `kind='text'`：表格块的 section_path 是「表格（第 N 页）」，它不是章节；
+    参考文献块（`kind='reference'`）是别人论文的条目，更不是本篇的章节。
+    """
+    with db.conn() as c:
+        rows = c.execute(
+            "SELECT section_path, level, start_page, end_page, text FROM chunks "
+            "WHERE paper_id=? AND kind='text' AND COALESCE(section_path,'')<>'' "
+            "ORDER BY chunk_no", (int(paper_id),)).fetchall()
+    if not rows:
+        return None
+    return [{"section_path": r["section_path"], "level": r["level"],
+             "start_page": r["start_page"], "end_page": r["end_page"],
+             "text": r["text"] or ""} for r in rows]
 
 
 def build_all(progress=None) -> dict:
     """给全库「有全文」的论文建索引。三态计数，失败不中断整批。
 
     `progress(frac, stage, message)` 供异步任务接进度，同步调用不传即可。
-    返回 {"indexed", "skipped", "failed", "errors": [...]}——skipped 是「有全文但
-    推不出任何节点」（整页空白之类），跟 failed（抛异常）分开记，不要混成一个数。
+    返回 {"indexed", "skipped", "failed", "errors", "degraded", "degraded_detail"}
+    ——skipped 是「有全文但推不出任何节点」（整页空白之类），跟 failed（抛异常）
+    分开记，不要混成一个数。
+
+    **守卫为什么是「一页标题都没有」而不是「build_index 报了 degraded」**：
+    `_nodes_from_pages` 只要**有一页**首行不像标题就置 degraded。真库里 paper 486
+    的 11 页里 10 页是完美的 QASPER 节名、只有第 9 页因为以句号结尾被判 False——
+    按「degraded 非空」当守卫会把这一篇整个翻到 PDF 坐标系去，实测它的
+    Recall@5 会从 1.000 掉到 0.458。所以判据是 `no_head == pages_seen`。
+
+    **为什么是「pages 优先、整篇都没标题才换 chunks」而不是一律用 chunks**：
+    第二级要拿节点定位正文，而真库里 24 篇 QASPER 论文的 `pages` 是「一页一节」的
+    数据集正文（page_no 是节序号）、`chunks` 却是后来按真实 PDF 重切的
+    （start_page 是 PDF 页号）——两套坐标系。无条件改用 chunks 会让这 24 篇取错正文
+    （抽样探针命中率 0/30，对照 paper 1 是 29/30）。
     """
     _boot()
     with db.conn() as c:
@@ -443,23 +494,47 @@ def build_all(progress=None) -> dict:
             "SELECT DISTINCT paper_id FROM pages ORDER BY paper_id")]
     indexed = skipped = failed = 0
     errors: list[str] = []
+    faked: list[int] = []
     for i, pid in enumerate(ids):
         if progress:
             progress(min(0.05 + 0.9 * i / max(len(ids), 1), 0.95), "index",
                      f"建章节索引 {i + 1}/{len(ids)}")
         try:
             r = build_index(pid)
+            # 整篇一页标题都给不出来才换结构化章节。取 sections 单独兜异常：
+            # 它抛了（老库缺列、并发重切、磁盘错）不该把「已经建好的那份索引」
+            # 记成 failed，更不该把降级信息一起吞掉——那正是这条修复的全部意义。
+            if r["pages_seen"] and r["pages_without_heading"] == r["pages_seen"]:
+                try:
+                    sections = sections_from_chunks(pid)
+                except Exception as e:              # noqa: BLE001
+                    sections = None
+                    errors.append(f"paper {pid}: 读结构化章节失败 "
+                                  f"{type(e).__name__}: {e}（已保留按页建的索引）")
+                if sections:
+                    r = build_index(pid, sections)  # 先删后插，上一次的假节自动作废
         except Exception as e:                      # noqa: BLE001 —— 单篇失败不该拖垮整批
             failed += 1
             errors.append(f"paper {pid}: {type(e).__name__}: {e}")
             continue
+        if r["degraded"]:
+            faked.append(pid)
         if r["nodes"]:
             indexed += 1
         else:
             skipped += 1
+    notes: list[degrade.Degradation] = []
+    if faked:
+        head = "、".join(str(p) for p in faked[:5]) + ("…" if len(faked) > 5 else "")
+        notes.append(degrade.Degradation(
+            degrade.SECTION_TREE_PAGE_FALLBACK,
+            f"{len(faked)}/{len(ids)} 篇有页给不出节标题，那些页退化为一页一节"
+            f"（章节路径成了「（第 N 页）」；paper {head}）"))
+    notes = degrade.merge(notes)
     if progress:
         progress(1.0, "index", f"完成：{indexed} 篇已索引")
-    return {"indexed": indexed, "skipped": skipped, "failed": failed, "errors": errors}
+    return {"indexed": indexed, "skipped": skipped, "failed": failed, "errors": errors,
+            "degraded": degrade.render(notes), "degraded_detail": degrade.as_dicts(notes)}
 
 
 # ── 打分权重（两级共用，改这里就能复现实验）──
@@ -682,8 +757,14 @@ def search_in_scope(query: str, scope: dict, top_k: int = 5) -> list[dict]:
     **一节最多出一个片段**（该节最好的那个）：一是防长节刷屏，二是保证
     `trace` 里「stage2_hits ≤ stage1_nodes」这个不变量恒成立，trace 才说得清筛选比例。
 
-    正文从 `pages` 表按节点的页区间回取。若某篇只在 build_index 时传了 sections、
-    库里却没有它的 pages 全文，这一级取不到文本会如实跳过该节（不编造片段）。
+    正文**优先用节点自己存的 body**。回 `pages` 表按页区间取是退路：结构化章节的
+    页区间会互相重叠（父节的引言段与第一个子节共占一页、长章节的 part 也跨页），
+    按页回取会把片段贴上不属于它的 `section_path`，也会让同一段正文在 top-k 里
+    出现两次。用节点自己的正文，这一级对「这段话属于哪一节」是精确的。
+    只有 body 为空的节点（按页建的索引、以及补建的父节点）才走页区间那条退路。
+
+    最后按 `(paper_id, page_no, offset)` 去重：页区间重叠时两个节可能选中同一段，
+    保留分数最高的那个（`passage_rank_key` 是全序，结果可复现）。
     """
     _boot()
     nodes = list((scope or {}).get("nodes") or [])
@@ -694,6 +775,9 @@ def search_in_scope(query: str, scope: dict, top_k: int = 5) -> list[dict]:
 
     pages: dict[int, list[tuple[int, str]]] = {}
     paper_ids = sorted({n["paper_id"] for n in nodes})
+    # 节点自己的正文。**不放进 scope**：scope 会进 trace / 返回值，塞正文会把它撑大；
+    # 这里按需批量取一次即可。
+    bodies: dict[tuple[int, str], str] = {}
     with db.conn() as c:
         for batch in _batched(paper_ids, 400):
             ph = ",".join("?" * len(batch))
@@ -701,10 +785,46 @@ def search_in_scope(query: str, scope: dict, top_k: int = 5) -> list[dict]:
                     f"SELECT paper_id,page_no,text FROM pages WHERE paper_id IN ({ph}) "
                     f"ORDER BY paper_id,page_no", batch):
                 pages.setdefault(r["paper_id"], []).append((r["page_no"], r["text"] or ""))
+            for r in c.execute(
+                    f"SELECT paper_id,node_id,body FROM section_nodes "
+                    f"WHERE paper_id IN ({ph})", batch):
+                if r["body"]:
+                    bodies[(r["paper_id"], r["node_id"])] = r["body"]
 
     hits: list[dict] = []
     for node in nodes:
         lo, hi = node.get("start_page"), node.get("end_page")
+        body = bodies.get((node["paper_id"], node["node_id"]), "").strip()
+        if body:
+            # 精确路径：这一节的正文就在手上，不必按页区间去 pages 表猜。
+            # 页码报 start_page（与 chunks/向量路的口径一致）。
+            title_terms = set(terms_of(node.get("title") or ""))
+            # 把标题拼回去再切片段：节点是**靠标题**被第一级选中的（「Related Work >
+            # Static Word Embeddings」），正文里往往一个查询词都没有。旧的按页回取
+            # 之所以能命中，正是因为页文本天然含标题行；章节块的 text 同样不含标题，
+            # 不拼回去这一级就会对这类节点交白卷。
+            title = (node.get("title") or "").strip()
+            chunks = _passages(("%s\n\n%s" % (title, body)) if title else body)
+            best = None
+            for i, (off, ctext) in enumerate(chunks):
+                sc, matched = _score_passage(ctext, q_terms, title_terms, i,
+                                             len(chunks), idf)
+                if sc <= 0:
+                    continue
+                sc += NODE_PRIOR_W * float(node.get("score") or 0.0)
+                cand = {
+                    "paper_id": node["paper_id"], "node_id": node["node_id"],
+                    "section_path": node.get("section_path") or "",
+                    "section_title": node.get("title") or "",
+                    "level": node.get("level"), "start_page": node.get("start_page"),
+                    "page_no": lo, "offset": off, "score": round(sc, 6),
+                    "matched_terms": matched, "text": ctext,
+                }
+                if best is None or (-cand["score"], cand["offset"]) <                         (-best["score"], best["offset"]):
+                    best = cand
+            if best:
+                hits.append(best)
+            continue
         if lo is None:
             # 没有自有页区间：补建的父节点，或结构里本来就没给页码的 chunk。
             # 不能放它进来「不设上下界地扫全篇」——那等于把第一级的筛选成果丢掉。
@@ -738,7 +858,17 @@ def search_in_scope(query: str, scope: dict, top_k: int = 5) -> list[dict]:
             hits.append(best)
 
     hits.sort(key=passage_rank_key)
-    return hits[:max(0, int(top_k))]
+    # 同一段正文只出一次：页区间重叠时两个节会选中同一 (页, 偏移)，
+    # 保留排在前面的（分数更高；`passage_rank_key` 是全序，同分也可复现）。
+    seen_pos: set[tuple] = set()
+    uniq: list[dict] = []
+    for h in hits:
+        key = (h["paper_id"], h["page_no"], h["offset"])
+        if key in seen_pos:
+            continue
+        seen_pos.add(key)
+        uniq.append(h)
+    return uniq[:max(0, int(top_k))]
 
 
 # ── 顶层：两级检索 ──

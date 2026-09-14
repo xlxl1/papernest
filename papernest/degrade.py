@@ -28,6 +28,8 @@ from typing import NamedTuple
 VECTOR_INDEX_EMPTY = "vector_index_empty"
 #: 向量检索抛异常（网络、维度不一致、端点 404……）
 VECTOR_CALL_FAILED = "vector_call_failed"
+#: 配置的向量后端不可用、或派生索引落后于真相，本次查询退回 SQLite 真相来源现算
+VECTOR_BACKEND_DEGRADED = "vector_backend_degraded"
 #: 检索到的论文因上下文预算被挤掉
 CONTEXT_OVER_BUDGET = "context_over_budget"
 #: 问句在该篇正文里一个词都没命中，退回按本篇自己的关键词选页
@@ -36,6 +38,17 @@ PAGE_PICK_FALLBACK = "page_pick_fallback"
 PAGE_PICK_MISS = "page_pick_miss"
 #: 追问被改写后才拿去检索
 QUERY_REWRITTEN = "query_rewritten"
+
+#: 用户回指的 [n] 不在本会话的编号表里，没有任何论文被拉回上下文
+REF_INDEX_UNRESOLVED = "ref_index_unresolved"
+#: 回指的论文太多，被截断了——用户点名的东西没能全进上下文
+REF_PIN_TRUNCATED = "ref_pin_truncated"
+#: 回指 pin 把本轮检索结果整体挤出了上下文
+REF_PIN_EVICTED = "ref_pin_evicted"
+#: 会话编号已经超出渲染层能认的位数（引用角标与 [n] 回指会同时失效）
+REF_INDEX_OVERFLOW = "ref_index_overflow"
+#: 章节树建索引时拿不到结构化章节，退回「一页一节」（章节路径成了「（第 N 页）」）
+SECTION_TREE_PAGE_FALLBACK = "section_tree_page_fallback"
 #: 流式输出中途断开，答案是半截的
 STREAM_INTERRUPTED = "stream_interrupted"
 

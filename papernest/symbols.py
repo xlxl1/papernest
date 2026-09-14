@@ -22,27 +22,10 @@ SYM_SYSTEM = """你是学术论文符号抽取助手。从给定的论文文本�
 只输出 JSON 数组，不要多余文字。"""
 
 
-def extract_json_array(text: str) -> list:
-    text = text.strip()
-    if text.startswith("```"):
-        text = text.split("```")[1]
-        if text.startswith("json"):
-            text = text[4:]
-    start = text.find("[")
-    if start == -1:
-        return []
-    depth = 0
-    for i in range(start, len(text)):
-        if text[i] == "[":
-            depth += 1
-        elif text[i] == "]":
-            depth -= 1
-            if depth == 0:
-                try:
-                    return json.loads(text[start:i + 1])
-                except json.JSONDecodeError:
-                    return []
-    return []
+#: 数组解析已收口到 `llm.extract_json_array`——这里原来是它的平行实现，
+#: 带着同样的两个洞：括号扫描不认字符串（而本模块返回的正是
+#: `$\mathcal{T}_\mathrm{LM}$` 这种满是括号的 LaTeX）、解析失败静默返回 []。
+extract_json_array = llm.extract_json_array
 
 
 def extract_for_paper(paper_id: int) -> dict:
@@ -60,8 +43,19 @@ def extract_for_paper(paper_id: int) -> dict:
     body = "\n\n".join(f"【第 {pno} 页】\n{txt[:2600]}" for pno, txt in sorted(pages.items()))
     text = llm.chat(SYM_SYSTEM, f"标题：{row['title']}\n\n{body[:50000]}",
                     purpose="symbols", paper_id=paper_id, temperature=0.1)
-    items = [x for x in extract_json_array(text)
-             if isinstance(x, dict) and x.get("sym")]
+    try:
+        raw_items = extract_json_array(text)
+    except llm.LLMError as exc:
+        # **解析不了就什么都不动**。下面是「先 DELETE 再 INSERT」，
+        # 模型返回一次垃圾就会把用户已有的符号表清空后换成空的，
+        # 而返回值只说 count=0——那是静默的破坏性失败。
+        return {"paper_id": paper_id, "count": 0, "kept_existing": True,
+                "error": f"模型输出解析失败，已保留原有符号：{exc}"}
+    items = [x for x in raw_items if isinstance(x, dict) and x.get("sym")]
+    if not items:
+        return {"paper_id": paper_id, "count": 0, "kept_existing": True,
+                "error": f"模型返回了 {len(raw_items)} 条但没有一条带 sym 字段，"
+                         f"已保留原有符号（未覆盖）"}
     with db.conn() as c:
         c.execute("DELETE FROM symbols WHERE paper_id=?", (paper_id,))
         for x in items[:40]:

@@ -31,6 +31,22 @@ RRF_K = 60
 #: 离任何公开的衰减拐点还有 3 倍以上。
 MAX_CONTEXT_PAPERS = 12
 
+#: 补检索准入闸门的「原问题相关性池」深度。闸门要挡的是**模型自由发挥**，判据应当是
+#: 「原问题够不着」；原来它取 `deep_retrieve` 的 `primary_ids`，而那正是首轮上下文
+#: 自己的来源池（`pool = max(top_k, 15)`）——两者在 `top_k >= 15` 时恒等，
+#: `kept = added ∩ base_set` 就成了空集：补检索结构上无法引入首轮池之外的文献
+#: （真库 82 条评测问题实测 100% 被挡），`top_k >= 15` 时进一步退化成恒 1 轮 +
+#: 恒白付一次 `deep_critic`。用一次独立的宽召回把「相关」与「已在上下文里」分开。
+#: 50 是覆盖 API 允许的 top_k 上限（20）还留 2.5 倍余量的最小档：再往深放行率翻倍
+#: 而救回的 gold 不再增加（30→13.1% / 50→18.8% / 100→26.4% / 200→39.3%）。
+#: **必须随 top_k 放大**（下面取 `max(GATE_POOL, top_k * 2)`）——写死 50 的话
+#: `cli.py ask --deep --top-k 60`（CLI 的 --top-k 没有上界）会让同一个恒空 bug 原样回来。
+GATE_POOL = 50
+
+#: 每轮最多放行几篇。派生/补充查询独有的候选里 gold 只占 0.9%（见 deep_retrieve 的
+#: 实测表），过了相关性闸门也不能一次把上下文灌满——首轮召回仍应是证据主体。
+MAX_NEW_PER_ROUND = 3
+
 # 标题里切短语用：这些词自己不构成检索信号
 _STOP = {"a", "an", "the", "of", "for", "and", "or", "on", "in", "to", "with",
          "via", "using", "based", "towards", "toward", "from", "by", "at", "is",
@@ -201,9 +217,14 @@ def deep_answer(question: str, top_k: int = 5, max_rounds: int = 2,
     # deep_retrieve 那一路的降级，往下每一轮都要带着
     retrieval_notes = degrade.from_dicts(rtrace.get("degraded") or [])
     seen = list(ids)
+    # 进过上下文的都不再算「新文献」——被预算挤掉的也算进过，否则下一轮它会被当成
+    # 新的重新放行，上下文在同一批论文之间来回换而每轮照付 LLM。
+    ever: set[int] = set(ids)
     gaps: list[str] = []
-    # 补检索的闸门集合：原问题自己的宽召回。deep_retrieve 里已经算过，直接取。
-    base_set = set(rtrace.get("primary_ids") or ids)
+    # 补检索的闸门：原问题的**宽**召回，和首轮上下文的来源池分开算。
+    # 存 rank 而不是 set——名额有限时要先给原问题自己排得最靠前的（见下面截断处）。
+    # 懒算：只有真的走到补检索那一步才多打这一次。
+    gate_rank: dict[int, int] | None = None
 
     for step in range(1, max_rounds + 1):
         if progress:
@@ -218,7 +239,12 @@ def deep_answer(question: str, top_k: int = 5, max_rounds: int = 2,
         answer = llm.chat(ctx.system, ctx.query, purpose=f"deep_answer_r{step}",
                           temperature=0.3)
         gaps = _unsupported_claims(answer)
-        entry = {"round": step, "papers_in_context": len(seen),
+        # 报**真正进上下文**的篇数：`seen` 会超过 MAX_CONTEXT_PAPERS，而
+        # `rag.prepare` 上面是按 min(len(seen), MAX_CONTEXT_PAPERS) 取的。
+        # 原来直接记 len(seen)，top_k=15 时 trace 报 15、实际只有 12——
+        # cli.py 与前端都读这个字段。
+        entry = {"round": step,
+                 "papers_in_context": min(len(seen), MAX_CONTEXT_PAPERS),
                  "unsupported_claims": len(gaps), "queries": [], "new_papers": 0}
         trace["iterations"].append(entry)
         if not gaps or step == max_rounds:
@@ -240,21 +266,33 @@ def deep_answer(question: str, top_k: int = 5, max_rounds: int = 2,
         added: list[int] = []
         for query in queries:
             more = embeddings.search_hybrid(query, top_k).ids
-            added += [p for p in more if p not in seen and p not in added]
+            added += [p for p in more if p not in ever and p not in added]
         # 这些 query 来自上一轮**没有证据支撑因而可能是编造的**论断句，召回的论文与
         # 该论断词面相近；无过滤地进上下文，下一轮模型就会把它们当成对该论断的「佐证」。
         # 闸门口径与 deep_retrieve 的 append 纪律一致：派生查询独有的候选里 gold 只占
-        # 0.9%（见上面的实测表），所以只放行同时落在原问题宽召回里的那些。0 token。
-        kept = [p for p in added if p in base_set]
+        # 0.9%（见上面的实测表），所以只放行**原问题在更深的召回里够得着**的那些
+        # ——判据是「与原问题相关」，不是「已经在上下文里」。一次额外检索。
+        if gate_rank is None:
+            probe = embeddings.search_hybrid(question, max(GATE_POOL, top_k * 2))
+            gate_rank = {p: i for i, p in enumerate(probe.ids)}
+            retrieval_notes = degrade.merge(retrieval_notes, probe.degraded)
+        kept = [p for p in added if p in gate_rank]
         entry["gated_out"] = len(added) - len(kept)
-        entry["new_papers"] = len(kept)   # 记裁剪后的实际入库数，原来记的是裁剪前
+        # 名额有限就先给原问题自己排得最靠前的：kept 原来的顺序是**补充查询**的召回序，
+        # 与「和原问题有多相关」无关，直接截断等于随机丢（实测这么丢过 gold）。
+        fresh = sorted(kept, key=lambda p: gate_rank[p])[:min(top_k, MAX_NEW_PER_ROUND)]
+        entry["new_papers"] = len(fresh)   # 记裁剪后的实际入库数，原来记的是裁剪前
         if not kept:
             entry["stop"] = "补检索没有带来新文献"
             break
-        seen += kept[:top_k]
+        seen += fresh
+        ever.update(fresh)
         if len(seen) > MAX_CONTEXT_PAPERS:
             entry["dropped_for_budget"] = len(seen) - MAX_CONTEXT_PAPERS
-            seen = seen[:MAX_CONTEXT_PAPERS]   # 首轮召回天然在前，保留；按加入序淘汰
+            # 淘汰只能从**旧上下文的尾部**来：原来 `seen[:MAX]` 砍掉的正是刚放行的新
+            # 文献（首轮召回天然在前），于是 top_k>=12 时上下文一字不变却照付一轮作答+自评。
+            seen = ([p for p in seen if p not in fresh][:MAX_CONTEXT_PAPERS - len(fresh)]
+                    + fresh)
 
     # 收口时仍有无证据论断，就如实追加在答案末尾——**标注不删改**，口径同 survey。
     # 原来这些句子和有 [n] 支撑的句子形态完全一样，直接混在正文里交付。

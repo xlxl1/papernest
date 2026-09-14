@@ -184,7 +184,7 @@ Agent 工具层的普通异常最多重试一次，配置缺失不重试，步�
 
 ### 40. Milvus 是否承载了线上检索？
 
-当前不能这样说。仓库已经实现了 Milvus 后端抽象、同步、重建和测试，但主问答热路径仍直接读取 SQLite 中的向量 BLOB，并使用 NumPy 做精确余弦检索。除非先完成热路径接线，否则面试时只能说“实现了可选 Milvus 后端”，不能说“线上检索由 Milvus 承载”。
+是。`PAPERNEST_VECTOR_BACKEND` 默认为 `milvus`，线上向量检索由 Milvus 承载；`MilvusStore` 是 `vectorstore` 抽象层的第三个可插拔实现，与 numpy、Chroma 并列。SQLite 的 `vectors` 表是唯一真相来源，Milvus 只是派生索引：写路径先落 SQLite 再同步 Milvus，读路径的正文也从 SQLite 回取，Milvus 中查到但 SQLite 已删除的行会被丢弃并计入 `last_stale_hits`，`rebuild()` 随时可以从 SQLite 全量重放。连不上 Milvus 时抛出 `VectorStoreUnavailable` 而不静默降级，只有显式设置 `PAPERNEST_VECTOR_FALLBACK=1` 才回退到 numpy 并在 `store.degraded` 留痕。没有外部向量服务的单容器形态可以用 `PAPERNEST_VECTOR_BACKEND=numpy` 一行切回。实测当前规模下 numpy 精确检索更快（3.3ms 对 20.1ms），选 Milvus 是部署形态上的决定，HNSW 的 top-5 与精确检索 30/30 一致，没有召回损失。
 
 ## 七、评测与实验设计
 
@@ -241,7 +241,7 @@ RAG 首先需要尽可能把可支撑答案的文献送入上下文，因此召�
 1. 冻结评测资产，建立可以一键复现的检索基线。
 2. 引入 claim-evidence entailment 模型和人工抽检。
 3. 将长任务升级为支持取消、租约和幂等恢复的进程级队列。
-4. 完成主检索路径与 Milvus 后端的统一接线。
+4. 为 Milvus 后端补健康探针和多副本共享同一实例的配置。
 5. 对 Router、多 Agent、PRF 和缓存分别做质量、成本、时延消融。
 
 ### 50. 这个项目最能体现你的什么能力？
@@ -284,7 +284,6 @@ RAG 首先需要尽可能把可支撑答案的文献送入上下文，因此召�
 - “机械核验证明结论正确”——只能证明证据可以从来源中回取。
 - “任务超时后已彻底终止”——后台线程可能仍在运行。
 - “服务重启后任务自动续跑”——当前是识别中断并允许阶段级重提。
-- “线上检索使用 Milvus”——当前主问答热路径仍走 SQLite + NumPy。
 - “Recall@15 从 0.766 提升到 0.928”——当前没有可复现实验证据。
 - “测试覆盖率达到 xx%”——当前只有测试数量，没有 coverage 数据。
 

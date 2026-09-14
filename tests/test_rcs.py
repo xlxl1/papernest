@@ -297,3 +297,73 @@ class RcsAnswerTests(RcsTestBase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BodyTextEvidenceWindowTest(RcsTestBase):
+    """定向摘要必须看得到「问句真正命中的那一页」，而不是恒定的前 3 页。
+
+    形态照真库量出来的数字构造（data/papernest.db 实测）：
+      · 45 篇有全文的论文平均 12.6 页（中位 12）；
+      · QASPER 侧单节中位 1227 字符；abstract+卡片中位 868、p90 1223 字符；
+      · 122 道带 gold 证据的题里，gold 证据首次出现的页(节)序号中位数 = 5、p90 = 10，
+        只有 43.4% 落在前 3 页——而前 3 节典型是 Abstract/Intro/Related Work。
+    所以这里：12 页 × ~1200 字符，abstract ~1200 字符，证据落在第 9 页。
+
+    三个 filler 页与 evidence 页等长，所以 `_pick_pages` 的密度归一不会因页长差异
+    而作弊——第 9 页胜出只能是因为它含 bleu/wmt14/decoder 这些问句词。
+    """
+
+    def _make_paper(self):
+        filler = ("This section reviews prior work on unrelated topics and "
+                  "provides general background discussion for completeness. ")
+        evidence = ("We evaluate the proposed decoder on the WMT14 corpus and "
+                    "observe a BLEU improvement of 2.3 points over the baseline.")
+        abstract = ("We study neural sequence models. " * 40)[:1200]
+        with db.conn() as c:
+            pid = db.insert_l0(c, {
+                "norm_key": "arxiv:9001", "title": "Neural Decoder Study",
+                "abstract": abstract, "year": 2021, "venue": "V", "authors": [],
+                "doi": None, "arxiv_id": "9001", "source": "s2"})
+            for pno in range(1, 13):
+                if pno == 9:
+                    text = (filler * 5) + evidence + " " + (filler * 5)
+                else:
+                    text = filler * 10
+                c.execute("INSERT INTO pages(paper_id,page_no,text) VALUES(?,?,?)",
+                          (pid, pno, text[:1200]))
+            db.reindex_pages(c, pid)
+        return pid, evidence
+
+    def test_evidence_page_reaches_the_summary_model(self):
+        pid, _evidence = self._make_paper()
+        seen = []
+
+        def capture(user):
+            seen.append(user)
+            return _summary(True, "要点。", [])
+
+        question = "What BLEU improvement does the proposed decoder achieve on WMT14?"
+        with self._on({"rcs_summary": capture}):
+            rcs.summarize_for(question, [pid])
+
+        self.assertEqual(len(seen), 1, "摘要调用没发出去")
+        prompt = seen[0]
+        # ① 钉住缺陷本身：命中页必须进得了喂给模型的正文
+        self.assertIn(
+            "BLEU improvement of 2.3 points", prompt,
+            "第 9 页（问句唯一真正命中的页）没有进入 _body_text 的输出——"
+            "定向摘要模型看不到证据，它判出来的「不相关」不是模型过滤激进，是输入里就没有")
+        # ② 钉住「不许靠拆掉预算蒙混过关」
+        self.assertLessEqual(len(prompt), rcs.SUMMARY_CHARS + 400,
+                             "正文超出 SUMMARY_CHARS 预算，等于把上限拆了")
+        # ③ 钉住预算天花板：防止后人「再改大一点」无依据地放大 token 成本
+        self.assertLessEqual(rcs.SUMMARY_CHARS, 8000,
+                             "SUMMARY_CHARS 超过 8000：token 成本没有依据地放大")
+
+    def test_page_markers_do_not_break_quote_verification(self):
+        """`_pick_pages` 插的「【第 N 页】」被模型连着抄回来时，不许判成「未核验」。
+
+        那是**假阴性**——把真证据标成未核验，比假阳性更隐蔽，因为它让人不敢用。
+        """
+        self.assertEqual(rcs._norm_quote("【第 15 页】We evaluate the decoder…"),
+                         rcs._norm_quote("We evaluate the decoder"))

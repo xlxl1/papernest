@@ -484,6 +484,14 @@ table.mx td a{cursor:pointer}
 <script>
 const $=id=>document.getElementById(id);
 const esc=s=>(s??'').toString().replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+// 把一个值塞进内联事件属性（onclick="f(…)"）里的**唯一正确**办法。
+// 仓库原来用的是 esc(x).replace(/'/g,'&#39;')——那是坏的：HTML 解析器会在把属性值
+// 交给 JS 编译**之前**把 &#39; 解回单引号，于是 onclick="f('Bing&#39;s')" 变成
+// f('Bing's') 直接语法错误，整个 onclick 编译不出来、点了没反应。
+// 浏览器里实测过：那种写法 el.onclick === null；本写法能正确拿到原字符串。
+// JSON.stringify 负责 JS 层转义（引号/反斜杠/控制字符），esc 负责 HTML 层，
+// 两层各管各的，顺序不能反。真库里已经有一篇会踩到（"Assessing BERT's ..."）。
+const jsArg=v=>esc(JSON.stringify(v??''));
 
 /* ── 访问口令：让 PAPERNEST_API_KEY 这把锁真的能开起来 ──
    服务端的鉴权中间件一直是好的，但这个页面此前 30 处 fetch 加 1 处 EventSource
@@ -618,8 +626,8 @@ async function chatHistory(){
           <b>${esc(s.title||'（无标题）')}</b>
           <span class="mkt"> · ${s.n} 条 · ${esc(s.updated_at||'')}</span>
           <div class="bar" style="margin-top:6px">
-            <button class="ghost" onclick="chatResume('${s.id}')">继续这段对话</button>
-            <button class="ghost" onclick="chatDelete('${s.id}',this)">删除</button>
+            <button class="ghost" onclick="chatResume(${jsArg(s.id)})">继续这段对话</button>
+            <button class="ghost" onclick="chatDelete(${jsArg(s.id)},this)">删除</button>
           </div>
         </div>`).join(''):'<p class="desc">还没有历史会话。</p>'}`;
     $('ov').classList.add('on');
@@ -638,7 +646,7 @@ async function chatResume(id){
       if(m.role==='user'){ pushMsg('user',m.content); continue; }
       const d=document.createElement('div'); d.className='msg bot';
       const src=(m.sources||[]).map(x=>`<a onclick="openPaper(${x.paper_id})">[${x.idx}] ${esc(x.title)}</a>`).join('<br>');
-      d.innerHTML=esc(m.content).replace(/\[(\d{1,2})\]/g,'<sup class="cite">$1</sup>')
+      d.innerHTML=esc(m.content).replace(/\[(\d{1,3})\]/g,'<sup class="cite">$1</sup>')
         +(src?`<div class="src">来源：<br>${src}</div>`:'');
       $('chat').appendChild(d);
     }
@@ -663,7 +671,7 @@ async function doChat(){
   const {el,done}=pushThinking();
   let raw='', sources=[], degraded='';
   const render=(streaming)=>{
-    const body=esc(raw).replace(/\[(\d{1,2})\]/g,'<sup class="cite">$1</sup>');
+    const body=esc(raw).replace(/\[(\d{1,3})\]/g,'<sup class="cite">$1</sup>');
     const src=(streaming&&sources.length)
       ? `<div class="src">已检索 ${sources.length} 篇相关文献，正在组织回答…</div>`:'';
     el.innerHTML=`${body}${src}${degraded?`<div class="src">⚠ ${esc(degraded)}</div>`:''}`;
@@ -686,11 +694,22 @@ async function doChat(){
       let j; try{ j=JSON.parse(data); }catch(_){ return; }
       if(ev==='sources'){ sources=j.sources||[]; degraded=j.degraded||''; setChatSession(j.session_id); render(true); }
       else if(ev==='delta'){ raw+=j.t; render(true); }
-      else if(ev==='error'){ raw+=(raw?'\n\n':'')+'⚠ '+j.error; }
+      else if(ev==='error'){
+        // 服务端在「200 已经发出去之后才出错」时发这个事件，发完就 return，
+        // **不会再发 done**。原来这里只把文本追加到 raw 上、既不 render 也不 done，
+        // 于是流关闭、reader 循环 break、函数直接走完，UI 永远停在
+        // 「正在组织回答…」——而半截答案其实已经落库了，用户却什么都看不到。
+        raw+=(raw?'\n\n':'')+'⚠ '+j.error;
+        if(j.degraded) degraded=j.degraded;
+        const body=esc(raw).replace(/\[(\d{1,3})\]/g,'<sup class="cite">$1</sup>');
+        const esrc=(sources||[]).map(s=>`<a onclick="openPaper(${s.paper_id})">[${s.idx}] ${esc(s.title)}（${esc(s.venue||'')} ${s.year||''}）</a>`).join('<br>');
+        hist.push({role:'assistant',content:raw});
+        done(`${body}${esrc?`<div class="src">来源（点击查看详情）：<br>${esrc}</div>`:''}${degraded?`<div class="src">⚠ ${esc(degraded)}</div>`:''}`);
+      }
       else if(ev==='done'){
         const src=(sources||[]).map(s=>`<a onclick="openPaper(${s.paper_id})">[${s.idx}] ${esc(s.title)}（${esc(s.venue||'')} ${s.year||''}）</a>`).join('<br>');
         hist.push({role:'assistant',content:j.answer||raw});
-        done(`${esc(j.answer||raw).replace(/\[(\d{1,2})\]/g,'<sup class="cite">$1</sup>')}${src?`<div class="src">来源（点击查看详情）：<br>${src}</div>`:''}${(j.degraded||degraded)?`<div class="src">⚠ ${esc(j.degraded||degraded)}</div>`:''}`);
+        done(`${esc(j.answer||raw).replace(/\[(\d{1,3})\]/g,'<sup class="cite">$1</sup>')}${src?`<div class="src">来源（点击查看详情）：<br>${src}</div>`:''}${(j.degraded||degraded)?`<div class="src">⚠ ${esc(j.degraded||degraded)}</div>`:''}`);
       }
     };
     while(true){
@@ -726,7 +745,7 @@ async function doSurvey(){
     const j=await submitJob('survey',{topic:t,top_k:10},
       job=>{ el.innerHTML=`<span class="spin"></span>【${esc(job.stage||'')}】${esc(job.message||'生成中…')}`; });
     const r=j.result;
-    const html=esc(r.survey).replace(/\[(\d{1,2})\]/g,'<sup class="cite">$1</sup>');
+    const html=esc(r.survey).replace(/\[(\d{1,3})\]/g,'<sup class="cite">$1</sup>');
     const src=(r.sources||[]).map(s=>`<a onclick="openPaper(${s.paper_id})">[${s.idx}] ${esc(s.title)}</a>`).join('<br>');
     const bad=(r.checks||[]).filter(c=>c.ok===false).map(c=>`<li>${esc(c.claim)}…（相关度 ${c.score}）</li>`).join('');
     done(`${html}<div class="src">✓ ${esc(r.verified_summary||'')}${bad?`<br><b>未通过核验的论断：</b><ul style="margin:4px 0 0 18px">${bad}</ul>`:''}<br><br>来源：<br>${src}</div>`);
@@ -767,7 +786,7 @@ function renderAgentRun(r){
     ${timelineHTML(r.plan,r.events)}</div>`;
   let body='';
   if(r.answer){
-    const html=esc(r.answer).replace(/\[(\d{1,2})\]/g,'<sup class="cite">$1</sup>');
+    const html=esc(r.answer).replace(/\[(\d{1,3})\]/g,'<sup class="cite">$1</sup>');
     const src=(r.sources||[]).map(s=>`<a onclick="openPaper(${s.paper_id})">[${s.idx??'?'}] ${esc(s.title||'')}</a>`).join('<br>');
     body=`<div class="msg bot" style="max-width:none">${html}
       ${src?`<div class="src">来源：<br>${src}</div>`:''}
@@ -803,7 +822,7 @@ async function agentRun(){
 async function loadAgentRuns(){
   try{
     const r=await (await fetch('/api/agent/runs?limit=10')).json();
-    $('agentRuns').innerHTML=(r.runs||[]).map(x=>`<div class="item" onclick="replayRun('${esc(x.run_id)}')">
+    $('agentRuns').innerHTML=(r.runs||[]).map(x=>`<div class="item" onclick="replayRun(${jsArg(x.run_id)})">
       <b>${esc(x.goal)}</b><span class="m">
       <span class="chip ${x.status==='completed'?'ok':(x.status==='failed'?'bad':'warn')}">${esc(x.status)}</span>
       <span>${esc(x.created_at)}</span><span>${x.total_ms||0}ms</span></span></div>`).join('')
@@ -909,8 +928,12 @@ async function doMatrix(useLlm){
       const cells=cols.map(c=>{
         const cell=(r.cells||{})[c.key]||{};
         if(!cell.value) return `<td class="mkt">—</td>`;
-        const mark = cell.page ? `<span class="chip ok">p.${cell.page}</span>`
-                   : (cell.verified ? '' : `<span class="chip warn">未核验</span>`);
+        // verified 是三态：null = 逐字摘录（出处由构造保证，是否答了这一列没验过）。
+        // 页码与核验标记要**并列**显示——原来的三元链让任何带页码的格子永远不显示核验标记。
+        const pg = cell.page ? `<span class="chip ok">p.${cell.page}</span>` : '';
+        const vf = cell.verified===null ? `<span class="chip">逐字摘录</span>`
+                 : cell.verified ? '' : `<span class="chip warn">未核验</span>`;
+        const mark = pg + vf;
         const full=esc(cell.value);
         const short=cell.value.length>140?esc(cell.value.slice(0,140))+'…':full;
         return `<td title="${full}">${short} ${mark}</td>`;
@@ -921,7 +944,8 @@ async function doMatrix(useLlm){
     const vr = m.verified_rate==null ? '—' : Math.round(m.verified_rate*100)+'%';
     $('modalBody').innerHTML=`<h3>文献对比矩阵（${(m.rows||[]).length} 篇）</h3>
       <p class="mkt">格子鼠标悬停看完整内容。<b>空格 = 原文未覆盖，不是遗漏</b>——PaperNest 不编造缺失内容；
-        <span class="chip ok">p.N</span> 是依据句所在页，<span class="chip warn">未核验</span> 表示没通过原文机械回取校验。</p>
+        <span class="chip ok">p.N</span> 是依据句所在页，<span class="chip warn">未核验</span> 表示没通过原文机械回取校验，
+        <span class="chip">逐字摘录</span> 表示该格是按关键词从原文逐字切出的句子——出处由构造保证，但「它是否回答了这一列」未经校验。</p>
       <div class="frow" style="margin:8px 0">
         <span class="chip">覆盖率 ${Math.round((m.coverage||0)*100)}%</span>
         <span class="chip">机械核验率 ${vr}</span>
@@ -956,13 +980,13 @@ async function loadSymbols(){
   const p=new URLSearchParams({q:$('symQ').value.trim(),kind:$('symKind').value});
   const r=await (await fetch('/api/symbols?'+p)).json();
   $('symList').innerHTML = r.items.map(it=>{
-    const ms=(it.meanings||[]).map(m=>`<div class="mkt">· ${esc(m.meaning)} —— <a onclick="openPaperByName('${esc(m.paper)}')">${esc(m.paper)}</a> ${m.year||''} p${m.page}</div>`).join('');
+    const ms=(it.meanings||[]).map(m=>`<div class="mkt">· ${esc(m.meaning)} —— <a onclick="openPaperByName(${jsArg(m.paper)})">${esc(m.paper)}</a> ${m.year||''} p${m.page}</div>`).join('');
     const badge = it.kind==='builtin' ? `<span class="badge acc">内置 · ${esc(it.cat||'')}</span>`
                 : `<span class="badge">${it.kind==='abbrev'?'缩写':'论文符号'}</span>`;
     const name = it.name ? `<span class="mkt">${esc(it.name)}</span>` : '';
     return `<div class="cand">
       <b style="font-size:15px">${esc(it.sym)}</b> ${badge} ${name}
-      ${it.latex?`<button class="ghost" style="padding:2px 10px;font-size:12px;margin-left:8px" onclick="navigator.clipboard.writeText('${esc(it.latex).replace(/'/g, '&#39;')}').then(()=>this.textContent='已复制 LaTeX')">复制 LaTeX</button>`:''}
+      ${it.latex?`<button class="ghost" style="padding:2px 10px;font-size:12px;margin-left:8px" onclick="navigator.clipboard.writeText(${jsArg(it.latex)}).then(()=>this.textContent='已复制 LaTeX')">复制 LaTeX</button>`:''}
       <div class="mkt">${it.latex?`<code>${esc(it.latex)}</code>`:''}</div>
       ${ms}
     </div>`;}).join('')
@@ -995,7 +1019,7 @@ async function openPaper(id){
               ['局限',c.limitations],['与我课题',c.relation_to_topic]].filter(([,v])=>v)
     .map(([k,v])=>`<div class="krow"><span class="k">${k}：</span>${esc(v)}</div>`).join('');
   $('modalBody').innerHTML=`<h3>${esc(p.title)}</h3>
-    <div class="meta">${(p.authors||[]).join(', ')} ｜ ${esc(p.venue||'')} ${p.year||''} ｜ 被引 ${p.citation_count??'-'} ｜
+    <div class="meta">${esc((p.authors||[]).join(', '))} ｜ ${esc(p.venue||'')} ${p.year||''} ｜ 被引 ${p.citation_count??'-'} ｜
       ${p.level>=2?'<span class="badge ok">L2 精读</span>':`<span class="badge acc">L${p.level}</span>`}
       ${p.card_model==='mock-extractive'?'<span class="badge">mock 卡</span>':''}
       ${p.oa_pdf_url?`｜ <a href="${esc(p.oa_pdf_url)}" target="_blank">PDF ↗</a>`:'｜ 无 OA PDF'}</div>
@@ -1259,7 +1283,7 @@ function renderWr(){
 function wrTopicPanel(run){
   const cands=(run.topics||[]).map((t,i)=>`
     <div class="cand"><label><input type="radio" name="wrTop" value="${i}" ${i===0?'checked':''}
-      onchange="$('wrTitle').value='${esc(t.title||'').replace(/'/g,'&#39;')}'"> <b>${esc(t.title||'')}</b></label>
+      onchange="$('wrTitle').value=${jsArg(t.title||'')}"> <b>${esc(t.title||'')}</b></label>
       <div class="mkt">缺口：${esc(t.gap||'')}</div>
       <div class="mkt">切入：${esc(t.angle||'')}${t.risks?`　风险：${esc(t.risks)}`:''}</div>
       ${(t.evidence||[]).map(ev=>`<div class="ev">${ev.verified?'<span class="vok">✓ 已核</span>':'<span class="vno">× 待核</span>'}
@@ -1332,7 +1356,7 @@ async function wrOutlineGo(edited){
 /* 章节草稿（[n] 角标 → 悬浮证据句，点击开文献详情） */
 function wrCitedText(s){
   const cites=s.citations||{};
-  return esc(s.content||'').replace(/\[(\d{1,2})\]/g,(m,n)=>{
+  return esc(s.content||'').replace(/\[(\d{1,3})\]/g,(m,n)=>{
     const c=cites[n];
     if(!c) return `<sup class="cite" style="background:#f7e5e2;color:var(--bad)" title="白名单外/悬空编号">${n}</sup>`;
     const tip=esc((c.title||'')+' ▸ '+(c.evidence_sentence||'无证据句').slice(0,200));
@@ -1415,7 +1439,7 @@ async function wrList(){
   try{
     const r=await (await fetch('/api/write/runs?limit=12')).json();
     $('wrRuns').innerHTML=(r.runs||[]).map(x=>`
-      <div class="item" onclick="wrLoad('${esc(x.id)}')" style="${wrRun&&wrRun.run.id===x.id?'border-color:var(--accent)':''}">
+      <div class="item" onclick="wrLoad(${jsArg(x.id)})" style="${wrRun&&wrRun.run.id===x.id?'border-color:var(--accent)':''}">
         <b>${esc(x.title||x.topic.slice(0,40))}</b><span class="m">
         ${wrChip(x.status)}<span>${esc(x.stage||'')}</span><span>${esc(x.updated_at||'')}</span></span></div>`).join('')
       ||'<p class="desc">还没有写作任务。</p>';
@@ -1449,7 +1473,7 @@ async function spLoadProjects(){
         ${p.topic?`<span class="mkt"> · ${esc(p.topic)}</span>`:''}
         <div class="bar" style="margin-top:6px">
           <button class="ghost" onclick="spOpen(${p.id})">打开</button>
-          <button class="ghost" onclick="spDeleteProject(${p.id},'${esc(p.name).replace(/'/g,'&#39;')}')">删除</button>
+          <button class="ghost" onclick="spDeleteProject(${p.id},${jsArg(p.name)})">删除</button>
         </div>
       </div>`).join('') : '<p class="desc">还没有课题。上面建一个开始。</p>';
   }catch(e){ note('spNote','✗ '+e.message); }
@@ -1734,7 +1758,7 @@ async function gfLoad(){
         ${g.year?`<span class="mkt"> ${g.year}</span>`:''}
         <div class="mkt">引它的：${(g.cited_by_titles||[]).slice(0,3).map(t=>esc(t.slice(0,44))).join('；')||'—'}</div>
         <div class="bar" style="margin-top:6px">
-          <button class="ghost" onclick="gfAdopt('${esc(g.norm_key).replace(/'/g,'&#39;')}',this)">加进文献库</button>
+          <button class="ghost" onclick="gfAdopt(${jsArg(g.norm_key)},this)">加进文献库</button>
           ${g.doi?`<a class="ghost" style="padding:4px 12px" href="https://doi.org/${esc(g.doi)}" target="_blank">原文 ↗</a>`:''}
         </div>
       </div>`).join('') : '<p class="desc">还没有缺口数据——先拉引文边。</p>';
@@ -1784,7 +1808,7 @@ async function gfRelated(){
         <div class="mkt">${esc(r.reason||'')}</div>
         ${r.in_library
           ? `<div class="bar" style="margin-top:6px"><button class="ghost" onclick="openPaper(${r.paper_id})">查看</button></div>`
-          : `<div class="bar" style="margin-top:6px"><button class="ghost" onclick="gfAdopt('${esc(r.norm_key).replace(/'/g,'&#39;')}',this)">加进文献库</button></div>`}
+          : `<div class="bar" style="margin-top:6px"><button class="ghost" onclick="gfAdopt(${jsArg(r.norm_key)},this)">加进文献库</button></div>`}
       </div>`).join('') : '<p class="desc">没找到相关论文——这些种子论文可能还没拉过引文边。</p>';
   }catch(e){ note('gfNote','✗ '+e.message); }
 }
@@ -1841,7 +1865,7 @@ async function fdOpen(id){
 }
 
 function fdItem(digestId,it){
-  const key=esc(it.norm_key).replace(/'/g,'&#39;');
+  const key=jsArg(it.norm_key);
   const reasons=(it.reasons||[]).slice(0,4).map(r=>
     `<span class="chip" title="词权重 ${r.weight} · 批内区分度 idf ${r.idf}">${esc(r.term)}`
     +` · ${r.where==='title'?'标题':'摘要'} · idf ${r.idf}</span>`).join(' ');
@@ -1853,8 +1877,8 @@ function fdItem(digestId,it){
     <div style="margin-top:4px">${reasons||'<span class="mkt">（无命中词项）</span>'}</div>
     ${it.llm_note?`<div class="mkt">模型判断：${esc(it.llm_note)}</div>`:''}
     <div class="bar" style="margin-top:6px">
-      <button class="ghost" onclick="fdAdopt(${digestId},'${key}',this)">加进文献库</button>
-      <button class="ghost" onclick="fdDismiss(${digestId},'${key}',this)">不感兴趣</button>
+      <button class="ghost" onclick="fdAdopt(${digestId},${key},this)">加进文献库</button>
+      <button class="ghost" onclick="fdDismiss(${digestId},${key},this)">不感兴趣</button>
       <a class="ghost" style="padding:4px 12px" href="https://arxiv.org/abs/${esc(it.arxiv_id||'')}" target="_blank">原文 ↗</a>
     </div>
   </div>`;

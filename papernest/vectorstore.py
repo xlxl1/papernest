@@ -1,17 +1,14 @@
 """向量存储后端抽象层：numpy 常驻归一化矩阵与 Milvus / Chroma 并存、可 A/B。
 
-⚠️ **当前状态：这一层没有接进检索热路径。**
-问答走的是 `rag.prepare → embeddings.search_hybrid → search_papers → embeddings._paper_matrix`，
-直接从 SQLite `vectors` 表读 BLOB 建 numpy 矩阵，全程不 import 本模块。
-`get_store()` 在全仓只有 `cli.py` 的 `vec status` / `vec rebuild` 两个调用点，
-真库 `vector_meta` 表 0 行可佐证。写向量的三条路径（`embeddings.index_paper`、
-`chunkembed`、`db.replace_chunks`）也都是自己拼 SQL 直写，不经过 `_write_items()`。
+本模块是三后端（numpy / Chroma / Milvus）的统一抽象层，`get_store()` 按
+`PAPERNEST_VECTOR_BACKEND` 选择实现，默认 `milvus`（部署形态决定，见下文）。
+SQLite `vectors` 表始终是唯一真相来源，各后端的索引都只是派生物，随时可以
+`rebuild()` 从 SQLite 全量重放；删除语义统一为 per-(paper_id, kind, idx)，
+与主写路径一致（见 `embeddings.index_paper` 与 `tests/test_index_paper.py`）。
 
-后果之一已经发生过：抽象层的删除语义是 per-(paper_id, kind, idx) 的，
-而主写路径曾是 per-(paper_id, model) 的——粒度一宽就把同篇的 chunk 向量连带删了
-（已于 2026-09-03 修复，见 `embeddings.index_paper` 与 `tests/test_index_paper.py`）。
-**所以：不要说「线上检索由 Milvus 承载」；`PAPERNEST_VECTOR_BACKEND` 目前只影响
-`cli.py vec` 子命令的行为。** 接线是待办项。
+检索热路径（`embeddings.search_papers`）就走这一层：查询向量交给 `get_store()`
+选出来的后端算分，正文仍从 SQLite 回取。后端连不上、或索引落后于真相时，
+调用点退回 numpy 并把原因当作降级记录上报，不静默。
 
 ## 为什么 SQLite `vectors` 表是唯一真相来源，Chroma 只是派生索引
 
@@ -37,7 +34,8 @@
 | 20,000 | 2.91 ms      | 3.21 ms        |
 
 Chroma 查询时间几乎不随规模增长（HNSW 次线性），**拐点约 2 万条**。库内当前约
-1,200 条向量 → numpy 更快，所以 **numpy 是默认后端**，Chroma 是可选后端。
+1,200 条向量 → numpy 更快。但 **Milvus 是默认后端（部署形态决定：延迟不随规模变、
+可与其他应用共享实例）**，numpy 是单容器形态可一行切回的后端，Chroma 可选。
 HNSW 近似召回用库里 451 条真实向量测得 recall@1=0.990、@5/@10=1.000，
 在这个规模上与精确检索基本无差。
 

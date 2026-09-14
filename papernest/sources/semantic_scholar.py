@@ -31,17 +31,27 @@ def search(query: str, limit: int = 20) -> list[dict]:
     # 无 key 共享池按突发拥塞 429；退避跨过 5 分钟窗口边界（±20% 抖动防惊群）
     delays = (20, 45, 90, 150)
     last = None
+
+    def _backoff(attempt: int):
+        """第 attempt 次失败后的退避。**最后一次尝试之后不睡**——后面已经没有下一次
+        请求了，睡满那 150 秒只是把调用方白白多锁 150 秒（单次查询最坏从 155s 变 305s）。
+        口径与 graph.py 的 `_backoff` 一致；这个文件原来的注释声称「与 graph.py 同一套
+        序列」，但恰恰漏了 graph.py 明确写出来要避免的这一条。
+        """
+        if attempt < len(delays) - 1:
+            _sleep(delays[attempt] * _jitter())
+
     with http.client() as client:
         for attempt in range(4):
             try:
                 r = client.get(SEARCH_URL, params=params, headers=headers)
             except httpx.HTTPError as e:
                 last = e
-                _sleep(delays[attempt] * _jitter())
+                _backoff(attempt)
                 continue
             if r.status_code in _backoff_statuses():
                 last = f"HTTP {r.status_code}"
-                _sleep(delays[attempt] * _jitter())
+                _backoff(attempt)
                 continue
             if r.status_code == 400:
                 raise SourceError(f"Semantic Scholar 请求被拒（400）：{r.text[:200]}")

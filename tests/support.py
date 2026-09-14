@@ -30,7 +30,62 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from papernest import config
+from papernest import config, db
+
+# ── 生产库写保护 ────────────────────────────────────────────────────────────
+#
+# `db.init_db()` 是**写路径**：它跑 `executescript(SCHEMA)` + `_migrate()`。
+# `config.DB_PATH` 默认指向用户真实的 `data/papernest.db`（本机 80MB、503 篇），
+# 所以任何一条忘记重定向库的用例，跑一次测试就顺带给生产库做了一次迁移。
+#
+# 这已经发生过两次，形态完全不同：
+#   ① `test_eval.py` 直接调 init_db 校验 gold 键——把真库 user_version 5→6 迁了。
+#   ② 2026-09-09：`test_fix_regressions` 带对口令请求 `/api/stats`，而那个端点
+#      第一行就是 `db.init_db()`，于是新加的 `table_summaries` 被建到了真库里。
+#
+# ② 光读代码发现不了：用例里没有 `init_db` 三个字，写入发生在 TestClient 的
+# 线程池 worker 里，栈上连一帧 `tests/` 都没有——查它花了三轮全量扫描。
+# 指望「写 TestClient 用例时记得重定向库」靠不住，所以在这里一次性堵死。
+#
+# **装在 support.py 而不是 tests/__init__.py**：README 的跑法是
+# `discover -s tests -t tests`，那种模式下 `tests/` 不当包用，`__init__.py`
+# 根本不会被导入（实测过）。而 support.py 被二十来个测试文件在**模块导入期**
+# 引入，discover 又是先导入全部模块再跑用例，所以装在这里对整轮都生效。
+#
+# 只拦写，不拦读：有几条用例**有意**读真库（`test_eval.py` 的 gold 键校验、
+# `test_agent.py` 的全量路由校验、`test_eval_set_composition.py` 的成分统计），
+# 它们都是 `sqlite3.connect(..., mode=ro)` 直接开的，不走 init_db，不受影响。
+# 读真库是这个仓库的一条纪律（合成夹具掩盖过真实数据缺陷），要禁的只有写。
+
+#: 生产库的绝对路径，在任何用例改动 `config.DB_PATH` 之前记下来。
+PRODUCTION_DB = config.DB_PATH.resolve()
+
+
+def _install_production_db_guard():
+    """幂等安装。多个测试模块都 import 本文件，不能装两层。"""
+    if getattr(db.init_db, "_papernest_prod_guard", False):
+        return
+    real = db.init_db
+
+    def guarded(force: bool = False):
+        if config.DB_PATH.resolve() == PRODUCTION_DB:
+            raise RuntimeError("\n".join([
+                f"测试试图在**生产库**上执行 init_db（{PRODUCTION_DB}）。",
+                "init_db 是写路径（executescript(SCHEMA) + _migrate()），"
+                "跑一次测试就等于给用户的库做了一次迁移。",
+                "改法：让用例继承 tests.support.TempDbTestCase，或在建 TestClient / "
+                "调任何库函数之前把 config.DATA_DIR / config.DB_PATH 指到临时目录"
+                "（make_tempdir 就是干这个的）。",
+                "注意：用 TestClient 打任何一个端点都可能间接触发它"
+                "（`/api/stats` 第一行就是 db.init_db()），而那发生在线程池里，"
+                "栈上看不到你的用例。"]))
+        return real(force)
+
+    guarded._papernest_prod_guard = True
+    db.init_db = guarded
+
+
+_install_production_db_guard()
 
 
 def make_tempdir(case: unittest.TestCase, prefix: str = "papernest_test") -> Path:

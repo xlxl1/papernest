@@ -21,10 +21,45 @@ _CITE_WORDS = ("引用", "参考文献", "citation", "cite", "支持这段", "�
 _SURVEY_WORDS = ("综述", "survey", "研究现状", "研究进展", "文献总结")
 _READ_WORDS = ("精读", "全文", "阅读论文", "read paper", "详细分析")
 
+# 上面三组是**领域词**：既可能是用户的意图，也可能只是被用户引述的库内容。
+# 这个库的主题正是 LLM Agent，503 篇里有 5 篇标题含 Survey/综述，而「贴一段标题
+# 来提问」是最常见的用法——于是「被引述内容里的领域词」被读成了「用户的意图」。
+# 真库实测：「《…A Survey…》被引用了多少次」被路由去做引用推荐（答案 209 就在
+# papers.citation_count 里）；「精读论文 1：…A Survey…」被路由去写全库综述。
+#
+# 加词边界**修不掉这一层**——"A Survey" 本来就是独立单词。所以领域词只用来判断
+# 「在谈论这件事」，还必须有一个**祈使动词**表明「请你做这件事」才触发昂贵分支。
+# 动词按分支分开：推荐是引用的动词、不是综述的动词，否则「推荐几篇 agent 综述」
+# 会被 survey 分支吃掉。
+#
+# 这两张表会漂移（用户说「攒一篇综述」就落回默认路径）。这是**刻意的不对称**：
+# generate_survey 是全库 LLM 长文生成，误触发一次的代价远大于漏触发一次，
+# 而默认路径至少还会给一个带来源的回答。扩表时按这个口径加词。
+_CITE_VERBS = ("推荐", "补充", "补上", "找", "给出", "标注",
+               "recommend", "recommends", "suggest", "suggests", "find", "add")
+_SURVEY_VERBS = ("写", "生成", "起草", "做一篇", "整理成", "综述一下", "总结一下",
+                 "generate", "write", "draft", "compose", "produce")
 
-def _has_any(text: str, words: tuple[str, ...]) -> bool:
+
+def _has_any(text: str, words: tuple[str, ...], whole: bool = False) -> bool:
+    """子串匹配；ASCII 词加词边界，中日韩没有词边界故仍按子串。
+
+    领域词只卡**左**边界（`whole=False`）：放过 citation / cited / surveys 这些屈折形，
+    卡掉 `eli-cite-d` / `ex-cite-d` 这类「cite 只是词中间一段」的假命中
+    （真库 pages 里就有 elicited，chunks 里有 citeseer）。
+    动词卡**两侧**边界（`whole=True`）：不然 recommend ⊂ recommendation、
+    add ⊂ Addressing、find ⊂ findings，库里的论文标题会自己变成祈使句。
+    """
     lowered = text.lower()
-    return any(word.lower() in lowered for word in words)
+    for word in words:
+        w = word.lower()
+        if w.isascii():
+            pat = r"(?<![a-z0-9])" + re.escape(w) + (r"(?![a-z0-9])" if whole else "")
+            if re.search(pat, lowered):
+                return True
+        elif w in lowered:
+            return True
+    return False
 
 
 def _paper_id_from_goal(goal: str) -> int | None:
@@ -39,14 +74,14 @@ def build_plan(goal: str, top_k: int = 5) -> list[PlanStep]:
     An LLM planner can be added later, but this baseline is reproducible and
     keeps arbitrary model output away from the tool execution boundary.
     """
-    if _has_any(goal, _CITE_WORDS):
+    if _has_any(goal, _CITE_WORDS) and _has_any(goal, _CITE_VERBS, whole=True):
         return [PlanStep(
             id=1,
             tool="recommend_citations",
             reason="检测到引用/参考文献需求，先匹配可支持该段落的文献。",
             args={"paragraph": goal, "top_k": top_k},
         )]
-    if _has_any(goal, _SURVEY_WORDS):
+    if _has_any(goal, _SURVEY_WORDS) and _has_any(goal, _SURVEY_VERBS, whole=True):
         return [PlanStep(
             id=1,
             tool="generate_survey",
@@ -126,6 +161,7 @@ def run_agent(goal: str, top_k: int = 5, max_steps: int = 5,
     """
     run_id = uuid.uuid4().hex
     t_start = time.perf_counter()
+    unconfigured = False
     plan = build_plan(goal, top_k)
     if dry_run:
         return AgentResponse(run_id=run_id, status="planned", goal=goal, plan=plan)
@@ -209,6 +245,7 @@ def run_agent(goal: str, top_k: int = 5, max_steps: int = 5,
                     break  # 超时不重试：耗时工具重试只会更久
                 except llm.LLMUnavailable as exc:  # 配置缺失不是瞬态故障，不重试
                     tool_error = str(exc)
+                    unconfigured = True             # 靠异常类型记，不靠中文文案猜
                     break
                 except Exception as exc:
                     tool_error = f"{type(exc).__name__}: {str(exc)[:300]}"
@@ -247,11 +284,21 @@ def run_agent(goal: str, top_k: int = 5, max_steps: int = 5,
                 error = tool_error
                 return _finish("failed", error)
             emit(ToolEvent(step_id=step.id, tool=step.tool, status="failed",
-                           latency_ms=round((time.perf_counter() - t_start) * 1000),
+                           # 本步耗时，不是整个 run 的累计。原来这里用的是 t_start
+                           # （run 的起点，agent.py:163），而成功事件用的是 started，
+                           # 两个事件的 latency 不同口径，轨迹一拉出来就对不上。
+                           latency_ms=round((time.perf_counter() - started) * 1000),
+                           attempt=attempt,
                            summary="工具执行失败（已重试）" if len(events) > 1 else "工具执行失败",
                            error=tool_error))
             error = tool_error
-            status = "blocked" if "未配置" in (tool_error or "") else "failed"
+            # ── 25：状态判定不许再靠中文子串猜 ──
+            # 上面第 245 行已经用 `except llm.LLMUnavailable` **精确**捕到了「缺配置」
+            # 这个语义，却没记下来；到这里又用 `"未配置" in tool_error` 重新猜一遍。
+            # 两个后果：改一句异常文案、或换一个抛英文消息的 provider 适配层，
+            # blocked 就静默变成 failed，前端的「去配置 key」引导消失；
+            # 反向更危险——中转站返回的中文错误体里带「未配置」会把真故障误记成缺配置。
+            status = "blocked" if unconfigured else "failed"
             return _finish(status, error)
     finally:
         # ThreadPoolExecutor 的 `with` 出口默认 wait=True——超时步骤会把「硬截止」

@@ -18,12 +18,13 @@
 """
 import json
 import os
+import warnings
 import threading
 from typing import NamedTuple
 
 import numpy as np
 
-from . import config, db, deadline, degrade, http, llm
+from . import budget, config, db, deadline, degrade, http, llm, vectorstore
 
 
 class EmbedUnavailable(Exception):
@@ -35,20 +36,20 @@ def available() -> bool:
 
 
 #: 单请求条数。批越大越省往返，但也越容易读超时（实测长文本 16 条一批会 ReadTimeout）。
-BATCH_SIZE = int(os.environ.get("PAPERNEST_EMBED_BATCH", "8"))
+BATCH_SIZE = config._env_int(8, "PAPERNEST_EMBED_BATCH")
 #: 瞬态失败的退避（秒）。**必须有**：原来一次读超时就让整条 `cli.py embed` 挂掉，
 #: 而这条命令要跑几百次调用——没有重试等于「跑到哪算哪，全靠运气」。
 _EMBED_DELAYS = (3, 8, 20)
 #: 单请求读超时。成功的调用实测 0.6~1.0s，20s 已经非常宽松——
 #: 而超时在这里是**探测信号**（端点对超限输入是挂起而不是报错），
 #: 所以它必须便宜：60s 一次的话，几百条超限文本就是几小时。
-_EMBED_TIMEOUT = int(os.environ.get("PAPERNEST_EMBED_TIMEOUT", "20"))
+_EMBED_TIMEOUT = config._env_int(20, "PAPERNEST_EMBED_TIMEOUT")
 
 
 #: 单条输入的初始字符上限，以及自适应缩短时的下限。
 #: **不能只靠一个固定上限**：token 与字符的比例随语言差好几倍（英文约 4 字符/token、
 #: 中文常常 1 字符/token），同一个字符数在两种文本下的 token 数完全不同。
-INPUT_CHARS = int(os.environ.get("PAPERNEST_EMBED_CHARS", "6000"))
+INPUT_CHARS = config._env_int(6000, "PAPERNEST_EMBED_CHARS", minimum=100)
 MIN_INPUT_CHARS = 400
 
 #: 超时被当成「可能是输入过长」的信号：某些端点（实测 qwen3.7-text-embedding-flash）
@@ -127,6 +128,9 @@ LAST_TRUNCATION: list[int] = []
 def embed_texts(texts: list[str], purpose: str = "embed") -> list[list[float]]:
     if not available():
         raise EmbedUnavailable("未配置 LLM_API_KEY / EMBED_MODEL")
+    # 每日用量闸门。这条路径正是 2026-09-03 把免费额度跑光的那一条
+    # （`cli.py embed` 一次几千条调用），所以它比 chat 更需要这道闸。
+    budget.check("嵌入调用")
     import time
     out: list[list[float]] = []
     url = config.EMBED_API_BASE.rstrip("/") + "/embeddings"
@@ -258,33 +262,79 @@ def _paper_matrix():
     return ids, idxs, M
 
 
-def search_papers(query: str, top_k: int = 8) -> list[dict]:
-    """论文级语义检索。返回 [{paper_id, score}]，按余弦相似度降序，全序。
+#: 语义检索只认这两类向量：标题摘要（kind='paper'）与章节块（kind='chunk'）。
+#: 句级向量（kind='sent'）是引用推荐那条路用的，混进论文级检索会让同一篇论文刷屏。
+_PAPER_KINDS = ("paper", "chunk")
+_KIND_WHERE = {"kind": {"$in": list(_PAPER_KINDS)}}
 
-    矩阵里一篇论文有多行（标题摘要向量 + 各章节块向量），这里**按 paper_id 取最高分
-    那一行**再排序——不去重的话 top-k 会被章节多的那一两篇论文占满，
-    「检索到 5 篇」实际只有 1 篇。
+#: 向量后端的降级原因。检索是同步函数、任务跑在线程池里，所以按线程存，
+#: 免得两个并发查询互相盖掉对方的降级记录。
+_STORE_NOTE = threading.local()
+
+
+def take_store_note() -> str | None:
+    """取出并清空本线程上一次向量检索的降级原因。
+
+    做成「取走即清空」是为了让调用点不会把上一轮的降级当成本轮的：降级记录一旦
+    读漏或读串，界面上就会出现「这次好好的却报着降级」或反过来的假象。
+    """
+    note = getattr(_STORE_NOTE, "value", None)
+    _STORE_NOTE.value = None
+    return note
+
+
+def _candidate_rows(top_k: int) -> int:
+    """向后端要多少行候选。
+
+    后端返回的是**向量行**，而这里要的是**论文**：一篇论文有 1 条标题摘要向量加
+    N 条章节块向量，只按 top_k 取行的话，章节多的一两篇论文就能把名额占满，
+    「检索到 5 篇」实际只有 1 篇。所以按行超取，去重之后再截到 top_k。
+    真库一篇论文平均两三条向量，20 倍是留足余量的经验值；下限 64 是为了
+    top_k 很小时也不至于取得太紧。
+    """
+    return max(int(top_k) * 20, 64)
+
+
+def search_papers(query: str, top_k: int = 8) -> list[dict]:
+    """论文级语义检索。返回 [{paper_id, score, chunk_no}]，按余弦相似度降序，全序。
+
+    检索走 `vectorstore.get_store()` 选出来的后端（默认 Milvus，单容器形态设
+    `PAPERNEST_VECTOR_BACKEND=numpy` 就地算），本函数不再自己读 BLOB 建矩阵——
+    同一份 SQLite 真相，由谁来算是部署形态的选择，不该写死在检索链路里。
+
+    一篇论文在后端里有多行（标题摘要向量 + 各章节块向量），这里**按 paper_id 取
+    最高分那一行**再排序。降级原因不随返回值走，用 `take_store_note()` 取，
+    这样上层（`search_hybrid`）能把它记成一条降级，而这个函数的签名不用变。
     """
     qv = np.asarray(embed_texts([query])[0], dtype=np.float32)
-    ids, idxs, M = _paper_matrix()
-    if ids is None:
-        return []
-    if M.shape[1] != qv.size:
+    store, note = vectorstore.get_store_or_degrade()
+    want = _candidate_rows(top_k)
+    try:
+        rows = store.search(qv, want, where=_KIND_WHERE)
+        if not rows and store.name != "numpy" and store.count() > 0:
+            # 真相里有向量、派生索引却一行都不返回，说明索引落后（collection 还没建、
+            # rebuild 没跑完）。这时退回真相来源现算，而不是把空结果交上去——
+            # 空结果和「确实没有相关论文」在上层长得一模一样，那才是真正危险的静默失败。
+            rows = vectorstore.NumpyStore().search(qv, want, where=_KIND_WHERE)
+            if rows:
+                note = (f"{store.name} 的索引落后于 SQLite 真相，本次退回本地计算；"
+                        f"跑 `python cli.py vec rebuild` 重建索引")
+    except vectorstore.DimensionMismatch as e:
         # 换了嵌入模型但库里还是旧维度：如实报错，不做静默截断（截断出来的
         # 余弦是没有意义的数，比报错更危险）。`cli.py embed` 负责迁移或重建。
         raise EmbedUnavailable(
-            f"向量维度不一致：库内 {M.shape[1]} 维、当前模型 {qv.size} 维，"
-            f"请先跑 `python cli.py embed` 迁移或重建索引")
-    scores = M @ (qv / (np.linalg.norm(qv) + 1e-9))
+            f"{e}；请先跑 `python cli.py embed` 迁移或重建索引") from e
+    _STORE_NOTE.value = note
     best: dict[int, float] = {}
     best_chunk: dict[int, int] = {}
-    for pid, cno, sc in zip(ids.tolist(), idxs.tolist(), scores.tolist()):
+    for r in rows:
+        pid, sc = int(r["paper_id"]), float(r["score"])
         if sc > best.get(pid, -2.0):
             best[pid] = sc
-            # 记下是**哪一段**赢的：-1 表示赢在标题摘要向量上，没有对应的正文块。
-            # 这条信息是「语义命中能不能进上下文」的全部依据——中文问句 × 英文正文
-            # 时词面命中恒为 0，只有向量这一路知道该把哪段喂给模型。
-            best_chunk[pid] = cno
+            # 记下是**哪一段**赢的：kind 是 'paper' 说明赢在标题摘要向量上，没有
+            # 对应的正文块。这条信息是「语义命中能不能进上下文」的全部依据——
+            # 中文问句配英文正文时词面命中恒为 0，只有向量这一路知道该喂哪段给模型。
+            best_chunk[pid] = int(r["idx"]) if r.get("kind") == "chunk" else -1
     # 全序：分数并列时按 paper_id 决胜，否则跨进程结果会漂移
     order = sorted(best, key=lambda p: (-best[p], p))[:top_k]
     return [{"paper_id": p, "score": float(best[p]),
@@ -334,12 +384,24 @@ CHUNK_SEARCH = (os.environ.get("PAPERNEST_CHUNK_SEARCH")
 # 取 0.2：QASPER 每个 k 都涨（@1 +0.057、@10 +0.033），自建集 @5 涨 0.031、@10 持平，
 # 代价只有 @15 的 0.0156。只看 QASPER 会选 1.0——那要拿自建集 @10/@15 各三个多点去换。
 # （更早按页切时最优点是 0.5；换成按章节切后最优点左移，说明块变小后单条命中更该被"小步加分"。）
-CHUNK_WEIGHT = float(os.environ.get("PAPERNEST_CHUNK_WEIGHT")
-                     or os.environ.get("PAPERNEST_PAGE_WEIGHT", "0.2"))
+#
+# ⚠️ **「0.2 是低权重」这个直觉在默认档位上不成立，别照它推理。**
+# RRF 的分数是 `weight / (rrf_k + rank + 1)`，而 rrf_k=60 远大于候选深度，
+# 所以整条主路的**全部动态范围**都被压得很扁：
+#   top_k=5（默认，候选深度 15）：权重 1.0 的主路从第 1 名到第 15 名总共只值
+#     1/61 − 1/75 = 0.00306，而 chunk 路第 1 名就贡献 0.2/61 = 0.00328（1.07 倍）
+#     —— 也就是说 chunk 路命中一次，足以抹平主路里任意名次差。
+#   top_k=8  → 主路跨度 0.00449，chunk 首位 0.00328（0.73 倍，主路更大）
+#   top_k=15 → 主路跨度 0.00687，chunk 首位 0.00328（0.48 倍）
+# 结论：这个「权重」控制的是**跨路相对影响**，而它的实际量级由 rrf_k 与候选深度
+# 共同决定、随 top_k 变化。上面那张表仍然有效（它是在默认档位上实测的），
+# 但不要再把 0.2 解释成「显著低于主路」。要改 rrf_k 得两个评测集一起重测。
+CHUNK_WEIGHT = config._env_float(0.2, "PAPERNEST_CHUNK_WEIGHT", "PAPERNEST_PAGE_WEIGHT")
 
-# 旧名保留，外部（含测试）仍可读写
-PAGE_SEARCH = CHUNK_SEARCH
-PAGE_WEIGHT = CHUNK_WEIGHT
+# 旧名 PAGE_SEARCH / PAGE_WEIGHT 已删除。它们是 `= CHUNK_*` 的**副本**，而
+# `search_hybrid` 读的是 CHUNK_*——写旧名是纯 no-op，却看着像生效了。
+# 曾经唯一守护默认权重 0.2 的那条测试正是靠写 PAGE_WEIGHT，等于什么都没断言。
+# 环境变量 `PAPERNEST_PAGE_WEIGHT` 作为用户侧的旧名仍然认（见上面的 _env_float）。
 
 
 class RetrievalResult(NamedTuple):
@@ -401,7 +463,13 @@ def search_hybrid(query: str, top_k: int = 8, rrf_k: int = 60,
     vec_chunk: dict[int, int] = {}          # paper_id -> 语义上赢的那个 chunk_no
     if available():
         try:
+            take_store_note()           # 清掉上一轮的，免得把旧降级算到这轮头上
             hits = search_papers(query, top_k * 3)
+            store_note = take_store_note()
+            if store_note:
+                notes.append(degrade.Degradation(
+                    degrade.VECTOR_BACKEND_DEGRADED,
+                    f"向量后端降级：{store_note}"))
             vec_ids = [h["paper_id"] for h in hits]
             vec_chunk = {h["paper_id"]: h["chunk_no"] for h in hits
                          if h.get("chunk_no") is not None}

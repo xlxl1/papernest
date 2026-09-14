@@ -16,19 +16,15 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from . import cite, db
+from . import cite, db, normalize
 
 # Windows/Obsidian 都不接受的文件名字符
 _BAD_FN = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
 # OpenAlex 把 DOI 存成完整 URL（https://doi.org/10.x）——引文图那边踩过同一个坑：
 # 不剥前缀，frontmatter 是一条 URL、底部链接拼成 https://doi.org/https://doi.org/…
-_DOI_URL_RE = re.compile(r"^https?://(dx\.)?doi\.org/", re.I)
-
-
-def _bare_doi(doi) -> str | None:
-    d = _DOI_URL_RE.sub("", str(doi or "").strip())
-    return d or None
+# 唯一真源在 normalize.bare_doi——这条正则曾在仓库里被抄了 4 份。
+_bare_doi = normalize.bare_doi
 
 
 def _citekey(row) -> str:

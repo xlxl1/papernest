@@ -127,10 +127,19 @@ def build_chunks(path: str, c, paper_id: int) -> list[dict]:
     表格必须单独成块并**整行切分、表头跨块重复**：论文里的结果表被页边界或
     字数上限拦腰砍断后，下半张没有表头，检索到也读不懂——那是 chunk 质量最隐蔽的
     杀手之一。表格块标 kind='table'，检索结果里可以据此换一种呈现。
+
+    表只识别**一次**，结果同时用于两件事：切表格块，以及把表格行从正文块里摘掉
+    （否则同一段文字在库里存两份——真库实测拿表头当查询时，每篇取 5 块有 45%
+    的上下文含实质重复）。表题不摘（`chunk_table` 不带表题，摘了就丢了）。
     """
     from . import structure, tables
     try:
-        cs = structure.section_chunks(path)
+        found = tables.detect_tables(path)
+    except Exception:
+        found = []          # 表格识别失败不影响正文块——正文才是主路径
+    try:
+        # 把表传进去：落在表格区的 block 不再重复进正文块（见 table_owned_blocks）
+        cs = structure.section_chunks(path, detected_tables=found)
     except Exception:
         cs = []
     out: list[dict] = []
@@ -139,23 +148,50 @@ def build_chunks(path: str, c, paper_id: int) -> list[dict]:
                 "section_path": ch.get("section_path") or ch.get("section_title") or "",
                 "level": ch.get("level") or 1,
                 "start_page": ch.get("start_page"), "end_page": ch.get("end_page"),
-                "kind": "text"}
+                "kind": ch.get("kind") or "text"}
                for ch in cs]
     else:
         out = db.chunks_from_pages(c, paper_id)
 
+    # 已有的表格摘要贴回去：它按表的内容哈希存在 `table_summaries` 里，
+    # 不随 chunks 一起被 replace_chunks 换掉，所以重切块之后不用重新花钱买。
     try:
-        for t in tables.detect_tables(path):
+        from . import tablesum
+        sums = tablesum.get_many(paper_id) if found else {}
+    except Exception:
+        sums = {}               # 摘要是增强，取不到就照常出原样表格块
+    try:
+        for t in found:
+            summary = sums.get(tablesum.table_hash(paper_id, t)) if sums else None
             for part in tables.chunk_table(t):
                 out.append({
-                    "text": part["text"],
+                    "text": tablesum.decorate(part["text"], summary) if summary
+                            else part["text"],
                     "section_path": f"表格（第 {t['page_no']} 页）"
                                     + (f" {part['part']}/{part['of']}"
                                        if part.get("of", 1) > 1 else ""),
                     "level": 1, "start_page": t["page_no"], "end_page": t["page_no"],
                     "kind": "table"})
     except Exception:
-        pass        # 表格识别失败不影响正文块——正文才是主路径
+        pass        # 成块失败就只留正文块
+
+    # 插图：**只有配过说明的图才成块**。没有说明的话，一个块里就只剩图题，
+    # 而图题本来就在正文块里——白占一个检索单元。
+    try:
+        from . import figures
+        figs = figures.get_many(paper_id)
+        if figs:
+            for f in figures.find_figures(path):
+                s = figs.get(figures.figure_hash(paper_id, f["page_no"], f["caption"]))
+                if not s:
+                    continue
+                out.append({
+                    "text": figures.decorate(f["caption"], s),
+                    "section_path": f"插图 {f['label']}（第 {f['page_no']} 页）",
+                    "level": 1, "start_page": f["page_no"], "end_page": f["page_no"],
+                    "kind": "figure"})
+    except Exception:
+        pass        # 插图是增强，出问题不影响正文与表格
     return out
 
 
