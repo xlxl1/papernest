@@ -1,9 +1,9 @@
-# 凭据：绝不入库（.env.example 是模板，可以提交）
+# ───── 凭据：绝不入库（.env.example 是模板，可以提交）─────
 .env
 .env.*
 !.env.example
 
-# 数据与运行时产物（本地库、PDF、向量索引和评测输出均不入库）
+# ───── 数据与运行时产物（本地库、PDF、向量索引和评测输出均不入库）─────
 data/*
 !data/.gitkeep
 *.db
@@ -14,7 +14,7 @@ data/*
 eval_report*.json
 verify_report.json
 
-# Python
+# ───── Python ─────
 __pycache__/
 *.py[cod]
 .venv/
@@ -23,21 +23,25 @@ venv/
 .ruff_cache/
 *.egg-info/
 
-# 编辑器 / 系统
+# ───── 编辑器 / 系统 ─────
 .vscode/
 .idea/
 .DS_Store
 Thumbs.db
 
-# 临时脚本
+# ───── 临时脚本 ─────
 _chat.json
 _t.json
 _finish.py
 
-# 运行时日志（会轮转，data/ 下）
+# ───── 运行时日志（会轮转，data/ 下）─────
 data/papernest.log*
 
-# QASPER 评测用的 arXiv PDF（tools/fetch_qasper_pdfs.py 下载，~300MB，可重下）
+# ───── QASPER 评测用的 arXiv PDF（tools/fetch_qasper_pdfs.py 下载，~300MB，可重下）─────
 data/qasper_pdf/
 _pkg/
 _pkg2/
+
+# ───── 私人内容（面试准备、IDE 个人配置等）─────
+INTERVIEW_QA.md
+.claude/
