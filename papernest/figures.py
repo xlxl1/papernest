@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """插图理解：把论文里的图变成能被检索到的文字。
 
-## 现状
+## 抽取策略
 
-全仓**零图片抽取**。论文里的图对这个系统完全不存在——用户问「那个架构图长什么样」
-「模型结构是怎么连的」，检索侧一个字都没有。
+带图题的矢量图按图题定位；没有图题的嵌入位图按 image bbox 做保守兜底。
+两类图都会进入 figure chunk，视觉摘要仍然是可选增强。
 
 ## 为什么以图题为锚，而不是 `page.get_images()`
 
@@ -15,8 +15,8 @@
   它们的图是**矢量**画的（matplotlib / TikZ 出的 PDF 图元），`get_images()` 看不见。
 - 反过来，论文 1 有 93 张位图却只有 5 条图题——那 93 张多半是图里的小块和装饰。
 
-所以按位图抓，会**漏掉整类矢量图**，同时抓回一堆碎片。按图题抓才对得上
-「读者眼里的一张图」。代价是没有图题的图抓不到，那种图本来也没法给它写说明。
+所以只按位图抓，会**漏掉整类矢量图**，同时抓回一堆碎片；只按图题抓又会漏掉
+没有文字图题的截图。现在先按图题抓完整图，再以尺寸、面积和重复 xref 过滤位图兜底。
 
 ## 图题判据
 
@@ -134,7 +134,13 @@ def _column_left_right(blocks, cap_rect, page_rect):
 
 
 def find_figures(pdf_path: str) -> list[dict]:
-    """按图题定位插图。返回 `[{page_no, caption, rect, ...}]`，**不渲染、不花钱**。"""
+    """定位插图并返回 `[{page_no, caption, rect, ...}]`，**不渲染、不花钱**。
+
+    图题仍然是最可靠的锚点；没有图题时再用嵌入位图的 bbox 做保守兜底。
+    这让扫描图、实验截图和没有 ``Figure ...`` 文字的图片至少能进入图像索引，
+    同时不会把页眉 logo、透明小图标和图题已经覆盖的图片重复收进去。纯矢量图
+    没有图题时无法由 PyMuPDF 的 image API 发现，需交给 Marker/MinerU 版面模型。
+    """
     import pymupdf
     out = []
     doc = pymupdf.open(pdf_path)
@@ -143,6 +149,7 @@ def find_figures(pdf_path: str) -> list[dict]:
             blocks = [b for b in page.get_text("blocks") if (b[4] or "").strip()]
             blocks.sort(key=lambda b: (b[1], b[0]))
             pr = tuple(page.rect)
+            captioned = []
             for n, b in enumerate(blocks):
                 text = (b[4] or "").strip()
                 m = CAPTION_RE.match(text)
@@ -152,21 +159,93 @@ def find_figures(pdf_path: str) -> list[dict]:
                 x0, x1 = _column_left_right(blocks, b, pr)
                 # 上边界：同栏里、图题上方最近的一个**正文段落**的底边。
                 # 只认正文段落，不认任意文本块——见 `_is_prose`。
-                above = [o[3] for o in blocks
-                         if o is not b and o[3] <= cap_top + 1
-                         and o[0] < x1 and o[2] > x0 and _is_prose(o)]
-                top = max(above) if above else pr[1]
+                above_blocks = [o for o in blocks
+                                if o is not b and o[3] <= cap_top + 1
+                                and o[0] < x1 and o[2] > x0 and _is_prose(o)]
+                top = max((o[3] for o in above_blocks), default=pr[1])
                 top = max(top, cap_top - MAX_UP, pr[1])
+                # Large vector diagrams expose their labels as text blocks.
+                # Some label groups are long enough to pass _is_prose, so the
+                # nearest "prose" block can sit only a few points above the
+                # caption and make us reject the real figure.  A dense group
+                # of mostly short blocks is stronger evidence of a diagram;
+                # use its upper edge as the figure boundary in that case.
+                if cap_top - top < MIN_H:
+                    dense = [o for o in blocks
+                             if o is not b and o[3] <= cap_top + 1
+                             and o[0] < x1 and o[2] > x0
+                             and o[1] >= cap_top - MAX_UP]
+                    short = sum(len((o[4] or '').split()) <= 14 for o in dense)
+                    if len(dense) >= 8 and short / len(dense) >= 0.65:
+                        top = min(o[1] for o in dense)
                 if cap_top - top < MIN_H or x1 - x0 < MIN_W:
                     continue        # 图题上面没有空间：多半是接排的续行，不是图
                 # 下边界多给 4pt：文本块的 bbox 比字面稍紧，正好卡在图题上沿会
                 # 削掉图最底下一排元素（实测 472 图 3 底部一排圆点被切了半截）。
                 # 多切进去的那一条最多带上图题第一行，无害——图题本来就要单独给模型。
                 bottom = min(pr[3], cap_top + 4.0)
-                out.append({"page_no": i, "caption": re.sub(r"\s+", " ", text).strip(),
-                            "label": m.group(1),
-                            "rect": (float(x0), float(top), float(x1), float(bottom)),
-                            "width": float(x1 - x0), "height": float(bottom - top)})
+                item = {"page_no": i, "caption": re.sub(r"\s+", " ", text).strip(),
+                        "label": m.group(1),
+                        "rect": (float(x0), float(top), float(x1), float(bottom)),
+                        "width": float(x1 - x0), "height": float(bottom - top),
+                        "uncaptioned": False}
+                out.append(item)
+                captioned.append(item)
+
+            # A raster image can be a complete figure even when its caption is
+            # absent or the caption is outside the extracted text layer.  Keep
+            # this fallback deliberately conservative: tiny/repeated assets are
+            # usually logos, icons, masks, or fragments of a larger screenshot.
+            try:
+                infos = page.get_image_info(xrefs=True) or []
+            except Exception:
+                infos = []
+            seen_xrefs = set()
+            image_no = 0
+            page_area = float(page.rect.width * page.rect.height) or 1.0
+            for info in infos:
+                rect = info.get("bbox")
+                if not rect or len(rect) != 4:
+                    continue
+                x0, y0, x1, y1 = map(float, rect)
+                w, h = x1 - x0, y1 - y0
+                if w < MIN_W or h < MIN_H or w * h < 3000.0:
+                    continue
+                if w * h > page_area * 0.85 or y1 < 54.0:
+                    continue
+                xref = info.get("xref")
+                if xref and xref in seen_xrefs:
+                    continue
+                if xref:
+                    seen_xrefs.add(xref)
+                # A captioned figure's rectangle may contain several raster
+                # sub-images; one figure chunk is enough for retrieval.
+                if any(f["rect"][0] <= (x0 + x1) / 2 <= f["rect"][2]
+                       and f["rect"][1] <= (y0 + y1) / 2 <= f["rect"][3]
+                       for f in captioned):
+                    continue
+                # De-duplicate overlapping image tiles (common in scanned PDFs).
+                area = w * h
+                duplicate = False
+                for f in out:
+                    if f.get("page_no") != i or f.get("uncaptioned") is not True:
+                        continue
+                    fx0, fy0, fx1, fy1 = f["rect"]
+                    inter = max(0.0, min(x1, fx1) - max(x0, fx0)) * max(0.0, min(y1, fy1) - max(y0, fy0))
+                    if inter / max(1.0, min(area, (fx1 - fx0) * (fy1 - fy0))) >= 0.75:
+                        duplicate = True
+                        break
+                if duplicate:
+                    continue
+                image_no += 1
+                out.append({
+                    "page_no": i,
+                    "caption": f"未标注图片（第 {i} 页，图像 {image_no}）",
+                    "label": f"image-{image_no}",
+                    "rect": (x0, y0, x1, y1),
+                    "width": w, "height": h,
+                    "uncaptioned": True,
+                })
     finally:
         doc.close()
     return out

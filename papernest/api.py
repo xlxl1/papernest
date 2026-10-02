@@ -2,6 +2,7 @@
 import asyncio
 import hmac
 import json
+import math
 import os
 from pathlib import Path
 
@@ -174,7 +175,8 @@ class IngestBody(BaseModel):
 def agent_plan(body: AgentRequest):
     """Return the selected tool plan without calling external services."""
     return agent.run_agent(body.goal, body.top_k, body.max_steps,
-                           body.topic, dry_run=True).model_dump()
+                           body.topic, dry_run=True,
+                           intent_hint=body.intent_hint).model_dump()
 
 
 @app.post("/api/agent/run")
@@ -182,7 +184,8 @@ def agent_run(body: AgentRequest):
     """Run a bounded tool workflow and return its execution timeline."""
     return agent.run_agent(body.goal, body.top_k, body.max_steps,
                            body.topic, dry_run=body.dry_run,
-                           timeout_s=body.timeout_s).model_dump()
+                           timeout_s=body.timeout_s,
+                           intent_hint=body.intent_hint).model_dump()
 
 
 @app.get("/api/agent/runs")
@@ -1155,8 +1158,10 @@ def _local_pdf(paper_id: int) -> Path:
 
 
 @app.get("/api/paper/{paper_id}/page/{page_no}.png")
-def paper_page_image(paper_id: int, page_no: int, dpi: int = 110):
-    """把指定页渲染成 PNG。
+def paper_page_image(paper_id: int, page_no: int, dpi: int = 110,
+                     bbox_x1: float | None = None, bbox_y1: float | None = None,
+                     bbox_x2: float | None = None, bbox_y2: float | None = None):
+    """把指定页渲染成 PNG；传完整 bbox 时在原 PDF 坐标上高亮该区域。
 
     为什么不靠 `<iframe src=...#page=N>`：浏览器内置 PDF 查看器对 `#page=` 的支持
     各家不一，实测在本项目的内嵌环境里根本不跳页。而「点结论上的页码 → 看到那一页」
@@ -1170,7 +1175,17 @@ def paper_page_image(paper_id: int, page_no: int, dpi: int = 110):
         if not (1 <= page_no <= doc.page_count):
             raise HTTPException(status_code=404,
                                 detail=f"页码超出范围（本文共 {doc.page_count} 页）")
-        pix = doc.load_page(page_no - 1).get_pixmap(dpi=dpi)
+        page = doc.load_page(page_no - 1)
+        bbox = (bbox_x1, bbox_y1, bbox_x2, bbox_y2)
+        if all(v is not None and math.isfinite(v) for v in bbox):
+            rect = pymupdf.Rect(*bbox) & page.rect
+            if rect.is_valid and not rect.is_empty:
+                rect += (-3, -2, 3, 2)
+                rect &= page.rect
+                page.draw_rect(rect, color=(0.95, 0.58, 0.05),
+                               fill=(1.0, 0.85, 0.25), fill_opacity=0.24,
+                               width=1.4, overlay=True)
+        pix = page.get_pixmap(dpi=dpi)
         png = pix.tobytes("png")
     finally:
         doc.close()
@@ -1184,6 +1199,39 @@ def paper_pages(paper_id: int):
         rows = c.execute("SELECT page_no, text FROM pages WHERE paper_id=? ORDER BY page_no",
                          (paper_id,)).fetchall()
     return {"count": len(rows), "pages": [dict(r) for r in rows]}
+
+
+@app.get("/api/paper/{paper_id}/formulas")
+def paper_formulas(paper_id: int):
+    with db.conn() as c:
+        items = db.formulas_for_paper(c, paper_id)
+        audit = db.document_artifact(c, paper_id, "formula_audit")
+    return {"count": len(items), "items": items,
+            "audit": dict(audit) if audit else None}
+
+
+@app.get("/api/paper/{paper_id}/markdown")
+def paper_markdown(paper_id: int, rebuild: bool = False):
+    from . import formulas, fulltext
+    with db.conn() as c:
+        if rebuild:
+            row = c.execute("SELECT pdf_path FROM papers WHERE id=?", (paper_id,)).fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="paper not found")
+            if row["pdf_path"] and Path(row["pdf_path"]).exists():
+                chunks = fulltext.build_chunks(row["pdf_path"], c, paper_id)
+                db.replace_chunks(c, paper_id, chunks)
+                content = fulltext.rebuild_canonical_markdown(c, paper_id, chunks)
+            else:
+                content = fulltext.rebuild_canonical_markdown(c, paper_id)
+        else:
+            artifact = db.document_artifact(c, paper_id, "canonical_markdown",
+                                            formulas.PARSER_VERSION)
+            if not artifact:
+                content = fulltext.rebuild_canonical_markdown(c, paper_id)
+            else:
+                content = artifact["content"]
+    return Response(content=content, media_type="text/markdown; charset=utf-8")
 
 
 # ── 符号大全 ──

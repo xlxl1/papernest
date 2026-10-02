@@ -524,6 +524,49 @@ def search_hybrid(query: str, top_k: int = 8, rrf_k: int = 60,
     return RetrievalResult(merged[:top_k], mode, notes, chunk_hits)
 
 
+
+
+def search_by_type(query: str, top_k: int = 8,
+                  rrf_k: int = 60, type_weight: dict | None = None) -> list[int]:
+    """按 block_type 分别检索 + 跨类型 RRF 融合。
+
+    用户故事: 问"有没有相关公式?" → search_by_type(query, "formula")
+    用户故事: "实验结果表" → search_by_type(query, "table")
+
+    流程:
+    1. 对每类(text/table/figure/formula)各召 top_k*2 个候选
+    2. RRF 融合(公式: 1/(60+rank))
+    3. 取 top_k
+
+    返回 paper_id 列表(已排序)。
+    返回空 list = 这一类没有命中,不是错误。
+    """
+    rankings: list[list[int]] = []
+    weights: list[float] = []
+    with db.conn() as c:
+        # 每类单独召回
+        for bt in ("text", "table", "figure", "formula"):
+            rows = db.search_chunks_fts(c, query, top_k * 2, block_type=bt)
+            ids = []
+            seen_pids = set()
+            for r in rows:
+                pid = r["paper_id"]
+                if pid not in seen_pids:
+                    ids.append(pid)
+                    seen_pids.add(pid)
+            if ids:
+                rankings.append(ids)
+                # 公式/表格 权重略高(用户专门查这些)
+                weights.append(1.2 if bt in ("table", "formula") else 1.0)
+    if not rankings:
+        return []
+    # RRF 融合
+    scores: dict[int, float] = {}
+    for ranking, weight in zip(rankings, weights):
+        for rank, pid in enumerate(ranking):
+            scores[pid] = scores.get(pid, 0.0) + weight / (rrf_k + rank + 1)
+    return sorted(scores, key=lambda p: -scores[p])[:top_k]
+
 def best_sentence(paragraph_vec: np.ndarray, paper_id: int) -> tuple[str | None, float]:
     """该论文的句子级向量里，与段落最接近的一句。"""
     with db.conn() as c:

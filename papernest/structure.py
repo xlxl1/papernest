@@ -344,6 +344,7 @@ def _read(pdf_path) -> tuple[list[dict], int]:
                     "font": lines[0]["font"],
                     "x0": min(l["x0"] for l in lines),
                     "y0": min(l["y0"] for l in lines),
+                    "x1": max(l["bbox"][2] for l in lines),
                     "y1": max(l["y1"] for l in lines),
                     "n_lines": len(lines),
                     "n_chars": len(text),
@@ -706,12 +707,34 @@ def _split_paragraph(text: str, max_chars: int) -> list[str]:
     return out
 
 
-def _pack(items: list[tuple[str, int]], max_chars: int) -> list[list[tuple[str, int]]]:
-    """把 (段落文本, 页码) 贪心装箱：切分点优先落在段落边界，段落本身超长才内部切。"""
-    groups: list[list[tuple[str, int]]] = []
-    cur: list[tuple[str, int]] = []
+def _block_bbox(b: dict) -> dict | None:
+    """block → 它的 bbox dict;用于 `_pack` 第三项的传递。
+
+    PDF 没文本层时 block 的 x0/y0/x1/y1 都会是 0.0,这时返回 None 而不是
+    `(0,0,0,0)`——`(0,0,0,0)` 会让前端画一个定位到左上角的框,反向定位失效。
+    返回 None 让 chunk 的 bbox 字段也是 None,前端按"无坐标"处理。
+    """
+    x0 = b.get("x0")
+    y0 = b.get("y0")
+    x1 = b.get("x1")
+    y1 = b.get("y1")
+    if not (x0 or y0 or x1 or y1):
+        return None
+    return {"x0": x0, "y0": y0, "x1": x1, "y1": y1}
+
+def _pack(items: list[tuple[str, int, dict | None]],
+              max_chars: int) -> list[list[tuple[str, int, dict | None]]]:
+    """把 (段落文本, 页码, bbox) 贪心装箱。
+
+    第三项 bbox 来自 block 的 PyMuPDF 坐标 (x0/y0/x1/y1)。同一段超长文本被
+    `_split_paragraph` 切成多片时,所有片共享同一 bbox(它们来自同一 block);
+    bbox 在最终 `_emit` 里才会从三元组里抽出来写到 chunk 字段——贪心装箱只关心
+    字符预算,坐标是惰性传递的副产物。
+    """
+    groups: list[list[tuple[str, int, dict | None]]] = []
+    cur: list[tuple[str, int, dict | None]] = []
     cur_len = 0
-    for text, page in items:
+    for text, page, bbox in items:
         pieces = _split_paragraph(text, max_chars) if len(text) > max_chars else [text]
         for pc in pieces:
             add = len(pc) + (2 if cur else 0)
@@ -719,19 +742,24 @@ def _pack(items: list[tuple[str, int]], max_chars: int) -> list[list[tuple[str, 
                 groups.append(cur)
                 cur, cur_len = [], 0
                 add = len(pc)
-            cur.append((pc, page))
+            cur.append((pc, page, bbox))
             cur_len += add
     if cur:
         groups.append(cur)
     return groups
 
 
+
 def _emit(groups, title: str, path: str, level: int, start_at: int,
           degraded: str | None, kind: str = "text") -> list[dict]:
     out: list[dict] = []
     for part, grp in enumerate(groups, 1):
-        text = "\n\n".join(t for t, _ in grp)
-        pages = [p for _, p in grp]
+        text = "\n\n".join(t for t, _, _b in grp)
+        pages = [p for _, p, _b in grp]
+        # 段组里**第一个**有 bbox 的元素当作整块的 bbox。贪心装箱的段可能来自
+        # 不同的 block(章节切片),首个 block 的坐标足够做反向定位——精确到行
+        # 不是 RAG 要的目标,精确到段落就够前端高亮一行了。
+        first_bbox = next((g[2] for g in grp if g[2]), None)
         chunk = {
             "section_title": title,
             "section_path": path,
@@ -744,6 +772,11 @@ def _emit(groups, title: str, path: str, level: int, start_at: int,
             "n_parts": len(groups),
             "n_chars": len(text),
             "kind": kind,
+            "bbox_x1": first_bbox.get("x0") if first_bbox else None,
+            "bbox_y1": first_bbox.get("y0") if first_bbox else None,
+            "bbox_x2": first_bbox.get("x1") if first_bbox else None,
+            "bbox_y2": first_bbox.get("y1") if first_bbox else None,
+            "block_type": None,
         }
         if degraded:
             chunk["degraded"] = degraded
@@ -767,7 +800,7 @@ def _page_chunks(blocks: list[dict], max_chars: int,
         if b["page_no"] not in by_page:
             by_page[b["page_no"]] = []
             order.append(b["page_no"])
-        by_page[b["page_no"]].append((b["text"], b["page_no"]))
+        by_page[b["page_no"]].append((b["text"], b["page_no"], _block_bbox(b)))
     for page in order:
         out.extend(_emit(_pack(by_page[page], max_chars), "", "", 0,
                          len(out), PAGE_FALLBACK_NOTE))
@@ -853,7 +886,7 @@ def _section_chunks(blocks: list[dict], sections: list[dict],
     bounds = [s["block_index"] for s in sections] + [len(blocks)]
     ref_lo, ref_hi = _ref_block_span(blocks, sections)
 
-    head = [(b["text"], b["page_no"]) for b in blocks[:bounds[0]]
+    head = [(b["text"], b["page_no"], _block_bbox(b)) for b in blocks[:bounds[0]]
             if b["block_index"] not in drop]
     if head:
         # 首个标题之前的内容（题名/作者/摘要）不能丢，单独成块并如实标注它没有章节归属
@@ -868,7 +901,7 @@ def _section_chunks(blocks: list[dict], sections: list[dict],
         path = " > ".join(t for _, t in stack)
         body = blocks[sec["block_index"] + 1: bounds[i + 1]]
         for kind, run in _runs_by_kind(body, ref_lo, ref_hi):
-            items = [(b["text"], b["page_no"]) for b in run
+            items = [(b["text"], b["page_no"], _block_bbox(b)) for b in run
                      if b["block_index"] not in drop]
             if not items:
                 continue  # 父标题下紧跟子标题：没有正文就不产 chunk，但仍留在 path 上
@@ -905,8 +938,34 @@ def section_chunks(pdf_path, max_chars: int = DEFAULT_CHUNK_CHARS,
         from . import tables as _tables
         try:
             drop = _tables.table_owned_blocks(blocks, detected_tables)
+            # Text inside a detected table/diagram must not become a chapter
+            # heading.  This matters for dense overview figures: labels such
+            # as "Evaluation" and "Security" satisfy heading heuristics but
+            # are visual cells, not document sections.
+            sections = [s for s in sections
+                        if s.get("block_index") not in drop]
         except Exception:
             drop = set()      # 去重是优化，坏了就退回「留着重复」，不能拖垮切块
+    # Figure labels are text to PyMuPDF but are not prose.  Remove blocks
+    # inside a caption-anchored figure from section detection and body chunks;
+    # the caption itself remains searchable and the optional figure-summary
+    # path can add a separate auditable chunk later.
+    try:
+        from . import figures as _figures
+        for fig in _figures.find_figures(pdf_path):
+            fx0, fy0, fx1, fy1 = fig["rect"]
+            for b in blocks:
+                if b.get("page_no") != fig.get("page_no"):
+                    continue
+                if _CAPTION_RE.match(b.get("text") or ""):
+                    continue
+                bx0, by0, bx1, by1 = b.get("x0", 0), b.get("y0", 0), b.get("x1", 0), b.get("y1", 0)
+                midx, midy = (bx0 + bx1) / 2, (by0 + by1) / 2
+                if fx0 <= midx <= fx1 and fy0 <= midy <= fy1:
+                    drop.add(b["block_index"])
+        sections = [s for s in sections if s.get("block_index") not in drop]
+    except Exception:
+        pass
     return _section_chunks(blocks, sections, max_chars, drop)
 
 

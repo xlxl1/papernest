@@ -121,11 +121,50 @@ CREATE TABLE IF NOT EXISTS chunks (
   start_page INTEGER,             -- 仍然记页码，证据链不断
   end_page INTEGER,
   kind TEXT DEFAULT 'text',       -- text | table（表格块整行不截断、表头跨块重复）
+  -- bbox:页面坐标系 (PDF.js goTo 用)。文本 PDF 是 PyMuPDF 文本块的 bbox;
+  --       OCR/兜底页面是 page.rect。已有数据迁移后为 NULL(不影响检索)。
+  bbox_x1 REAL,
+  bbox_y1 REAL,
+  bbox_x2 REAL,
+  bbox_y2 REAL,
   text TEXT,
+  block_id TEXT,
   PRIMARY KEY(paper_id, chunk_no)
 );
 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
-  paper_id UNINDEXED, chunk_no UNINDEXED, text, tokenize='trigram'
+  paper_id UNINDEXED, chunk_no UNINDEXED, text,
+  block_type UNINDEXED,           -- 过滤用:text / table / figure / formula
+  tokenize='trigram'
+);
+CREATE TABLE IF NOT EXISTS formulas (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  paper_id INTEGER NOT NULL,
+  block_id TEXT NOT NULL,
+  page_no INTEGER NOT NULL,
+  bbox_x1 REAL, bbox_y1 REAL, bbox_x2 REAL, bbox_y2 REAL,
+  raw_text TEXT NOT NULL DEFAULT '',
+  formula_no TEXT,
+  source TEXT NOT NULL DEFAULT 'pdf_text',
+  confidence REAL NOT NULL DEFAULT 0,
+  latex TEXT,
+  latex_confidence REAL,
+  status TEXT NOT NULL DEFAULT 'unresolved',
+  metadata_json TEXT NOT NULL DEFAULT '{}',
+  parser_version TEXT NOT NULL,
+  created_at TEXT DEFAULT (datetime('now','localtime')),
+  updated_at TEXT DEFAULT (datetime('now','localtime')),
+  UNIQUE(paper_id, block_id)
+);
+CREATE INDEX IF NOT EXISTS idx_formulas_paper_page
+  ON formulas(paper_id, page_no);
+CREATE TABLE IF NOT EXISTS document_artifacts (
+  paper_id INTEGER NOT NULL,
+  artifact_type TEXT NOT NULL,
+  parser_version TEXT NOT NULL,
+  content TEXT NOT NULL DEFAULT '',
+  metadata_json TEXT NOT NULL DEFAULT '{}',
+  updated_at TEXT DEFAULT (datetime('now','localtime')),
+  PRIMARY KEY(paper_id, artifact_type, parser_version)
 );
 -- 表格摘要：模型给每张表写的一段自然语言说明。
 -- **按表的内容哈希存，不存进 chunks.text**：重切块（`replace_chunks`）会把 chunks
@@ -366,7 +405,7 @@ def conn(immediate: bool = False):
 # 每个版本一个「幂等」迁移函数；PRAGMA user_version 记录已应用到哪一版。
 # 旧库（user_version=0）会顺序补齐，新库建表后直接盖到最新版。
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 13
 
 
 def _columns(c: sqlite3.Connection, table: str) -> set[str]:
@@ -494,10 +533,75 @@ def _migrate_9(c: sqlite3.Connection):
     if "structure_ok" not in cols:
         c.execute("ALTER TABLE table_summaries "
                   "ADD COLUMN structure_ok INTEGER NOT NULL DEFAULT 1")
+def _migrate_10(c: sqlite3.Connection):
+    """v10:chunks 表加 bbox + block_type,支持 PDF 反向 chain 定位 + 按类型检索。"""
+    _add_column(c, "chunks", "bbox_x1", "REAL")
+    _add_column(c, "chunks", "bbox_y1", "REAL")
+    _add_column(c, "chunks", "bbox_x2", "REAL")
+    _add_column(c, "chunks", "bbox_y2", "REAL")
+    # block_type 也得加进 chunks 表本体,不只是 FTS 镜像——
+    # replace_chunks 直接 INSERT chunks(...block_type...),
+    # 没有这列就报 "table chunks has no column named block_type"。
+    # 老数据回填为 "text",检索行为与加列前一致。
+    if "block_type" not in _columns(c, "chunks"):
+        c.execute("ALTER TABLE chunks ADD COLUMN block_type TEXT")
+        c.execute("UPDATE chunks SET block_type='text' WHERE block_type IS NULL")
+
+    has_block_type = any(
+        r[1] == "block_type"
+        for r in c.execute("PRAGMA table_info(chunks_fts)")
+    )
+    if not has_block_type:
+        c.execute("CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts_new USING fts5(paper_id UNINDEXED, chunk_no UNINDEXED, text, block_type UNINDEXED, tokenize='trigram')")
+        c.execute("INSERT INTO chunks_fts_new(paper_id, chunk_no, text, block_type) SELECT f.paper_id, f.chunk_no, f.text, 'text' FROM chunks_fts f")
+        c.execute("DROP TABLE chunks_fts")
+        c.execute("ALTER TABLE chunks_fts_new RENAME TO chunks_fts")
+
+
+def _migrate_11(c: sqlite3.Connection):
+    """v11: auditable formula candidates and rebuildable document artifacts."""
+    c.executescript("""
+    CREATE TABLE IF NOT EXISTS formulas (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, paper_id INTEGER NOT NULL,
+      block_id TEXT NOT NULL, page_no INTEGER NOT NULL,
+      bbox_x1 REAL, bbox_y1 REAL, bbox_x2 REAL, bbox_y2 REAL,
+      raw_text TEXT NOT NULL DEFAULT '', formula_no TEXT,
+      source TEXT NOT NULL DEFAULT 'pdf_text', confidence REAL NOT NULL DEFAULT 0,
+      latex TEXT, latex_confidence REAL, status TEXT NOT NULL DEFAULT 'unresolved',
+      metadata_json TEXT NOT NULL DEFAULT '{}', parser_version TEXT NOT NULL,
+      created_at TEXT DEFAULT (datetime('now','localtime')),
+      updated_at TEXT DEFAULT (datetime('now','localtime')),
+      UNIQUE(paper_id, block_id));
+    CREATE INDEX IF NOT EXISTS idx_formulas_paper_page ON formulas(paper_id, page_no);
+    CREATE TABLE IF NOT EXISTS document_artifacts (
+      paper_id INTEGER NOT NULL, artifact_type TEXT NOT NULL,
+      parser_version TEXT NOT NULL, content TEXT NOT NULL DEFAULT '',
+      metadata_json TEXT NOT NULL DEFAULT '{}',
+      updated_at TEXT DEFAULT (datetime('now','localtime')),
+      PRIMARY KEY(paper_id, artifact_type, parser_version));
+    """)
+
+
+def _migrate_12(c: sqlite3.Connection):
+    """v12: persist stable canonical block ids on chunks."""
+    _add_column(c, "chunks", "block_id", "TEXT")
+
+
+def _migrate_13(c: sqlite3.Connection):
+    """v13: repair databases that were marked v12 without v10 columns.
+
+    Some older upgrade paths advanced ``user_version`` even when the v10
+    chunk columns were absent.  Re-run the idempotent v10 migration so older
+    libraries can still use chunk search and survey generation.
+    """
+    _migrate_10(c)
+
 
 
 MIGRATIONS = {1: _migrate_1, 2: _migrate_2, 3: _migrate_3, 4: _migrate_4,
-              5: _migrate_5, 6: _migrate_6, 7: _migrate_7, 8: _migrate_8, 9: _migrate_9}
+              5: _migrate_5, 6: _migrate_6, 7: _migrate_7, 8: _migrate_8, 9: _migrate_9,
+              10: _migrate_10, 11: _migrate_11, 12: _migrate_12,
+              13: _migrate_13}
 
 _init_lock = threading.Lock()
 _initialized: set[str] = set()
@@ -675,6 +779,60 @@ def reindex_pages(c: sqlite3.Connection, paper_id: int):
               (paper_id,))
 
 
+def replace_formulas(c: sqlite3.Connection, paper_id: int, formulas: list[dict],
+                     parser_version: str) -> int:
+    """Idempotently replace one parser version's formula audit records."""
+    c.execute("DELETE FROM formulas WHERE paper_id=? AND parser_version=?",
+              (paper_id, parser_version))
+    for item in formulas:
+        bbox = item.get("bbox") or (None, None, None, None)
+        meta = {k: v for k, v in item.items()
+                if k not in {"bbox", "raw_text", "latex"}}
+        c.execute("""INSERT INTO formulas(
+                     paper_id,block_id,page_no,bbox_x1,bbox_y1,bbox_x2,bbox_y2,
+                     raw_text,formula_no,source,confidence,latex,latex_confidence,
+                     status,metadata_json,parser_version)
+                     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                  (paper_id, item["block_id"], item["page_no"], *bbox,
+                   item.get("raw_text") or "", item.get("formula_no"),
+                   item.get("source") or "pdf_text",
+                   float(item.get("confidence") or 0), item.get("latex"),
+                   item.get("latex_confidence"), item.get("status") or "unresolved",
+                   json.dumps(meta, ensure_ascii=False), parser_version))
+    return len(formulas)
+
+
+def formulas_for_paper(c: sqlite3.Connection, paper_id: int) -> list[dict]:
+    rows = c.execute("""SELECT * FROM formulas WHERE paper_id=?
+                           ORDER BY page_no,bbox_y1,bbox_x1,id""", (paper_id,)).fetchall()
+    return [dict(r) | {"bbox": (r["bbox_x1"], r["bbox_y1"], r["bbox_x2"], r["bbox_y2"])}
+            for r in rows]
+
+
+def save_document_artifact(c: sqlite3.Connection, paper_id: int, artifact_type: str,
+                           parser_version: str, content: str, metadata: dict | None = None):
+    c.execute("""INSERT INTO document_artifacts(
+                 paper_id,artifact_type,parser_version,content,metadata_json,updated_at)
+                 VALUES(?,?,?,?,?,datetime('now','localtime'))
+                 ON CONFLICT(paper_id,artifact_type,parser_version) DO UPDATE SET
+                   content=excluded.content, metadata_json=excluded.metadata_json,
+                   updated_at=excluded.updated_at""",
+              (paper_id, artifact_type, parser_version, content,
+               json.dumps(metadata or {}, ensure_ascii=False)))
+
+
+def document_artifact(c: sqlite3.Connection, paper_id: int, artifact_type: str,
+                      parser_version: str | None = None):
+    if parser_version:
+        return c.execute("""SELECT * FROM document_artifacts
+                            WHERE paper_id=? AND artifact_type=? AND parser_version=?""",
+                         (paper_id, artifact_type, parser_version)).fetchone()
+    return c.execute("""SELECT * FROM document_artifacts
+                        WHERE paper_id=? AND artifact_type=?
+                        ORDER BY updated_at DESC LIMIT 1""",
+                     (paper_id, artifact_type)).fetchone()
+
+
 def search_pages_fts(c: sqlite3.Connection, q: str, limit: int = 50) -> list:
     """页级全文检索。返回按相关性排序的 (paper_id, page_no, text)。
 
@@ -726,15 +884,25 @@ def replace_chunks(c: sqlite3.Connection, paper_id: int, chunks: list[dict]):
         n += 1
         kind = ch.get("kind") or "text"
         c.execute("""INSERT INTO chunks(paper_id,chunk_no,section_path,level,
-                       start_page,end_page,kind,text) VALUES(?,?,?,?,?,?,?,?)""",
-                  (paper_id, n, ch.get("section_path") or "", int(ch.get("level") or 1),
-                   ch.get("start_page"), ch.get("end_page"), kind, text))
+                       start_page,end_page,kind,
+                       bbox_x1,bbox_y1,bbox_x2,bbox_y2,block_type,block_id,
+                       text) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                  (paper_id, n,
+                   ch.get("section_path") or "",
+                   int(ch.get("level") or 1),
+                   ch.get("start_page"), ch.get("end_page"),
+                   kind,
+                   ch.get("bbox_x1"), ch.get("bbox_y1"),
+                   ch.get("bbox_x2"), ch.get("bbox_y2"),
+                   ch.get("block_type") or "text",
+                   ch.get("block_id"),
+                   text))
         # 参考文献块留在 chunks 里（引文图 / 找相关工作要读原文），但**不进检索索引**：
         # 它是别人论文的条目，不是本篇的证据。真库实测 13.9% 的可检索文本是这种条目，
         # 64 条真实查询里 16 条的块级 top-5 含参考文献块，最坏一条 5/5。
         if kind != "reference":
-            c.execute("INSERT INTO chunks_fts(paper_id,chunk_no,text) VALUES(?,?,?)",
-                      (paper_id, n, text))
+            c.execute("INSERT INTO chunks_fts(paper_id,chunk_no,text,block_type) VALUES(?,?,?,?)",
+                      (paper_id, n, text, ch.get("block_type") or "text"))
     return n
 
 
@@ -776,33 +944,68 @@ def chunks_from_pages(c: sqlite3.Connection, paper_id: int) -> list[dict]:
     """
     return cap_chunks([
         {"text": r["text"] or "", "section_path": "", "level": 1,
-         "start_page": r["page_no"], "end_page": r["page_no"], "kind": "text"}
+         "start_page": r["page_no"], "end_page": r["page_no"],
+         "bbox_x1": 0.0, "bbox_y1": 0.0,
+         "bbox_x2": 0.0, "bbox_y2": 0.0,
+         "kind": "text", "block_type": "text"}
         for r in c.execute(
             "SELECT page_no,text FROM pages WHERE paper_id=? ORDER BY page_no",
             (paper_id,)).fetchall()])
 
 
-def search_chunks_fts(c: sqlite3.Connection, q: str, limit: int = 50) -> list:
-    """检索单元级全文检索。与 search_fts 同一套容错口径；不做 LIKE 兜底——
-    全文表太大，全表扫描的代价远超它能捞回的那点召回。"""
+def search_chunks_fts(c: sqlite3.Connection, q: str, limit: int = 50,
+                          block_type: str | None = None) -> list:
+    """检索单元级全文检索。与 search_fts 同一套容错口径;不做 LIKE 兜底——
+    全文表太大,全表扫描的代价远超它能捞回的那点召回。
+
+    block_type: 可选过滤(text / table / figure / formula)。
+    None = 不过滤,返回所有类型的命中。
+    """
     terms = [t for t in _expand_terms(q) if len(t) >= MIN_FTS_CHARS]
     if not terms:
         return []
     match = " OR ".join(f'"{t}"' for t in terms)
     try:
-        return c.execute(
-            """SELECT f.paper_id, f.chunk_no, f.text,
-                      (SELECT section_path FROM chunks
-                        WHERE paper_id=f.paper_id AND chunk_no=f.chunk_no) section_path,
-                      (SELECT start_page FROM chunks
-                        WHERE paper_id=f.paper_id AND chunk_no=f.chunk_no) start_page
-               FROM chunks_fts f
-               WHERE chunks_fts MATCH ? ORDER BY rank LIMIT ?""",
-            (match, limit)).fetchall()
+        if block_type:
+            return c.execute(
+                """SELECT f.paper_id, f.chunk_no, f.text, f.block_type,
+                          (SELECT section_path FROM chunks
+                            WHERE paper_id=f.paper_id AND chunk_no=f.chunk_no) section_path,
+                          (SELECT start_page FROM chunks
+                            WHERE paper_id=f.paper_id AND chunk_no=f.chunk_no) start_page,
+                          (SELECT bbox_x1 FROM chunks
+                            WHERE paper_id=f.paper_id AND chunk_no=f.chunk_no) bbox_x1,
+                          (SELECT bbox_y1 FROM chunks
+                            WHERE paper_id=f.paper_id AND chunk_no=f.chunk_no) bbox_y1,
+                          (SELECT bbox_x2 FROM chunks
+                            WHERE paper_id=f.paper_id AND chunk_no=f.chunk_no) bbox_x2,
+                          (SELECT bbox_y2 FROM chunks
+                            WHERE paper_id=f.paper_id AND chunk_no=f.chunk_no) bbox_y2
+                   FROM chunks_fts f
+                   WHERE chunks_fts MATCH ? AND f.block_type = ?
+                   ORDER BY rank LIMIT ?""",
+                (match, block_type, limit)).fetchall()
+        else:
+            return c.execute(
+                """SELECT f.paper_id, f.chunk_no, f.text, f.block_type,
+                          (SELECT section_path FROM chunks
+                            WHERE paper_id=f.paper_id AND chunk_no=f.chunk_no) section_path,
+                          (SELECT start_page FROM chunks
+                            WHERE paper_id=f.paper_id AND chunk_no=f.chunk_no) start_page,
+                          (SELECT bbox_x1 FROM chunks
+                            WHERE paper_id=f.paper_id AND chunk_no=f.chunk_no) bbox_x1,
+                          (SELECT bbox_y1 FROM chunks
+                            WHERE paper_id=f.paper_id AND chunk_no=f.chunk_no) bbox_y1,
+                          (SELECT bbox_x2 FROM chunks
+                            WHERE paper_id=f.paper_id AND chunk_no=f.chunk_no) bbox_x2,
+                          (SELECT bbox_y2 FROM chunks
+                            WHERE paper_id=f.paper_id AND chunk_no=f.chunk_no) bbox_y2
+                   FROM chunks_fts f
+                   WHERE chunks_fts MATCH ?
+                   ORDER BY rank LIMIT ?""",
+                (match, limit)).fetchall()
     except sqlite3.OperationalError:
         return []
-
-
 def search_chunks_ranked(c: sqlite3.Connection, q: str, limit: int = 50) -> list[int]:
     """块级命中聚合到论文级：一篇取它最好的那个块的名次，去重后返回 paper_id 序。"""
     seen: dict[int, int] = {}
@@ -812,7 +1015,8 @@ def search_chunks_ranked(c: sqlite3.Connection, q: str, limit: int = 50) -> list
 
 
 def search_chunks_hits(c: sqlite3.Connection, q: str, limit: int = 50,
-                       per_paper: int = 4) -> dict[int, list[dict]]:
+                       per_paper: int = 4,
+                       block_type: str | None = None) -> dict[int, list[dict]]:
     """块级命中，**保留是哪一块**：{paper_id: [{chunk_no, section_path, start_page, text}]}。
 
     `search_chunks_ranked` 把命中压成 paper_id 就丢掉了块的身份，于是上下文组装侧
@@ -823,15 +1027,22 @@ def search_chunks_hits(c: sqlite3.Connection, q: str, limit: int = 50,
     每篇最多带 `per_paper` 块（按相关性），避免一篇长论文占满整个上下文预算。
     """
     out: dict[int, list[dict]] = {}
-    for rank, row in enumerate(search_chunks_fts(c, q, limit * 4)):
+    for rank, row in enumerate(search_chunks_fts(c, q, limit * 4, block_type)):
         pid = row["paper_id"]
         bucket = out.setdefault(pid, [])
         if len(bucket) < per_paper:
+            # bbox 反向定位用：前端拿到 chunk 后能定位到原 PDF 的物理坐标
+            # 没坐标就 None（扫描件 / 老数据），前端按"无坐标"处理
             bucket.append({"chunk_no": row["chunk_no"],
                            "section_path": row["section_path"] or "",
                            "start_page": row["start_page"],
                            "text": row["text"] or "",
-                           "rank": rank})
+                           "rank": rank,
+                           "block_type": row["block_type"] or "text",
+                           "bbox_x1": row["bbox_x1"],
+                           "bbox_y1": row["bbox_y1"],
+                           "bbox_x2": row["bbox_x2"],
+                           "bbox_y2": row["bbox_y2"]})
     return out
 
 
@@ -842,7 +1053,9 @@ def chunks_by_no(c: sqlite3.Connection, paper_id: int,
         return []
     marks = ",".join("?" * len(chunk_nos))
     rows = c.execute(
-        f"""SELECT chunk_no, section_path, start_page, text FROM chunks
+        f"""SELECT chunk_no, section_path, start_page, text,
+                  bbox_x1, bbox_y1, bbox_x2, bbox_y2, block_type
+            FROM chunks
             WHERE paper_id=? AND chunk_no IN ({marks})""",
         [paper_id, *chunk_nos]).fetchall()
     by_no = {r["chunk_no"]: dict(r) for r in rows}

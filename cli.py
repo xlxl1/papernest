@@ -210,6 +210,37 @@ def cmd_read(args):
         print(f"  {r.get('note','')}")
 
 
+def cmd_formulas(args):
+    db.init_db()
+    with db.conn() as c:
+        rows = db.formulas_for_paper(c, args.paper_id)
+    print(json.dumps({"paper_id": args.paper_id, "count": len(rows), "items": rows},
+                     ensure_ascii=False, indent=2, default=str))
+
+
+def cmd_pdf_markdown(args):
+    from papernest import formulas
+    db.init_db()
+    with db.conn() as c:
+        if args.rebuild:
+            row = c.execute("SELECT pdf_path FROM papers WHERE id=?",
+                            (args.paper_id,)).fetchone()
+            if not row:
+                print("paper not found"); sys.exit(1)
+            if row["pdf_path"] and Path(row["pdf_path"]).exists():
+                chunks = fulltext.build_chunks(row["pdf_path"], c, args.paper_id)
+                db.replace_chunks(c, args.paper_id, chunks)
+                content = fulltext.rebuild_canonical_markdown(c, args.paper_id, chunks)
+            else:
+                content = fulltext.rebuild_canonical_markdown(c, args.paper_id)
+        else:
+            artifact = db.document_artifact(c, args.paper_id, "canonical_markdown",
+                                            formulas.PARSER_VERSION)
+            content = artifact["content"] if artifact else fulltext.rebuild_canonical_markdown(
+                c, args.paper_id)
+    print(content, end="")
+
+
 def cmd_export_obsidian(args):
     """导出 Obsidian 文献笔记：citekey 命名 + YAML frontmatter + 库内互引双链。"""
     from papernest import obsidian
@@ -502,9 +533,9 @@ def cmd_enrich(args):
 def cmd_figure_summary(args):
     """给论文插图配说明，让图能被语义检索找到。默认只算账，不花钱。
 
-    以**图题**定位插图，不是 `page.get_images()`：真库 26 篇里，论文 460 有 4 条
+    以**图题优先、嵌入位图兜底**定位插图：真库 26 篇里，论文 460 有 4 条
     图题却 0 张位图（矢量图），而论文 1 有 93 张位图只有 5 条图题（多是碎片）。
-    按图题抓才对得上「读者眼里的一张图」。
+    图题抓完整矢量图，位图兜底补上没有图题的截图；纯矢量且无图题仍需版面模型。
 
     说明只写图的类型、成分、比较关系，**不读数值**——实测模型会把折线图的
     结论说反（详见 papernest/figures.py 的模块注释）。
@@ -516,7 +547,7 @@ def cmd_figure_summary(args):
               "PAPERNEST_VISION_MODEL=qwen3-vl-plus（或 qwen3-vl-flash）。")
         print("[figure-summary] 没配也能看账：下面按默认渲染尺寸估。")
     ids = [int(x) for x in (args.papers or "").replace(",", " ").split()] or None
-    print("[figure-summary] 正在按图题定位插图（读 PDF，不花钱）……")
+    print("[figure-summary] 正在按图题及嵌入位图定位插图（读 PDF，不花钱）……")
     items = figures.pending(ids)
     est = figures.estimate(items)
     if not items:
@@ -1239,6 +1270,15 @@ def main():
     ip.add_argument("--topic", default=None, help="课题上下文（写进卡片的「与我课题的关系」）")
     ip.add_argument("--no-cards", action="store_true", help="只入库不生成卡片（0 次 LLM）")
     ip.set_defaults(fn=cmd_import_pdf)
+
+    pf = sub.add_parser("formulas", help="view audited formula candidates for a paper")
+    pf.add_argument("paper_id", type=int)
+    pf.set_defaults(fn=cmd_formulas)
+
+    pm = sub.add_parser("pdf-markdown", help="view or rebuild canonical PDF Markdown")
+    pm.add_argument("paper_id", type=int)
+    pm.add_argument("--rebuild", action="store_true")
+    pm.set_defaults(fn=cmd_pdf_markdown)
 
     fm = sub.add_parser("fix-meta", help="修正抽错的元数据（改 title/doi 会重算 norm_key）")
     fm.add_argument("paper_id", type=int)

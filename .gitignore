@@ -41,7 +41,12 @@ data/papernest.log*
 data/qasper_pdf/
 _pkg/
 _pkg2/
+.tmp/
+.test-tmp/
 
 # ───── 私人内容（面试准备、IDE 个人配置等）─────
 INTERVIEW_QA.md
 .claude/
+docs/Part7-*
+gen_v3_l*.py
+q_data.json

@@ -115,13 +115,173 @@ def extract_pages(path: str, paper_id: int, max_pages: int = 40) -> int:
                         (paper_id, i, text))
             c.execute("UPDATE papers SET pdf_path=? WHERE id=?", (path, paper_id))
             db.reindex_pages(c, paper_id)   # 精读拿到的正文要进得了全库检索
-            db.replace_chunks(c, paper_id, build_chunks(path, c, paper_id))
+            chunks = build_chunks(path, c, paper_id, max_pages=max_pages)
+            db.replace_chunks(c, paper_id, chunks)
+            rebuild_canonical_markdown(c, paper_id, chunks)
     finally:
         doc.close()
     return n
 
 
-def build_chunks(path: str, c, paper_id: int) -> list[dict]:
+def _ocr_rescue(path: str, paper_id: int, max_pages: int = 40) -> tuple[int, str | None]:
+    """补救整份无文本层的 OA PDF，并把 OCR 结果接回 chunks/Markdown。
+
+    ``pdfimport`` 有一条同名上传路径；下载 OA PDF 直接走 ``read_paper``，不能
+    假设一定经过上传模块，否则扫描版 OA 论文会悄悄只有元数据。
+    """
+    from . import ocr, formulas
+    if not ocr.enabled():
+        return 0, None
+    try:
+        pages = ocr.ocr_pdf(path, max_pages=max_pages, paper_id=paper_id)
+    except ocr.OcrUnavailable as exc:
+        return 0, f"OCR 已开启但用不了：{exc}"
+    except Exception as exc:  # noqa: BLE001
+        return 0, f"OCR 失败：{type(exc).__name__}: {exc}"
+    if not pages:
+        return 0, "OCR 未返回可用文本"
+    with db.conn() as c:
+        for page_no, text in pages:
+            c.execute("INSERT OR REPLACE INTO pages(paper_id,page_no,text) VALUES(?,?,?)",
+                      (paper_id, page_no, text))
+        db.reindex_pages(c, paper_id)
+        chunks = db.chunks_from_pages(c, paper_id)
+        db.replace_chunks(c, paper_id, chunks)
+        db.replace_formulas(c, paper_id, [], formulas.PARSER_VERSION)
+        degraded = {"degraded": "OCR text has no PDF character geometry; formula detection and LaTeX are unresolved",
+                     "source": f"ocr:{ocr.MODE}", "formulas": []}
+        db.save_document_artifact(c, paper_id, "formula_audit", formulas.PARSER_VERSION,
+                                  json.dumps(degraded, ensure_ascii=False, indent=2), degraded)
+        rebuild_canonical_markdown(c, paper_id, chunks)
+    return len(pages), f"已用 OCR 补出 {len(pages)} 页正文（引擎：{ocr.MODE}）；OCR 文本可能有错字，公式 LaTeX 未解析"
+
+
+def _ocr_missing_pages(path: str, paper_id: int, missing: list[int],
+                       max_pages: int = 40) -> tuple[int, str | None]:
+    """补混合 PDF 中缺少文本层的页面，保留原生页的结构化 chunks。"""
+    from . import ocr
+    if not ocr.enabled() or not missing:
+        return 0, None
+    try:
+        pages = ocr.ocr_pdf(path, max_pages=max_pages, paper_id=paper_id,
+                            page_numbers=missing)
+    except ocr.OcrUnavailable as exc:
+        return 0, f"混合 PDF OCR 已开启但用不了：{exc}"
+    except Exception as exc:  # noqa: BLE001
+        return 0, f"混合 PDF OCR 失败：{type(exc).__name__}: {exc}"
+    if not pages:
+        return 0, f"有 {len(missing)} 页没有文本层，但 OCR 未返回可用文本"
+    missing_set = {p for p, _ in pages}
+    with db.conn() as c:
+        for page_no, text in pages:
+            c.execute("INSERT OR REPLACE INTO pages(paper_id,page_no,text) VALUES(?,?,?)",
+                      (paper_id, page_no, text))
+        db.reindex_pages(c, paper_id)
+        native = [ch for ch in build_chunks(path, c, paper_id, max_pages=max_pages)
+                  if int(ch.get("start_page") or 0) not in missing_set]
+        ocr_chunks = [ch for ch in db.chunks_from_pages(c, paper_id)
+                      if int(ch.get("start_page") or 0) in missing_set]
+        chunks = native + ocr_chunks
+        db.replace_chunks(c, paper_id, chunks)
+        rebuild_canonical_markdown(c, paper_id, chunks)
+    return len(pages), f"混合 PDF 已用 OCR 补出 {len(pages)}/{len(missing)} 个无文本页面；OCR 文本可能有错字"
+
+
+def _infer_block_type(text: str) -> str:
+    """轻量启发式:区分 formula vs text。表格/figure 走独立路径。
+    文本里出现 \\( \\) 或 \\[ \\] 或 $...$ 视作公式;否则 text。
+    """
+    if not text:
+        return "text"
+    s = text
+    if "\\(" in s or "\\)" in s or "\\[" in s or "\\]" in s:
+        return "formula"
+    if s.count("$") >= 2:  # LaTeX 行内公式 $...$
+        return "formula"
+    if any(c in s for c in ("\\sum", "\\int", "\\prod", "\\partial", "\\infty")):
+        return "formula"
+    return "text"
+
+
+def _stable_chunk_id(ch: dict, index: int) -> str:
+    import hashlib
+    key = "|".join(str(x) for x in (ch.get("block_type") or ch.get("kind"),
+        ch.get("start_page"), ch.get("bbox_x1"), ch.get("bbox_y1"),
+        ch.get("text") or "", index))
+    return "chunk-" + hashlib.sha256(key.encode("utf-8")).hexdigest()[:20]
+
+
+def rebuild_canonical_markdown(c, paper_id: int, chunks: list[dict] | None = None) -> str:
+    """Rebuild canonical Markdown from persisted structured results."""
+    from . import formulas
+    if chunks is None:
+        chunks = [dict(r) for r in c.execute(
+            "SELECT * FROM chunks WHERE paper_id=? ORDER BY chunk_no", (paper_id,)).fetchall()]
+    blocks = []
+    last_section = None
+    for index, ch in enumerate(chunks, 1):
+        block = dict(ch)
+        section = (block.get("section_path") or "").strip()
+        block_kind = block.get("block_type") or block.get("kind") or "text"
+        if section and section != last_section and block_kind not in ("formula", "table", "figure"):
+            blocks.append({
+                "block_id": "heading-" + _stable_chunk_id(
+                    {"kind": "heading", "start_page": block.get("start_page"),
+                     "text": section}, index),
+                "type": "heading", "text": section,
+                "level": max(1, min(section.count(">") + 1, 6)),
+                "page_no": block.get("start_page"),
+                "bbox": [block.get("bbox_x1"), block.get("bbox_y1"),
+                         block.get("bbox_x2"), block.get("bbox_y2")],
+                "source": "section_path", "confidence": 1.0,
+            })
+            last_section = section
+        block.setdefault("block_id", _stable_chunk_id(block, index))
+        block.setdefault("source", "structured")
+        block.setdefault("confidence", 1.0)
+        blocks.append(block)
+    # chunks 只保存检索表示，不保存公式 OCR 的状态/LaTeX 置信度。
+    # 从公式真相表覆盖公式块，避免重建 Markdown 时把已识别公式退化成 warning。
+    formula_rows = [dict(r) for r in c.execute(
+        "SELECT * FROM formulas WHERE paper_id=? ORDER BY page_no,bbox_y1,bbox_x1,id",
+        (paper_id,)).fetchall()]
+    by_block_id = {r["block_id"]: r for r in formula_rows}
+    def _formula_locator(row):
+        return (row.get("page_no"),
+                row.get("bbox_x1"), row.get("bbox_y1"),
+                row.get("bbox_x2"), row.get("bbox_y2"))
+    by_locator = {_formula_locator(r): r for r in formula_rows}
+    for block in blocks:
+        if (block.get("block_type") or block.get("kind")) != "formula":
+            continue
+        row = by_block_id.get(block.get("block_id"))
+        if not row:
+            row = by_locator.get((block.get("start_page"),
+                                  block.get("bbox_x1"), block.get("bbox_y1"),
+                                  block.get("bbox_x2"), block.get("bbox_y2")))
+        if not row:
+            continue
+        block.update({
+            "page_no": row["page_no"],
+            "bbox": [row["bbox_x1"], row["bbox_y1"],
+                     row["bbox_x2"], row["bbox_y2"]],
+            "raw_text": row["raw_text"],
+            "formula_no": row["formula_no"],
+            "source": row["source"],
+            "confidence": row["confidence"],
+            "latex": row["latex"],
+            "latex_confidence": row["latex_confidence"],
+            "status": row["status"],
+        })
+    markdown = formulas.canonical_markdown(blocks)
+    meta = {"blocks": len(blocks), "formulas": sum(1 for b in blocks
+            if (b.get("block_type") or b.get("kind")) == "formula")}
+    db.save_document_artifact(c, paper_id, "canonical_markdown",
+                              formulas.PARSER_VERSION, markdown, meta)
+    return markdown
+
+
+def build_chunks(path: str, c, paper_id: int, max_pages: int = 40) -> list[dict]:
     """按章节切检索单元，表格另行成块；识别不到结构就退化成按页（不抛异常）。
 
     表格必须单独成块并**整行切分、表头跨块重复**：论文里的结果表被页边界或
@@ -132,9 +292,24 @@ def build_chunks(path: str, c, paper_id: int) -> list[dict]:
     （否则同一段文字在库里存两份——真库实测拿表头当查询时，每篇取 5 块有 45%
     的上下文含实质重复）。表题不摘（`chunk_table` 不带表题，摘了就丢了）。
     """
-    from . import structure, tables
+    from . import formulas, structure, tables
     try:
-        found = tables.detect_tables(path)
+        formula_result = formulas.detect_pdf(path, max_pages=max_pages)
+        formula_items, ocr_note = formulas.apply_math_ocr(
+            path, formula_result.get("formulas") or [])
+    except Exception as exc:
+        formula_result = {"formulas": [], "degraded": f"formula detection failed: {exc}"}
+        formula_items, ocr_note = [], None
+    db.replace_formulas(c, paper_id, formula_items, formulas.PARSER_VERSION)
+    db.save_document_artifact(
+        c, paper_id, "formula_audit", formulas.PARSER_VERSION,
+        json.dumps(formula_items, ensure_ascii=False, indent=2),
+        {"degraded": formula_result.get("degraded"), "math_ocr": ocr_note})
+    try:
+        # Merge a table that continues at the top of the next page.  The
+        # detector keeps its historical per-page API by default; chunking is
+        # the place where a continued table must become one searchable object.
+        found = tables.detect_tables(path, merge_pages=True)
     except Exception:
         found = []          # 表格识别失败不影响正文块——正文才是主路径
     try:
@@ -148,10 +323,37 @@ def build_chunks(path: str, c, paper_id: int) -> list[dict]:
                 "section_path": ch.get("section_path") or ch.get("section_title") or "",
                 "level": ch.get("level") or 1,
                 "start_page": ch.get("start_page"), "end_page": ch.get("end_page"),
-                "kind": ch.get("kind") or "text"}
+                "kind": ch.get("kind") or "text",
+                # bbox 来自 PyMuPDF text_block span 索引(章节切片的物理位置)
+                # 没拿到就 None(已有的检索结果照常可用,只是不能反向定位)
+                "bbox_x1": ch.get("bbox_x1"), "bbox_y1": ch.get("bbox_y1"),
+                "bbox_x2": ch.get("bbox_x2"), "bbox_y2": ch.get("bbox_y2"),
+                "block_type": ch.get("block_type") or _infer_block_type(ch.get("text") or "")}
                for ch in cs]
     else:
         out = db.chunks_from_pages(c, paper_id)
+
+    # Formula candidates become their own auditable chunks. Remove exact formula text from
+    # ordinary chunks where possible so retrieval does not receive the same line twice.
+    for item in formula_items:
+        raw = (item.get("raw_text") or "").strip()
+        if raw:
+            for ch in out:
+                if (ch.get("block_type") or ch.get("kind")) in ("text", None):
+                    text = ch.get("text") or ""
+                    if raw in text:
+                        ch["text"] = re.sub(r"\s{3,}", "\n\n", text.replace(raw, "")).strip()
+                    else:
+                        # structure.section_chunks may preserve the same formula with
+                        # line breaks between spans. Remove it by a whitespace-tolerant
+                        # pattern, while leaving the original `pages` evidence intact.
+                        tokens = [re.escape(t) for t in re.split(r"\s+", raw) if t]
+                        if tokens:
+                            pattern = r"\s*".join(tokens)
+                            ch["text"] = re.sub(pattern, "", text,
+                                                count=1, flags=re.IGNORECASE).strip()
+        out.append(formulas.formula_chunk(item))
+    out = [ch for ch in out if (ch.get("text") or "").strip()]
 
     # 已有的表格摘要贴回去：它按表的内容哈希存在 `table_summaries` 里，
     # 不随 chunks 一起被 replace_chunks 换掉，所以重切块之后不用重新花钱买。
@@ -170,26 +372,34 @@ def build_chunks(path: str, c, paper_id: int) -> list[dict]:
                     "section_path": f"表格（第 {t['page_no']} 页）"
                                     + (f" {part['part']}/{part['of']}"
                                        if part.get("of", 1) > 1 else ""),
-                    "level": 1, "start_page": t["page_no"], "end_page": t["page_no"],
-                    "kind": "table"})
+                    "level": 1, "start_page": t["page_no"],
+                    "end_page": t.get("end_page", t["page_no"]),
+                    "kind": "table", "block_type": "table",
+                    "continued": bool(t.get("continued")),
+                    "needs_review": bool(t.get("needs_review")),
+                    "page_bboxes": t.get("page_bboxes") or [],
+                    "bbox_x1": t["bbox"][0], "bbox_y1": t["bbox"][1],
+                    "bbox_x2": t["bbox"][2], "bbox_y2": t["bbox"][3]})
     except Exception:
         pass        # 成块失败就只留正文块
 
-    # 插图：**只有配过说明的图才成块**。没有说明的话，一个块里就只剩图题，
-    # 而图题本来就在正文块里——白占一个检索单元。
+    # 插图：有说明时贴上视觉摘要；没有图题的 raster 图片也先建立一个
+    # 可检索的占位块，后续 figure-summary 生成摘要后重切即可补全语义。
     try:
         from . import figures
         figs = figures.get_many(paper_id)
-        if figs:
-            for f in figures.find_figures(path):
-                s = figs.get(figures.figure_hash(paper_id, f["page_no"], f["caption"]))
-                if not s:
-                    continue
-                out.append({
-                    "text": figures.decorate(f["caption"], s),
-                    "section_path": f"插图 {f['label']}（第 {f['page_no']} 页）",
-                    "level": 1, "start_page": f["page_no"], "end_page": f["page_no"],
-                    "kind": "figure"})
+        for f in figures.find_figures(path):
+            s = figs.get(figures.figure_hash(paper_id, f["page_no"], f["caption"]))
+            if not s and not f.get("uncaptioned"):
+                continue
+            out.append({
+                "text": figures.decorate(f["caption"], s),
+                "section_path": f"插图 {f['label']}（第 {f['page_no']} 页）",
+                "level": 1, "start_page": f["page_no"], "end_page": f["page_no"],
+                "kind": "figure", "block_type": "figure",
+                "uncaptioned": bool(f.get("uncaptioned")),
+                "bbox_x1": f["rect"][0], "bbox_y1": f["rect"][1],
+                "bbox_x2": f["rect"][2], "bbox_y2": f["rect"][3]})
     except Exception:
         pass        # 插图是增强，出问题不影响正文与表格
     return out
@@ -225,9 +435,45 @@ def read_paper(paper_id: int, topic: str | None = None, progress=None) -> dict:
                  for r in c.execute("SELECT page_no,text FROM pages WHERE paper_id=?",
                                     (paper_id,)).fetchall()}
         row = c.execute("SELECT title FROM papers WHERE id=?", (paper_id,)).fetchone()
+    ocr_note = None
+    if not pages:
+        rescued, ocr_note = _ocr_rescue(dl["path"], paper_id)
+        if rescued:
+            with db.conn() as c:
+                pages = {r["page_no"]: r["text"]
+                         for r in c.execute("SELECT page_no,text FROM pages WHERE paper_id=?",
+                                            (paper_id,)).fetchall()}
+            n_pages = rescued
+    else:
+        import pymupdf
+        from . import ocr
+        try:
+            doc = pymupdf.open(dl["path"])
+            missing = [i for i, page in enumerate(doc, 1)
+                       if i <= 40 and i not in pages and not (page.get_text("text") or "").strip()]
+            doc.close()
+        except Exception:
+            missing = []
+        if missing:
+            rescued, ocr_note = _ocr_missing_pages(dl["path"], paper_id, missing)
+            if rescued:
+                with db.conn() as c:
+                    pages = {r["page_no"]: r["text"]
+                             for r in c.execute("SELECT page_no,text FROM pages WHERE paper_id=?",
+                                                (paper_id,)).fetchall()}
+                n_pages = len(pages)
+            elif not ocr.enabled():
+                ocr_note = f"有 {len(missing)} 页没有文本层，未启用 OCR；这些页暂不可检索"
+    if not pages:
+        return {"paper_id": paper_id, "pages_stored": 0, "card": None,
+                "note": (ocr_note + "；" if ocr_note else "") +
+                        "PDF 没有可抽取的文本层；已保留元数据，正文暂不可检索。"
+                        "请设置 PAPERNEST_OCR=local 或 cloud 后重新处理"}
     if not llm.available():
+        base_note = "全文已抽取入库（可在对话中检索引用）"
         return {"paper_id": paper_id, "pages_stored": len(pages),
-                "card": None, "note": "全文已抽取入库（可在对话中检索引用）；L2 精读卡片需要配置 LLM"}
+                "card": None, "note": (ocr_note + "；" if ocr_note else "") +
+                        base_note + "；L2 精读卡片需要配置 LLM"}
 
     if progress:
         progress(0.6, "card", "重档模型生成精读卡片")

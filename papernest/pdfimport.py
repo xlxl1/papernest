@@ -523,6 +523,25 @@ def _pages_count(paper_id: int) -> int:
                          (paper_id,)).fetchone()["n"]
 
 
+def _missing_text_pages(path: str, paper_id: int, max_pages: int = MAX_PAGES) -> list[int]:
+    """Return pages without a native text layer, including mixed PDFs."""
+    import pymupdf
+    with db.conn() as c:
+        stored = {int(r["page_no"]) for r in c.execute(
+            "SELECT page_no FROM pages WHERE paper_id=?", (paper_id,))}
+    doc = pymupdf.open(path)
+    try:
+        missing = []
+        for i, page in enumerate(doc, 1):
+            if i > max_pages:
+                break
+            if i not in stored and not (page.get_text("text") or "").strip():
+                missing.append(i)
+        return missing
+    finally:
+        doc.close()
+
+
 def _refresh_fts(c: sqlite3.Connection, paper_id: int):
     """FTS 是外部内容表，papers 改了必须手工 DELETE+INSERT（同 db.save_card）。"""
     row = c.execute("SELECT title, abstract, card_json FROM papers WHERE id=?",
@@ -774,8 +793,56 @@ def _ocr_rescue(path: str, paper_id: int, warnings: list[str]) -> int:
             c.execute("INSERT OR REPLACE INTO pages(paper_id,page_no,text) "
                       "VALUES(?,?,?)", (paper_id, pno, text))
         db.reindex_pages(c, paper_id)
-        db.replace_chunks(c, paper_id, db.chunks_from_pages(c, paper_id))
+        chunks = db.chunks_from_pages(c, paper_id)
+        db.replace_chunks(c, paper_id, chunks)
+        from . import formulas
+        db.replace_formulas(c, paper_id, [], formulas.PARSER_VERSION)
+        degraded = {
+            "degraded": "OCR text has no PDF character geometry; formula detection and LaTeX are unresolved",
+            "source": f"ocr:{ocr.MODE}", "formulas": []}
+        db.save_document_artifact(c, paper_id, "formula_audit",
+                                  formulas.PARSER_VERSION,
+                                  json.dumps(degraded, ensure_ascii=False, indent=2), degraded)
+        fulltext.rebuild_canonical_markdown(c, paper_id, chunks)
     warnings.append(OCR_APPLIED_NOTE.format(n=len(pages), mode=ocr.MODE))
+    return len(pages)
+
+
+def _ocr_rescue_mixed(path: str, paper_id: int, missing: list[int],
+                      warnings: list[str]) -> int:
+    """OCR only textless pages while retaining structured chunks for text pages."""
+    from . import ocr
+    if not ocr.enabled() or not missing:
+        return 0
+    try:
+        pages = ocr.ocr_pdf(path, max_pages=MAX_PAGES, paper_id=paper_id,
+                            page_numbers=missing)
+    except ocr.OcrUnavailable as e:
+        warnings.append(f"混合 PDF 的 OCR 已开启但用不了：{e}")
+        return 0
+    except Exception as e:  # noqa: BLE001
+        warnings.append(f"混合 PDF OCR 失败：{type(e).__name__}: {e}")
+        return 0
+    if not pages:
+        warnings.append(f"有 {len(missing)} 页没有文本层，但 OCR 未返回可用文本")
+        return 0
+    with db.conn() as c:
+        for pno, text in pages:
+            c.execute("INSERT OR REPLACE INTO pages(paper_id,page_no,text) VALUES(?,?,?)",
+                      (paper_id, pno, text))
+        db.reindex_pages(c, paper_id)
+        # Keep native-PDF section/table chunks and append OCR-only pages as
+        # page chunks; replacing everything with page chunks would degrade the
+        # good layout structure on the other pages.
+        missing_set = {p for p, _ in pages}
+        native = [ch for ch in fulltext.build_chunks(path, c, paper_id, max_pages=MAX_PAGES)
+                  if int(ch.get("start_page") or 0) not in missing_set]
+        ocr_chunks = [ch for ch in db.chunks_from_pages(c, paper_id)
+                      if int(ch.get("start_page") or 0) in missing_set]
+        chunks = native + ocr_chunks
+        db.replace_chunks(c, paper_id, chunks)
+        fulltext.rebuild_canonical_markdown(c, paper_id, chunks)
+    warnings.append(f"混合 PDF 已用 OCR 补出 {len(pages)}/{len(missing)} 个无文本页面；OCR 文本可能有错字")
     return len(pages)
 
 
@@ -790,15 +857,22 @@ def _extract_pages_safe(path: str, paper_id: int, warnings: list[str]) -> int:
         用户会读成「元数据要手工补」，而不是「这份文档整个检索不到」。
         这是本项目最贵的一种静默失败：文件在库里、看起来导入成功了。
     """
+    from . import ocr
     try:
         fulltext.extract_pages(path, paper_id, max_pages=MAX_PAGES)
     except Exception as e:
         warnings.append(f"全文抽页失败（论文元数据已入库）：{e}")
         return 0
     n = _pages_count(paper_id)
-    if n == 0 and _has_text_layer(path) is False:
+    missing = _missing_text_pages(path, paper_id)
+    all_scanned = n == 0 and _has_text_layer(path) is False
+    if all_scanned:
         n = _ocr_rescue(path, paper_id, warnings)
-    if n == 0 and _has_text_layer(path) is False:
+    elif missing:
+        n += _ocr_rescue_mixed(path, paper_id, missing, warnings)
+        if not ocr.enabled():
+            warnings.append(f"有 {len(missing)} 页没有文本层，已跳过；如需补救请设置 PAPERNEST_OCR=local 或 cloud")
+    if n == 0 and all_scanned:
         warnings.append(NO_TEXT_LAYER_WARNING)
     elif n == 0:
         warnings.append("全文抽页得到 0 页（文件可能已损坏或被加密），"

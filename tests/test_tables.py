@@ -122,6 +122,20 @@ def prose_pdf(tmp: Path) -> str:
     return _save(doc, tmp, "prose.pdf")
 
 
+def vector_figure_pdf(tmp: Path) -> str:
+    """Dense vector labels above a caption: must stay a figure, not a table."""
+    doc = pymupdf.open()
+    page = doc.new_page(width=595, height=842)
+    for r in range(8):
+        y = 100 + r * 35
+        for c in range(3):
+            page.insert_text((80 + c * 150, y), f"Node {r}-{c}",
+                             fontsize=8, fontname=PLAIN)
+    page.insert_text((72, 420), "Figure 9: Overview of a taxonomy diagram.",
+                     fontsize=BODY, fontname=PLAIN)
+    return _save(doc, tmp, "vector-figure.pdf")
+
+
 def references_pdf(tmp: Path) -> str:
     """参考文献段：编号列 + 悬挂缩进正文列，x 区间对齐得比真表还整齐。
 
@@ -333,6 +347,10 @@ class DetectTests(_Base):
 
     def test_prose_pdf_has_no_tables(self):
         self.assertEqual(tables.detect_tables(prose_pdf(self.tmp)), [])
+
+    def test_dense_vector_figure_is_not_a_table(self):
+        path = vector_figure_pdf(self.tmp)
+        self.assertEqual(tables.detect_tables(path), [])
 
     def test_reference_list_is_not_mistaken_for_a_table(self):
         """悬挂缩进的参考文献 x 对齐很整齐，是几何兜底的头号误报源。"""

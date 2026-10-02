@@ -12,7 +12,15 @@ import re
 import time
 from pathlib import Path
 
-from . import db, tools
+from . import db, intent as intent_mod, tools
+
+# 意图评测集路径——与 eval_set.json 分开，因为 gold 字段（gold_intent vs gold_keys）
+# 不同；放一起会让 load_eval_set 的断言更难维护。两条入口共用同一个 load_eval_set
+# 机制，但 type=intent 的条目被 metric_intent_routing 单挑出来。
+INTENT_EVAL_SET_PATH = Path(__file__).resolve().parent.parent / "intent_eval_set.json"
+
+# 意图分类的 5 个合法值。metric_intent_routing 用这个做混淆矩阵的轴。
+INTENT_LABELS = ("cite", "survey", "read", "qa", "unknown")
 
 EVAL_SET_PATH = Path(__file__).resolve().parent.parent / "eval_set.json"
 
@@ -24,11 +32,29 @@ _CITE_PAT = re.compile(r"\[\d{1,2}\]")
 
 
 def load_eval_set(path: Path | None = None) -> list[dict]:
-    p = path or EVAL_SET_PATH
+    p = Path(path) if path else EVAL_SET_PATH
     entries = json.loads(p.read_text(encoding="utf-8"))
     for e in entries:
         assert e.get("type") in ("retrieval", "citation", "qa"), f"坏条目：{e.get('id')}"
         assert e.get("gold_keys"), f"{e.get('id')} 缺 gold_keys"
+    return entries
+
+
+def load_intent_eval_set(path: Path | None = None) -> list[dict]:
+    """加载意图评测集。每条必须有 gold_intent 字段（5 类之一）。
+
+    与 eval_set.json 的关键差异：
+    - 没有 gold_keys（意图评测与具体论文无关）
+    - type 字段固定为 "intent"
+    - gold_intent 必须 ∈ INTENT_LABELS
+    """
+    p = Path(path) if path else INTENT_EVAL_SET_PATH
+    entries = json.loads(p.read_text(encoding="utf-8"))
+    for e in entries:
+        assert e.get("type") == "intent", f"意图评测集只接受 type=intent，{e.get('id')} 是 {e.get('type')}"
+        gold = e.get("gold_intent")
+        assert gold in INTENT_LABELS, f"{e.get('id')} gold_intent={gold!r} 不在 {INTENT_LABELS}"
+        assert e.get("query"), f"{e.get('id')} 缺 query"
     return entries
 
 
@@ -110,6 +136,83 @@ def metric_citation(entries: list[dict], top_k: int = 5) -> dict:
         "evidence_verified_rate": round(sum(i["verified_rate"] for i in items) / n, 4),
         "precision_at_k": round(sum(i["precision"] for i in items) / n, 4),
         "top_k": top_k, "n": len(items), "items": items,
+    }
+
+
+def metric_intent_routing(entries: list[dict],
+                        classify=intent_mod.classify) -> dict:
+    """意图分类准确率 + 每类 precision/recall + 5×5 混淆矩阵。
+
+    比 metric_recall 那种「top-K 命中 gold」式评测多一层：
+    - accuracy  : 整体正确率
+    - per_intent: 每个类的 P/R/F1
+    - confusion : 5×5 矩阵，shape=[gold, predicted]，便于一眼看出
+                  cite/survey 之间有没有互相吃（build_plan 注释里讲的
+                  「Survey 标题被读成用户意图」就是这类问题）
+
+    classify 参数化：测试可以注入假分类器；生产用 intent_mod.classify。
+    """
+    items = []
+    confusion = {g: {p: 0 for p in INTENT_LABELS} for g in INTENT_LABELS}
+    for e in entries:
+        got = classify(e["query"])
+        # classify 可返回 Intent（属性访问）/ dict（key 访问）/ str（旧 stub）
+        if hasattr(got, "primary"):
+            predicted = got.primary
+            signals = getattr(got, "signals", [])
+            confidence = getattr(got, "confidence", None)
+        elif isinstance(got, dict):
+            predicted = got.get("primary", "unknown")
+            signals = got.get("signals", [])
+            confidence = got.get("confidence")
+        else:
+            predicted = str(got)
+            signals = []
+            confidence = None
+        gold = e["gold_intent"]
+        ok = (predicted == gold)
+        confusion[gold][predicted] = confusion[gold].get(predicted, 0) + 1
+        items.append({
+            "id": e["id"],
+            "query": e["query"][:60],
+            "gold": gold,
+            "predicted": predicted,
+            "ok": ok,
+            "signals": signals,
+            "confidence": confidence,
+            "category": e.get("category", ""),
+        })
+
+    n = max(len(items), 1)
+    accuracy = round(sum(i["ok"] for i in items) / n, 4)
+
+    # per_intent P/R/F1
+    per_intent = {}
+    for label in INTENT_LABELS:
+        # gold 是 label 的条目
+        gold_n = sum(1 for i in items if i["gold"] == label)
+        # predicted 是 label 的条目
+        pred_n = sum(1 for i in items if i["predicted"] == label)
+        # 命中
+        tp = sum(1 for i in items if i["gold"] == label and i["predicted"] == label)
+        precision = round(tp / pred_n, 4) if pred_n else 0.0
+        recall = round(tp / gold_n, 4) if gold_n else 0.0
+        f1 = round(2 * precision * recall / (precision + recall), 4)             if (precision + recall) else 0.0
+        per_intent[label] = {
+            "gold_n": gold_n, "pred_n": pred_n, "tp": tp,
+            "precision": precision, "recall": recall, "f1": f1,
+        }
+
+    worst = sorted([i for i in items if not i["ok"]],
+                   key=lambda i: i.get("confidence") or 0)[:5]
+
+    return {
+        "accuracy": accuracy,
+        "n": len(items),
+        "per_intent": per_intent,
+        "confusion": confusion,
+        "worst_items": worst,
+        "items": items,
     }
 
 
@@ -235,6 +338,14 @@ def run_eval(k: int = 5, run_qa: bool = False, limit: int | None = None,
         "retrieval_metric": metric_recall(keyword, k, retrieve),
         "citation": metric_citation([e for e in entries if e["type"] == "citation"], k),
     }
+    # 意图评测独立加载——不与 retrieval/citation/qa 共用一套数据，避免某条 gold
+    # 缺失把整个 run 拖红。找不到文件就跳过（评测集是可选的）。
+    intent_path = Path(__file__).resolve().parent.parent / "intent_eval_set.json"
+    if intent_path.exists():
+        intent_entries = load_intent_eval_set(intent_path)
+        report["intent_routing"] = metric_intent_routing(intent_entries)
+    else:
+        report["intent_routing"] = {"skipped": "intent_eval_set.json 不存在"}
     if natural:
         report["retrieval_metric_natural"] = metric_recall(natural, k, retrieve)
         report["form_gap"] = round(
@@ -292,3 +403,16 @@ def print_report(r: dict) -> None:
                   f"（{qa.get('quotes_total', 0)} 句）"
                   f" | 入选后被摘要判为不相关而剔除 {qa.get('filtered_out', 0)} 篇"
                   f"（重排未选中 {qa.get('not_selected', 0)} 篇属正常落选）")
+    intent = r.get("intent_routing", {})
+    if intent.get("skipped"):
+        print(f"\n④ 意图路由          : 跳过——{intent['skipped']}")
+    else:
+        print(f"\n④ 意图路由          : accuracy {intent['accuracy']}（{intent['n']} 条）")
+        for label in ("cite", "survey", "read", "qa", "unknown"):
+            pi = intent["per_intent"].get(label, {})
+            if pi.get("gold_n", 0) == 0 and pi.get("pred_n", 0) == 0:
+                continue
+            print(f"    {label:8s} P={pi['precision']:.2f} R={pi['recall']:.2f} F1={pi['f1']:.2f}"
+                  f"  (gold={pi['gold_n']} pred={pi['pred_n']} tp={pi['tp']})")
+        for w in intent.get("worst_items", [])[:3]:
+            print(f"    ✗ {w['id']} gold={w['gold']} pred={w['predicted']} {w['query']!r}")

@@ -1,279 +1,279 @@
-<div align="center">
-
 # PaperNest · 文巢
 
-**个人科研文献 Agent：搜文献 · 读文献 · 攒文献 · 引文献 · 写文献**
+PaperNest 是一个面向个人研究者的本地科研文献工作台。它把文献搜索、PDF 解析、证据检索、引文网络和受约束写作放在同一个本地项目中。
 
-让 LLM 只负责语义理解与生成，让确定性程序负责流程边界、证据约束和故障处理。
+项目的核心原则是：模型负责语义理解和生成，程序负责文件校验、版面解析、证据定位、状态流转、缓存和错误报告。模型生成的摘要、图像说明和表格说明都会标记为模型内容，不能冒充论文原文。
 
-[![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](#)
-[![Tests](https://img.shields.io/badge/tests-1165%20passed-2f6f4f)](#-tests)
-[![License](https://img.shields.io/badge/license-MIT-blue)](#license)
-[![Stars](https://img.shields.io/github/stars/xlxl1/papernest?style=social)](#)
+## 当前能力
 
-[English](#) · [简体中文](#) · [功能](#-功能) · [快速开始](#-快速开始) · [架构](#-架构) · [评测](#-评测) · [路线图](#-路线图)
+- 从 Semantic Scholar、OpenAlex、arXiv 或本地文件导入论文。
+- 支持 PDF、Word、PPT、HTML、Markdown、纯文本和 BibTeX/RIS/Zotero CSV。
+- 按 DOI、arXiv ID、标题归一化和文件 SHA-256 去重。
+- 使用 SQLite、FTS5 和可选 embedding 实现关键词、向量和混合检索。
+- 支持章节级检索块、页级证据、跨语言候选召回、PRF 补充检索和 RCS 重排。
+- 提供 Plan-Execute-Replan Agent，支持意图分类、澄清问题、有限状态执行、失败重试和过程追踪。
+- 支持多轮问答、引用编号固定、引用白名单和机械证据回取。
+- 支持选题、列大纲、撰写、评审、润色和导出 Markdown/DOCX 的写作流程。
+- 支持引文网络、缺口分析、跨论文矩阵和 Obsidian 导出。
+- 提供 Web 界面、REST API、SSE 任务进度和 Docker 启动方式。
 
-</div>
+## PDF 处理流程
 
----
+1. 校验 PDF 魔数、文件大小和内容哈希，抽取标题、作者、摘要、DOI 和 arXiv ID。
+2. 使用 PyMuPDF 读取文本层，按页保存原文，并按章节生成检索块。
+3. 整份扫描 PDF 或混合 PDF 的无文本页面可以使用 OCR。OCR 文本会标记为“非文本层”。
+4. 识别摘要单栏、正文双栏、跨栏图表等版面结构；结构失败时会退化为按页切分并报告降级。
+5. 检测公式候选并保存页码、bbox、原始文本和置信度。LaTeX 识别需要额外数学 OCR 插件。
+6. 识别有图注的矢量图和无图注的嵌入位图。无图注图片先以占位图块进入检索，之后可以补视觉摘要。
+7. 识别带框线和无框线表格，支持有明确表题的两列表格、跨页续表和表头重复。复杂合并单元格保留复核标记。
+8. 将正文、公式、表格和图片分别写入检索块，保存页码、章节、bbox、来源和块类型。
+9. 通过 FTS5 和可选向量索引检索；向量不可用时会明确报告降级状态。
 
-> **设计哲学**：核心成本结构是「每篇论文只让 LLM 精读一次，之后全部走缓存与 RAG」。
-> Agent 不是「让多个模型自由讨论」，而是**以证据约束为中心、由确定性工作流控制 LLM 不确定性**的 Research Agent 系统。
+详细说明见 [PDF 处理与 OCR 配置](docs/pdf-backends.md)。
 
-## 这是什么
+## 快速开始
 
-PaperNest 是一个面向**个人研究者**的本地文献工作台，解决「文献来源分散、检索不准、生成内容难以核验、长流程容易中断」这四个问题。它把学术 API、本地 PDF、BibTeX/RIS/Zotero 导入统一到一个本地库里，提供：
-
-- **检索**：向量 + FTS 的 RRF 混合、章节级 chunk 检索、迭代检索（PRF 补位）
-- **阅读**：PyMuPDF 按章节/按页解析、表格与插图识别、版面结构还原、扫描件 OCR
-- **入库**：单 PDF / 目录递归 / BibTeX / RIS / Zotero CSV，按内容去重
-- **引文网络**：阅读缺口、共被引 / 文献耦合推荐
-- **写作**：五 Agent 流水线（选题 / 大纲 / 撰写 / 文献 / 润色），引用白名单 + 机械回取校验
-- **多轮对话**：服务端会话记忆，会话内 `[n]` 编号固定指代同一篇论文
-
-**不做什么**：不做多租户、不做协同编辑、不训练基础模型、不接入外部写作平台——边界钉在本机单用户。
-
-## ✨ 功能
-
-### Agent 与编排
-- 确定性 Router / Planner（不把工具名/参数丢给 LLM 自由组合）
-- 工具注册表，5 个工具（search / read / cite / ask / write），有界状态机执行
-- 步骤级超时（协作式取消）+ 瞬态故障 4 次抖动退避
-- 异步任务表 + SSE 实时进度（含心跳保活）+ 轨迹落库可回放
-
-### 检索
-- **RRF 混合检索**（默认）：向量排序 + FTS 词面排序融合
-- **章节级 chunk 检索**（`PAPERNEST_CHUNK_SEARCH=1`，默认开）
-- **迭代检索（PRF）**：派生查询「只补位」不抢主排序
-- **查询形态无关**：关键词串与自然语言形态 Recall@5 一致
-- **降级信号透明**：向量不可用时如实上报，不会静默退化成纯 FTS
-
-### 解析与入库
-- **多格式入库**：PDF / Word / PPT / HTML / Markdown / 纯文本
-- **章节切分**：等上下文预算下证据召回是按页切的 **2.2~3.2 倍**（n=69 配对检验 p=0.0013）
-- **表格感知**：整行切分不截断、表头跨块重复
-- **元数据抽取**：版面启发式抽标题/DOI/arXiv，抽不出就如实留空 + warnings
-- **去重**：sha256 + norm_key（DOI/arXiv/标题归一）双重去重
-- **OCR**：可选本地 RapidOCR（离线）或 DashScope 云端
-
-### 评测与证据
-- 自建评测集 **82 条**（32 关键词串 + 32 自然语言 + 10 QA + 8 引用）
-- QASPER 公开基准接入（`paper_hit@k` + `evidence_recall@sec_k` 两层）
-- 证据句**机械回取校验**（按页 / 按节原文逐字找回）
-- 三指标评测脚本：`python cli.py eval`
-
-### 写作流水线
-- **选题 Agent**：候选带 `[n]` 证据
-- **大纲 Agent**：机械校验备注
-- **撰写 Agent**：节级内容寻址缓存（改别处不重跑已完稿节）
-- **评审 Agent**：总评 + 1-10 分 + major/minor 分级 + 可执行建议
-- **润色 Agent**：保留事实与 `[n]` 编号，给出逐条修改说明
-- **终检**：悬空/未核验编号、待补证据数、字数、引用核验率 — 全部机械可算
-- **学术诚信红线**：引用白名单杜绝编造参考文献，导出稿声明 AI 参与范围
-
-### 工程化
-- 单页 Web 界面（`web/index.html`，零依赖）+ REST API
-- 异步任务（SQLite 任务表）+ SSE 实时进度 + 心跳保活
-- token / latency / cost 逐次落账
-- 每日 token 闸门（防失控循环烧额度）
-- 日志：单文件轮转 + traceback
-- Docker 一键启动（数据挂卷，key 从宿主机 `.env` 注入）
-
-## 🚀 快速开始
+要求 Python 3.10 或更高版本。
 
 ```bash
-# 1. 安装依赖
 pip install -r requirements.txt
-
-# 2. 复制配置（需要真卡片就填 LLM_API_* 和 S2_API_KEY）
 cp .env.example .env
-
-# 3. 三步跑起来
-python cli.py verify                            # 第 0 步：复测基础能力
-python cli.py ingest "你的课题关键词" --limit 20  # 拉文献进库
-python cli.py serve                              # 打开 http://127.0.0.1:8765
+python cli.py --help
 ```
 
-> **不开 LLM 也能跑**：`EMBED_MODEL=` 留空即强制纯 FTS 口径（0 token、0 外网）。本机自用默认绑 127.0.0.1、无需 API key。
+本机演示不需要启动 Milvus，可以在 `.env` 中设置：
 
-### Docker
+```env
+PAPERNEST_VECTOR_BACKEND=numpy
+```
+
+没有 LLM 或 embedding 时，项目仍可以使用 FTS 关键词检索：
+
+```env
+EMBED_MODEL=
+```
+
+导入本地 PDF：
 
 ```bash
-PAPERNEST_API_KEY=your-ascii-password docker compose up --build
-# 打开 http://localhost:8765
+python cli.py import-pdf ./papers --no-cards
 ```
 
-> 容器内 uvicorn 必然绑 0.0.0.0，所以这里**强制要求**口令（ASCII）；本机自用又不想设口令就显式写 `PAPERNEST_ALLOW_NO_AUTH=1`。
-
-### 已有 PDF / Zotero 导入
+检查配置、索引和检索：
 
 ```bash
-python cli.py import-pdf ~/papers/                  # 本地 PDF 入库（按内容去重）
-python cli.py import-bib zotero-export.bib          # BibTeX / RIS / Zotero CSV
-python cli.py graph fetch --limit 30                # 拉引文边
-python cli.py graph gaps                            # 找出「被库内多篇引用、但自己不在库里」的论文
+python cli.py health
 ```
 
-### 写作流水线
+启动 Web 服务：
 
 ```bash
-python cli.py write "大模型 Agent 的评测方法研究"     # 选题 Agent（候选带 [n] 证据）
-python cli.py write-pick <run_id> 1                  # 检查点①：按候选序号定题 → 大纲
-python cli.py write-go <run_id>                      # 检查点②：逐节撰写⇄文献白名单⇄评审重写
-python cli.py write-finish <run_id>                  # 润色 + 机械终检 + 导出 md/docx
+python cli.py serve
 ```
 
-## 🏗 架构
+默认访问地址为 `http://127.0.0.1:8765`。如果绑定非回环地址，必须设置 ASCII 格式的 `PAPERNEST_API_KEY`。
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                        Web (单页 HTML)  +  REST API                   │
-│                  /api/papers · /api/agent/run · SSE                  │
-└────────────┬──────────────────────────┬─────────────────────────────┘
-             │                          │
-   ┌─────────▼──────────┐    ┌─────────▼──────────┐
-   │      Agent 层       │    │     RAG / 检索     │
-   │  Router · Planner  │    │   RRF 混合         │
-   │  工具注册 (5个)     │◄──►│   chunk 检索       │
-   │  有界状态机执行     │    │   PRF 补位         │
-   │  协作式取消          │    │   跨语言候选命中    │
-   └─────────┬──────────┘    └─────────┬──────────┘
-             │                          │
-   ┌─────────▼──────────────────────────▼──────────┐
-   │              数据层（SQLite + FTS5）            │
-   │  papers · chunks · tables · figures · llm_calls │
-   │  jobs · projects · notes · graph · chat_history │
-   └─────────┬──────────────────────────┬──────────┘
-             │                          │
-   ┌─────────▼──────────┐    ┌─────────▼──────────┐
-   │    向量后端         │    │   外部 API 适配    │
-   │  Milvus（默认）    │    │   OpenAI 兼容接口  │
-   │  Chroma / NumPy    │    │   S2 · OpenAlex · arXiv │
-   └────────────────────┘    └────────────────────┘
-```
-
-**几个关键设计**：
-
-- **检索与组装分离**：检索返回结构化命中（带页码/章节），组装上下文按口径选单元（默认 page，可切 chunk）。检索单元改章节块后做过三臂配对实测，结论与预期相反——见 [`docs/architecture.md`](docs/architecture.md)。
-- **缓存与降级**：所有 LLM 调用按 `(prompt 版本, 节标题, ...)` 哈希缓存；embedding 模型换了先用同一文本重嵌一篇做一致性检测（余弦 ≥0.98 原地迁移）。
-- **降级透明**：检索降级为纯 FTS 时返回字段里写明 `degraded` 与原因，不让调用方靠 mode 字符串猜。
-
-## 🔧 配置
-
-主要环境变量（完整列表见 `.env.example`）：
-
-| 变量 | 必填 | 说明 |
-|------|------|------|
-| `LLM_API_BASE` | ✅ | OpenAI 兼容端点 |
-| `LLM_API_KEY` | ✅ |  |
-| `LLM_MODEL` | ✅ | 默认模型 |
-| `LLM_MODEL_HEAVY` |  | 复杂任务（综述/评审）使用的强模型 |
-| `EMBED_MODEL` |  | 留空 = 强制纯 FTS 口径 |
-| `EMBED_API_BASE` |  | 单独配（chat 端点常无 `/embeddings` 路由） |
-| `EMBED_API_KEY` |  | 不填则回退 `DASHSCOPE_API_KEY` → `LLM_API_KEY` |
-| `S2_API_KEY` |  | Semantic Scholar，不填走共享池（限流更严） |
-| `RESEARCH_TOPIC` |  | 卡片「与我课题的关系」一栏的上下文 |
-| `PAPERNEST_API_KEY` |  | 绑非回环地址时**强制要求**（ASCII） |
-| `PAPERNEST_DAILY_TOKEN_BUDGET` |  | 防失控烧额度，默认 3,000,000 |
-| `PAPERNEST_CHUNK_SEARCH` |  | L2 全文进全库检索（默认 1） |
-
-## 📊 评测
-
-> **前提**：`.env` 里 `LLM_API_*` 配齐且 `cli.py embed` 跑过后，`PAPERNEST_VECTOR_BACKEND=milvus` 默认配置。EMBED_MODEL 留空即纯 FTS 口径。
-
-| 评测口径 | 维度 | 数值 |
-|---|---|---|
-| 自建集 82 条 Recall@5（线上向量+FTS） | 503 篇库 | **0.9740** |
-| 自建集 Recall@5（纯 FTS 兜底） | 同上 | 0.7552 |
-| QASPER hit@1（88 题） | 块级权重 0.2 | **0.5455** |
-| QASPER hit@5 | 同上 | 0.7045 |
-| 引用证据核验率（自建集 8 条） | 机械回取 | **0.85** |
-| 无证据率 | 越低越好 | 0.30 |
-| 自动化测试 | 全部离线确定性 | **1165 条** |
-
-详细评测报告（含 A/B 对照、跨语言、配对检验）见 [`docs/eval.md`](docs/eval.md)。
-
-## 🛠 开发
+## 常用命令
 
 ```bash
-# 跑测试（全部离线确定性，不联网不花钱）
-PYTHONPATH=. python -m unittest discover -s tests -t tests
+# 导入 PDF、目录或多个 PDF
+python cli.py import-pdf paper.pdf
+python cli.py import-pdf ./papers --topic "大模型 Agent 评测"
 
-# 评测（需要配 .env 后跑一次 cli.py embed）
-python cli.py eval                  # 检索 + 引用
-python cli.py eval --qa             # 加测无证据率（调真模型）
-python cli.py qasper eval           # QASPER 公开基准
+# 读取论文并生成精读卡片
+python cli.py read <paper_id> --topic "我的研究方向"
 
-# 格式与白名单
-git diff --cached --check           # 检查空白字符与冲突标记
-git status --short                  # 确认没有 .env、数据库或 PDF
+# 关键词或自然语言问答
+python cli.py ask "这篇论文的主要方法是什么？"
+python cli.py ask --deep "不同方法的实验差异是什么？"
+python cli.py ask --rcs "哪些论文支持这个结论？"
+
+# 公式、结构和规范化 Markdown
+python cli.py formulas <paper_id>
+python cli.py structure <paper_id>
+python cli.py pdf-markdown <paper_id>
+
+# 表格和图片增强
+python cli.py table-summary
+python cli.py figure-summary
+python cli.py enrich
+
+# 重切块和建立向量
+python cli.py rechunk
+python cli.py vec status
+python cli.py vec embed-chunks --dry-run
+python cli.py vec embed-chunks
+python cli.py vec rebuild
+
+# BibTeX、RIS、Zotero CSV 和引文网络
+python cli.py import-bib export.bib
+python cli.py graph fetch --limit 30
+python cli.py graph gaps
+
+# 评测
+python cli.py eval
+python cli.py qasper eval
 ```
 
-**提交规范**：`<type>(<scope>): <subject>`，类型包括 `feat` / `fix` / `docs` / `refactor` / `test` / `chore`。
+表格摘要和图片摘要默认只试算，不调用模型。确认配置和费用后再加 `--apply`：
 
-## 🗺 路线图
+```bash
+python cli.py table-summary --apply
+python cli.py figure-summary --apply
+python tools/migrate_chunks.py --apply
+python cli.py vec embed-chunks
+```
 
-按「价值/实现成本」排序，来自对 PaperQA2 / STORM / papersgpt / gpt-researcher / react-pdf-highlighter / ragas 的对比调研：
+## 配置
 
-1. **RCS 检索增强** — ✅ 已落地（LLM 重排 + 逐篇定向摘要 + 机械回取校验）
-2. **ragas 式 faithfulness 指标** — 把回答拆成 claim 逐条对照上下文
-3. **PDF 高亮标注 + 选中即问**（react-pdf-highlighter 风格）
-4. **Zotero 单向导入 + note 写回**（pyzotero，412 冲突重试）
-5. **MCP server 输出**：把检索/问答/引文网络暴露为 MCP 工具
-6. **Undermind 式检索 Agent**：LLM 相关性评审 + 覆盖率停止条件
-7. **STORM 视角引导的综述规划**
+完整模板在 [.env.example](.env.example)。常用配置如下：
 
-**不做**：多租户、多人协同编辑、训练基础模型、外部写作平台对接。
+| 变量 | 作用 |
+|---|---|
+| `LLM_API_BASE` | OpenAI 兼容的 `/chat/completions` 地址 |
+| `LLM_API_KEY` | LLM API 密钥 |
+| `LLM_MODEL` | 普通任务模型 |
+| `LLM_MODEL_HEAVY` | 精读、评审等复杂任务模型 |
+| `EMBED_API_BASE` | embedding API 地址，可与 chat 分开 |
+| `EMBED_API_KEY` | embedding API 密钥 |
+| `EMBED_MODEL` | embedding 模型；留空则使用 FTS |
+| `PAPERNEST_VECTOR_BACKEND` | `numpy` 或 `milvus` |
+| `PAPERNEST_VECTOR_FALLBACK` | 设置为 `1` 时，Milvus 不可用可降级到 numpy |
+| `PAPERNEST_OCR` | `off`、`local`、`cloud` 或 `auto` |
+| `PAPERNEST_OCR_DPI` | OCR 渲染分辨率，默认 200 |
+| `PAPERNEST_OCR_CLOUD_MODEL` | 云端 OCR 模型 |
+| `PAPERNEST_MATH_OCR_MODULE` | 提供 `recognize_formula()` 的数学 OCR 模块 |
+| `PAPERNEST_VISION_MODEL` | 图片视觉摘要模型，默认关闭 |
+| `S2_API_KEY` | Semantic Scholar API 密钥，可选 |
+| `RESEARCH_TOPIC` | 精读卡片中的研究方向上下文 |
+| `PAPERNEST_API_KEY` | 对外绑定地址时的服务访问口令 |
 
-## 📁 仓库结构
+### OCR
+
+本地 OCR 使用 RapidOCR：
+
+```bash
+pip install rapidocr_onnxruntime
+```
+
+```env
+PAPERNEST_OCR=local
+```
+
+云端 OCR 需要 `LLM_API_BASE`、`LLM_API_KEY` 和支持图片输入的视觉端点：
+
+```env
+PAPERNEST_OCR=cloud
+PAPERNEST_OCR_CLOUD_MODEL=qwen-vl-ocr-latest
+```
+
+普通 OCR 不能可靠生成公式 LaTeX。数学 OCR 模块的接口是：
+
+```python
+def recognize_formula(png_bytes: bytes, item: dict) -> dict:
+    return {"latex": r"\frac{a}{b}", "confidence": 0.95}
+```
+
+### 复杂 PDF
+
+当前默认解析器是 PyMuPDF，适合普通文本层 PDF。扫描件、公式密集页、复杂跨栏表格和没有图注的纯矢量图可以使用外部解析器辅助：
+
+- [Marker](https://github.com/datalab-to/marker)：适合多栏、公式、图片和表格综合解析。
+- [MinerU](https://github.com/opendatalab/MinerU)：适合扫描件、复杂版面和结构化表格。
+
+外部解析器负责生成页面 block、bbox、表格行和置信度，PaperNest 继续负责检索、引用、向量和审计。
+
+## 系统结构
+
+```text
+Web / REST API / CLI
+          │
+          ▼
+Agent：意图分类 → 计划 → 工具执行 → 结果检查 → 重规划
+          │
+          ├── 文献来源：S2 / OpenAlex / arXiv / 本地文件
+          ├── 文档处理：PyMuPDF / OCR / 公式 / 图片 / 表格
+          ├── 检索：SQLite FTS5 + embedding + RRF + PRF + RCS
+          ├── 证据：页码、章节、bbox、机械回取
+          └── 写作：选题、提纲、撰写、评审、润色、导出
+```
+
+SQLite 是论文、页文本、检索块、公式审计、摘要、任务和向量原始数据的主存储。numpy 适合单机和中小规模数据；Milvus 适合生产部署和大规模向量检索。
+
+## 评测与验证
+
+当前代码库包含离线确定性测试和 PDF 回归测试。最近一次验证结果：
+
+- 完整测试：1557 项通过。
+- OCR、PDF 导入、表格和图片专项测试：117 项通过。
+- `python -m compileall -q .` 通过。
+- `python cli.py --help` 和核心模块导入通过。
+- numpy 向量后端健康检查：配置、索引、embedding、检索 4 项通过。
+
+评测命令会读取本地评测集；使用真实 LLM 或 embedding 时会产生网络请求和费用：
+
+```bash
+python cli.py eval
+python cli.py eval --qa
+python cli.py qasper eval
+```
+
+## 已知边界
+
+- 默认全文处理前 40 页，单个 PDF 上限 50 MB。
+- OCR 文本可能出现错字，引用时应回看原 PDF。
+- 公式候选检测已经实现，LaTeX 需要单独配置数学 OCR。
+- 无图注的纯矢量图没有 image bbox，需要 Marker/MinerU 等版面模型。
+- 复杂合并单元格会保留人工复核标记，不会自动填入未知值。
+- 图片视觉摘要和表格自然语言摘要需要额外的 LLM/视觉模型配置。
+- 新环境没有 embedding 配置时只能使用 FTS；已有向量数据库不会随源码提交。
+
+## 项目结构
 
 ```text
 papernest/
-├── papernest/          # 核心 Python 包：检索 / RAG / Agent / 写作 / 导入
+├── papernest/          # 核心 Python 包
 │   ├── api.py          # FastAPI 路由
-│   ├── agent.py        # Router / Planner / 工具注册 / 状态机
-│   ├── rag.py          # RRF 混合检索 + chunk 检索 + PRF
-│   ├── chunkembed.py   # 章节块向量
-│   ├── writing.py      # 写作流水线（五 Agent）
-│   ├── chat.py         # 服务端多轮对话记忆
-│   ├── pdfimport.py    # 本地 PDF 入库
-│   ├── bibimport.py    # BibTeX / RIS / Zotero CSV 导入
-│   ├── graph.py        # 引文网络
-│   ├── milvusstore.py  # Milvus 向量后端
-│   └── sources/        # 外部 API 适配（arxiv / s2 / openalex）
-├── web/index.html      # 单页 Web 界面
+│   ├── agent.py        # Agent 状态机和工具编排
+│   ├── rag.py          # 混合检索、PRF、上下文组装
+│   ├── pdfimport.py    # PDF 校验、元数据、OCR 入库
+│   ├── fulltext.py     # 页文本、章节块和规范化 Markdown
+│   ├── structure.py    # 章节、单双栏和正文结构
+│   ├── tables.py       # 表格识别与行级切分
+│   ├── figures.py      # 图注和无图注图片识别
+│   ├── formulas.py     # 公式候选和数学 OCR 接口
+│   ├── ocr.py          # RapidOCR / 云端 OCR
+│   ├── vectorstore.py  # numpy / Chroma / Milvus 抽象
+│   └── sources/        # S2、OpenAlex、arXiv 适配器
+├── web/                # 单页 Web 界面
 ├── tests/              # 离线确定性测试
-├── tools/              # 数据迁移 / 评测辅助脚本
+├── tools/              # 迁移、评测和 OCR 工具
 ├── cli.py              # 命令行入口
 ├── requirements.txt
+├── Dockerfile
 ├── docker-compose.yml
-└── .env.example        # 配置模板（不含密钥）
+├── docker-compose.milvus.yml
+└── .env.example        # 不含密钥的配置模板
 ```
 
-数据、PDF、向量索引、上传文件和评测报告保存在 `data/`，已由 `.gitignore` 统一排除。
+运行数据、数据库、PDF、向量索引、日志和评测报告保存在 `data/`，由 `.gitignore` 排除。上传项目时不要提交 `.env`、`.env.bak*`、`data/`、`.tmp/`、`__pycache__/` 和 `.git/`。
 
-## 🤝 贡献
+## Docker
 
-欢迎提 Issue / PR。本仓库不接受任何形式的：
+本机服务：
 
-- **编造的实验数据或文献**（本项目以引用白名单杜绝）
-- **绕过机械回取校验** 的 PR
-- **静默改变默认行为** 而不在 PR 描述里说明
+```bash
+PAPERNEST_API_KEY=your-ascii-password docker compose up --build
+```
 
-提交前请跑通本地测试，并确保 `git status --short` 干净。
+生产向量后端：
 
-## 📄 License
+```bash
+docker compose -f docker-compose.yml -f docker-compose.milvus.yml up --build -d
+```
+
+Docker 会把 `data/` 挂载到容器中。服务默认只绑定 `127.0.0.1`；对外提供服务时必须设置访问口令并自行配置反向代理或端口暴露。
+
+## License
 
 [MIT](LICENSE)
-
-## 🙏 致谢
-
-设计参考：[PaperQA2](https://github.com/Future-House/paper-qa) · [STORM](https://github.com/stanford-oval/storm) · [papersgpt](https://github.com/papersgpt/papersgpt) · [gpt-researcher](https://github.com/assafelovic/gpt-researcher) · [react-pdf-highlighter](https://github.com/agentcooper/react-pdf-highlighter) · [ragas](https://github.com/explodinggradients/ragas) · [QASPER](https://arxiv.org/abs/2105.09611)
-
-向量库：[Milvus](https://milvus.io/) · 解析：[PyMuPDF](https://github.com/pymupdf/PyMuPDF) · LLM 端点：[DashScope](https://dashscope.aliyun.com/) · [OpenAI](https://openai.com/) · [Ollama](https://ollama.com/)
-
----
-
-<div align="center">
-<sub>如果 PaperNest 帮到了你的研究，给个 ⭐ 是最好的反馈</sub>
-</div>

@@ -35,6 +35,34 @@ def _vector_candidates(q: str, top_k: int
     return res.ids, list(res.degraded), dict(res.chunk_hits or {})
 
 
+def _source_locator(hits: list[dict] | None) -> dict:
+    """把本轮最靠前的块命中压成前端可消费的原文定位信息。"""
+    if not hits:
+        return {}
+    keys = ("bbox_x1", "bbox_y1", "bbox_x2", "bbox_y2")
+
+    def valid_bbox(h: dict) -> bool:
+        values = [h.get(k) for k in keys]
+        return (all(isinstance(v, (int, float)) and math.isfinite(v)
+                    for v in values)
+                and values[2] > values[0] and values[3] > values[1])
+
+    hit = next((h for h in hits
+                if h.get("start_page") is not None and valid_bbox(h)), None)
+    hit = hit or next((h for h in hits if h.get("start_page") is not None), None)
+    if not hit:
+        return {}
+    out = {
+        "chunk_no": hit.get("chunk_no"),
+        "start_page": hit.get("start_page"),
+        "section_path": hit.get("section_path") or "",
+        "block_type": hit.get("block_type") or "text",
+    }
+    if valid_bbox(hit):
+        out["bbox"] = [hit.get(k) for k in keys]
+    return out
+
+
 #: 页面取词：ASCII 按词，CJK 按 2-gram。原来是 `q.split()`——中文问句没有空格，
 #: 整句被当成一个「词」，拿去 `t.count()` 数英文正文恒为 0，于是中文提问时
 #: L2 全文页**永远**进不了上下文（实测：库内 45 篇有全文的论文里 40 篇正文是英文）。
@@ -504,7 +532,8 @@ def prepare(messages: list[dict], top_k: int = 5,
                 page_notes.append(note)
             blocks.append(paper_block)
             sources.append({"idx": i, "paper_id": pid, "title": r["title"],
-                            "year": r["year"], "venue": r["venue"]})
+                            "year": r["year"], "venue": r["venue"],
+                            **_source_locator(chunk_hits.get(pid))})
     sources.sort(key=lambda s: s["idx"])
     context = "\n\n".join(blocks) or "（库内没有检索到相关文献）"
     sys = SYSTEM

@@ -85,7 +85,7 @@ def model_warning(model: str | None = None) -> str:
 #: 渲染 DPI。实测 300 对本地引擎没有改善而耗时 1.7 倍，所以 200 是默认。
 DPI = config._env_int(200, "PAPERNEST_OCR_DPI", minimum=72)
 
-#: `off`（默认）/ `local`（RapidOCR）/ `cloud`（qwen-vl-ocr）。
+#: `off`（默认，不触发 OCR）/ `auto`（扫描件自动走 OCR）/ `local`（强制本地 RapidOCR）/ `cloud`（强制云端 qwen-vl-ocr）。
 MODE = (os.environ.get("PAPERNEST_OCR", "off") or "off").strip().lower()
 
 #: 单页实测用量（合成扫描件，qwen-vl-ocr-latest，200 DPI）：8 页共 38,731 token。
@@ -118,7 +118,13 @@ def available() -> dict:
 
 
 def enabled() -> bool:
-    return MODE in ("local", "cloud")
+    """OCR 是否启用: local / cloud / auto 都视为启用。
+    - local:本地 RapidOCR(快但精确率低些)
+    - cloud:云端 qwen-vl-ocr(准但要钱)
+    - auto:文本扫描路由模式——抽页得到 0 页且确认无文本层时**自动**走 OCR;
+      用户没说话但有扫描件时不再静默失败。
+    """
+    return MODE in ("local", "cloud", "auto")
 
 
 def estimate(n_pages: int, mode: str | None = None) -> dict:
@@ -200,10 +206,12 @@ def ocr_cloud(png: bytes, model: str | None = None,
 
 
 def ocr_pdf(pdf_path: str, max_pages: int = 50, mode: str | None = None,
-            progress=None, paper_id: int | None = None) -> list[tuple[int, str]]:
-    """整份 PDF 逐页 OCR，返回 `[(page_no, text)]`（空页会被丢掉）。
+            progress=None, paper_id: int | None = None,
+            page_numbers: list[int] | None = None) -> list[tuple[int, str]]:
+    """逐页 OCR，返回 `[(page_no, text)]`（空页会被丢掉）。
 
     **单页失败不中断**：扫描件里夹一张纯图的插页很常见，为它丢掉整份不值。
+    ``page_numbers`` 用于混合 PDF，只补没有文本层的页，避免重复 OCR 已有文本。
     """
     import pymupdf
     m = (mode or MODE).lower()
@@ -217,7 +225,9 @@ def ocr_pdf(pdf_path: str, max_pages: int = 50, mode: str | None = None,
         if w and progress:
             progress(0.0, w)
     out: list[tuple[int, str]] = []
-    for i in range(1, n + 1):
+    selected = sorted({int(i) for i in (page_numbers or range(1, n + 1))
+                       if 1 <= int(i) <= n})
+    for i in selected:
         if progress:
             progress(i / max(1, n), f"OCR 第 {i}/{n} 页（{m}）")
         try:

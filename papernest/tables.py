@@ -11,12 +11,13 @@
    再把多行按 x 区间聚类成列，要求列在足够多的行上重复出现（列对齐）才认成表。
 
 **明确的能力边界**（写在这里，不在报告里粉饰）：
-- 几何兜底要求每行 >= 3 个单元格（即 >= 2 个明显水平间隙）。这不是随手定的：2 列门槛会把
-  参考文献（"[1]" + 悬挂缩进正文）、编号列表整段判成表格——它们的 x 区间对齐得比真表还整齐。
-  代价是**真正的两列表格识别不到**，这是本模块已知且故意接受的漏检。
-- 合并单元格（rowspan/colspan）不还原：find_tables 给 None，几何路径按列归位，都会留空格。
+- 几何兜底默认要求 >= 3 列；带明确 `Table 1` / `表 1` 图题的两列表格会额外通过
+  数据形态检查放行。这样不会把参考文献（"[1]" + 悬挂缩进正文）整段判成表格。
+- 合并单元格（rowspan/colspan）不臆造值：find_tables 的 `None` 会保留并写入
+  `merged_cells` / `needs_review`，复杂结构仍应人工复核。
 - 单元格内文本折行会被拆成两「行」（行聚类按 y 重叠做），跨行单元格的表行数会偏多。
-- 跨页表格不做跨页拼接（本模块按页识别）。要拼接需要主进程在页间做接续判断。
+- `detect_tables(..., merge_pages=True)` 会对页底/页顶、列数和表头相符的相邻表做保守拼接，
+  并保留 `page_bboxes`；默认仍按页返回以兼容旧调用方。
 - 扫描件（无文本层）两条路径都拿不到东西，返回 0 张表，不报错。
 
 失败策略：除「PDF 打不开 / 加密」抛 TableError 外，任何一步失败都降级并把原因写进
@@ -30,8 +31,8 @@ import unicodedata
 
 #: 几何兜底：一张表至少要有这么多行（含表头）。3 行以下的「对齐」几乎全是巧合。
 GEOM_MIN_ROWS = 3
-#: 几何兜底：整张表最终至少要有这么多列（= 行内至少 2 个明显水平间隙）。
-#: 取 3 而不是 2 的理由见模块 docstring——2 会让参考文献段整段变成「表格」。
+#: 普通几何候选的安全列数门槛。检测阶段会暂时生成两列候选，再用表题和
+#: 数据形态过滤，避免把参考文献段整段变成「表格」。
 GEOM_MIN_COLS = 3
 #: 一行要有这么多单元格才够格加入候选区。定 2 而不是 3 是拿真论文测出来的：
 #: 学术表的「类别」列常常几行才写一次（跨行合并单元格的排版效果），
@@ -102,6 +103,7 @@ _SEP_CELL = "---"
 NOTE_BORROWED_HEADER = "> 注：未识别到表头，下方第一行为原表首行（代用表头）。"
 NOTE_CONT_WITH_HEADER = "> 注：续表（表头已重复，便于本块被单独检索时仍可读）。"
 NOTE_CONT_NO_HEADER = "> 注：续表（未重复表头，表头见第 1 块）。"
+NOTE_MERGED_REVIEW = "> 注：检测到合并单元格或不规则网格，结构需人工复核；空白单元格未被自动填值。"
 
 
 class TableError(ValueError):
@@ -530,16 +532,84 @@ def _guess_header(rows: list[list[str]], bolds: list[list[bool]] | None) -> bool
 
 # ── ② 两条识别路径 ──
 
-def _rows_from_extract(raw_rows) -> list[list[str]]:
-    """find_tables().extract() 的行清洗：None → ""，统一换行符，保留单元格内换行。"""
+def _rows_from_extract(raw_rows) -> list[list[str | None]]:
+    """清洗 ``find_tables().extract()`` 的行。
+
+    ``None`` 是 PyMuPDF 表格解析器表达 rowspan/colspan 的唯一信号之一，不能
+    直接抹成空字符串；下游 Markdown 会把它显示为空，但 JSON/审计字段仍能标记
+    这张表需要人工复核。
+    """
     out: list[list[str]] = []
     for r in raw_rows or []:
         cells = []
         for v in r or []:
-            s = "" if v is None else str(v)
-            cells.append(s.replace("\r\n", "\n").replace("\r", "\n").strip())
+            if v is None:
+                cells.append(None)
+            else:
+                s = str(v)
+                cells.append(s.replace("\r\n", "\n").replace("\r", "\n").strip())
         out.append(cells)
     return out
+
+
+def _merged_cell_markers(rows) -> list[dict]:
+    """Return conservative audit markers for cells that the extractor left empty.
+
+    PDF table APIs do not expose a portable rowspan/colspan model.  Keeping the
+    coordinates lets a UI show the original table for review instead of silently
+    presenting an apparently rectangular table with invented values.
+    """
+    marks = []
+    for r, row in enumerate(rows or []):
+        for col, value in enumerate(row or []):
+            if value is None:
+                marks.append({"row": r, "col": col, "rowspan": 1,
+                              "colspan": 1, "inferred": True})
+    return marks
+
+
+_TABLE_CAPTION_RE = re.compile(
+    r"^\s*(?:Table|TABLE|表)\s*\.?\s*\d+[A-Za-z]?\s*(?:[:：.]|\s|$)", re.I)
+
+
+def _nearby_table_caption(page, bbox) -> str | None:
+    """Return an explicit table title in the same column, if present."""
+    try:
+        blocks = [b for b in page.get_text("blocks") if (b[4] or "").strip()]
+    except Exception:
+        return None
+    x0, y0, x1, y1 = map(float, bbox)
+    for b in blocks:
+        text = (b[4] or "").strip()
+        if not _TABLE_CAPTION_RE.match(text):
+            continue
+        # Captions are normally above the table.  Allow a small below-table
+        # margin for publishers that place them after the final rule.
+        if b[3] < y0 - 90.0 or b[1] > y1 + 45.0:
+            continue
+        overlap = max(0.0, min(x1, b[2]) - max(x0, b[0]))
+        if overlap / max(1.0, min(x1 - x0, b[2] - b[0])) >= 0.25:
+            return re.sub(r"\s+", " ", text).strip()
+    return None
+
+
+def _has_nearby_table_caption(page, bbox) -> bool:
+    return _nearby_table_caption(page, bbox) is not None
+
+
+def _plausible_two_column_table(table: dict) -> bool:
+    """Reject two-column prose bands that happen to be aligned like a grid."""
+    rows = table.get("rows") or []
+    if len(rows) < 3:
+        return False
+    body = rows[1:]
+    numeric_rows = sum(1 for row in body if any(_numericish(c) for c in row))
+    if numeric_rows >= max(2, int(len(body) * 0.35)):
+        return True
+    # Textual category/value tables are still allowed, but a paragraph column
+    # is normally much longer than a cell in a compact table.
+    lengths = [len(_clean(c)) for row in rows for c in row]
+    return bool(lengths) and max(lengths) <= 80 and sum(lengths) / len(lengths) <= 42
 
 
 def _find_tables_path(page, page_no: int, bold_texts) -> tuple[list[dict], list[str]]:
@@ -572,11 +642,12 @@ def _find_tables_path(page, page_no: int, bold_texts) -> tuple[list[dict], list[
                 rows = [names] + rows
         except Exception:
             external = False
-        rows = [r for r in rows if any(c.strip() for c in r)]
+        rows = [r for r in rows if any(c is not None and c.strip() for c in r)]
         if not rows:
             continue
         n_cols = max(len(r) for r in rows)
         has_header = external or _guess_header(rows, _bold_grid(rows, bold_texts))
+        merged = _merged_cell_markers(rows)
         out.append({
             "page_no": page_no,
             "bbox": _bbox(getattr(t, "bbox", (0, 0, 0, 0))),
@@ -585,6 +656,9 @@ def _find_tables_path(page, page_no: int, bold_texts) -> tuple[list[dict], list[
             "rows": rows,
             "detected_by": "find_tables",
             "has_header": has_header,
+            "merged_cells": merged,
+            "structure_confidence": 0.55 if merged else 0.95,
+            "needs_review": bool(merged),
         })
     return out, warnings
 
@@ -600,7 +674,8 @@ def _bold_grid(rows: list[list[str]], bold_texts) -> list[list[bool]] | None:
     return [[_squash(c) in bold_texts for c in r] for r in rows]
 
 
-def _geometry_tables(rows: list[dict], page_no: int) -> tuple[list[dict], list[str]]:
+def _geometry_tables(rows: list[dict], page_no: int,
+                     min_cols: int = GEOM_MIN_COLS) -> tuple[list[dict], list[str]]:
     """路径②：几何启发式。列对齐 + 行内多个明显水平间隙。"""
     warnings: list[str] = []
     out: list[dict] = []
@@ -608,7 +683,7 @@ def _geometry_tables(rows: list[dict], page_no: int) -> tuple[list[dict], list[s
         if len(run) < GEOM_MIN_ROWS:
             continue
         cols = _columns_of(run)
-        if len(cols) < GEOM_MIN_COLS:
+        if len(cols) < min_cols:
             continue
         texts, bolds = _grid_of(run, cols)
         used = [sum(1 for r in texts if r[j].strip()) for j in range(len(cols))]
@@ -625,8 +700,59 @@ def _geometry_tables(rows: list[dict], page_no: int) -> tuple[list[dict], list[s
             "rows": texts,
             "detected_by": "geometry",
             "has_header": _guess_header(texts, bolds),
+            "merged_cells": [],
+            "structure_confidence": 0.68,
+            "needs_review": False,
         })
     return out, warnings
+
+
+def _figure_regions(page) -> list[tuple[float, float, float, float]]:
+    """Return caption-anchored figure rectangles for one page.
+
+    A diagram's labels often form short, well-aligned text rows.  The geometry
+    fallback cannot distinguish those rows from a borderless table by itself.
+    The first version only rejected a candidate whose bottom edge was within
+    40pt of the caption; large diagrams can contain several candidate grids
+    much farther above the caption (for example Fig. 2 in ``data/pdf/1.pdf``).
+    Reuse the figure locator's column and prose-boundary rules so the whole
+    diagram area is excluded while an adjacent-column table remains eligible.
+    """
+    try:
+        from . import figures as _figures
+
+        blocks = [b for b in page.get_text("blocks") if (b[4] or "").strip()]
+        regions = []
+        pr = tuple(page.rect)
+        for b in blocks:
+            text = (b[4] or "").strip()
+            if not _CAPTION_RE.match(text) or not re.match(
+                    r"^\s*(图|Fig(?:ure)?|FIG)", text, re.I):
+                continue
+            cap_top = float(b[1])
+            x0, x1 = _figures._column_left_right(blocks, b, pr)
+            above_blocks = [o for o in blocks
+                            if o is not b and o[3] <= cap_top + 1
+                            and o[0] < x1 and o[2] > x0
+                            and _figures._is_prose(o)]
+            top = max((o[3] for o in above_blocks), default=pr[1])
+            top = max(top, cap_top - _figures.MAX_UP, pr[1])
+            if cap_top - top < _figures.MIN_H:
+                dense = [o for o in blocks
+                         if o is not b and o[3] <= cap_top + 1
+                         and o[0] < x1 and o[2] > x0
+                         and o[1] >= cap_top - _figures.MAX_UP]
+                short = sum(len((o[4] or '').split()) <= 14 for o in dense)
+                if len(dense) >= 8 and short / len(dense) >= 0.65:
+                    top = min(o[1] for o in dense)
+            bottom = min(pr[3], cap_top + 4.0)
+            if bottom - top >= _figures.MIN_H and x1 - x0 >= _figures.MIN_W:
+                regions.append((float(x0), float(top), float(x1), float(bottom)))
+        return regions
+    except Exception:
+        # Figure filtering is an optional de-duplication step.  A failure here
+        # must leave the ordinary table detector usable.
+        return []
 
 
 def _detect_page(page, page_no: int) -> tuple[list[dict], list[str]]:
@@ -643,9 +769,37 @@ def _detect_page(page, page_no: int) -> tuple[list[dict], list[str]]:
     # 关键：先分栏再做行聚类。双栏页整页聚类会把左栏正文和右栏表格拼成同一行。
     geom: list[dict] = []
     for band in _column_bands(lines):
-        t, w2 = _geometry_tables(_visual_rows(band), page_no)
+        # Generate two-column candidates here; _has_nearby_table_caption below
+        # decides whether the weaker shape has enough document evidence.
+        t, w2 = _geometry_tables(_visual_rows(band), page_no, min_cols=2)
         geom.extend(t)
         warnings.extend(w2)
+
+    # A diagram with many labels has the same visual grid as a borderless
+    # table.  Exclude geometry candidates whose centre lies in a full,
+    # caption-anchored figure region; a nearby table in another column stays.
+    figure_regions = _figure_regions(page)
+    if figure_regions:
+        def is_figure_candidate(g):
+            gx0, gy0, gx1, gy1 = g["bbox"]
+            cx, cy = (gx0 + gx1) / 2.0, (gy0 + gy1) / 2.0
+            return any(x0 <= cx <= x1 and y0 <= cy <= y1
+                       for x0, y0, x1, y1 in figure_regions)
+        geom = [g for g in geom if not is_figure_candidate(g)]
+
+    # Two-column tables are common in papers, but an unconditional two-column
+    # threshold turns references and numbered lists into false tables.  Admit
+    # them only with a nearby explicit Table/表 caption; the ordinary geometry
+    # path keeps its safer three-column gate.
+    geom = [g for g in geom
+            if int(g.get("n_cols") or 0) >= GEOM_MIN_COLS
+            or (_has_nearby_table_caption(page, g.get("bbox") or ())
+                and _plausible_two_column_table(g))]
+
+    for candidate in found + geom:
+        caption = _nearby_table_caption(page, candidate.get("bbox") or ())
+        if caption:
+            candidate["caption"] = caption
 
     # 两条路径都命中同一张表时保留 find_tables 的（框线证据比几何猜测硬）。
     # 这是常态而非降级，所以不进 warnings——warnings 里只放「真的退化了」的事，
@@ -657,7 +811,91 @@ def _detect_page(page, page_no: int) -> tuple[list[dict], list[str]]:
 
 # ── ③ 公开函数 ──
 
-def detect_tables(pdf_path, page_no: int | None = None) -> list[dict]:
+def _norm_cell(value) -> str:
+    return re.sub(r"\s+", " ", "" if value is None else str(value)).strip().lower()
+
+
+def _same_columns(a, b, tolerance: float = 14.0) -> bool:
+    """Compare column anchors using the first few rows of two table grids."""
+    def anchors(t):
+        rows = t.get("rows") or []
+        n = int(t.get("n_cols") or max((len(r or []) for r in rows), default=0))
+        # Cell x coordinates are not retained by every detector.  The bbox is
+        # still a useful conservative proxy when n_cols agrees.
+        x0, _, x1, _ = t.get("bbox") or (0, 0, 0, 0)
+        if n <= 0 or x1 <= x0:
+            return []
+        step = (x1 - x0) / n
+        return [x0 + i * step for i in range(n)]
+    aa, bb = anchors(a), anchors(b)
+    return len(aa) == len(bb) and all(abs(x - y) <= tolerance for x, y in zip(aa, bb))
+
+
+def merge_cross_page_tables(pdf_path: str, found: list[dict]) -> list[dict]:
+    """Join conservative page-bottom/page-top continuations.
+
+    The original per-page bbox remains for compatibility; ``page_bboxes`` and
+    ``end_page`` carry the physical extent.  A repeated header on the next page
+    is removed, while a page without one keeps all rows and gets the first-page
+    header through ``chunk_table``.
+    """
+    if not found or len(found) < 2:
+        return list(found or [])
+    try:
+        import pymupdf
+        doc = pymupdf.open(pdf_path)
+        heights = {i + 1: float(doc[i].rect.height) for i in range(doc.page_count)}
+        doc.close()
+    except Exception:
+        heights = {}
+    ordered = sorted(found, key=lambda t: (t.get("page_no", 0),
+                                           (t.get("bbox") or (0, 0, 0, 0))[1]))
+    out = []
+    for current in ordered:
+        if not out:
+            item = dict(current)
+            item["page_bboxes"] = [{"page_no": item.get("page_no"),
+                                    "bbox": tuple(item.get("bbox") or ())}]
+            item["end_page"] = item.get("page_no")
+            out.append(item)
+            continue
+        prev = out[-1]
+        pno, cno = int(prev.get("end_page") or prev.get("page_no") or 0), int(current.get("page_no") or 0)
+        pb = prev.get("bbox") or (0, 0, 0, 0)
+        cb = current.get("bbox") or (0, 0, 0, 0)
+        ph, ch = heights.get(pno, 842.0), heights.get(cno, 842.0)
+        prev_bottom = float(pb[3]) >= ph * 0.72
+        curr_top = float(cb[1]) <= ch * 0.28
+        same_shape = int(prev.get("n_cols") or 0) == int(current.get("n_cols") or 0) and _same_columns(prev, current)
+        prev_rows, cur_rows = prev.get("rows") or [], current.get("rows") or []
+        prev_head = prev_rows[0] if prev_rows else []
+        cur_head = cur_rows[0] if cur_rows else []
+        repeated_header = bool(prev_head and cur_head and
+                               len(prev_head) == len(cur_head) and
+                               all(_norm_cell(a) == _norm_cell(b) for a, b in zip(prev_head, cur_head)))
+        no_new_caption = not current.get("caption")
+        if cno == pno + 1 and prev_bottom and curr_top and same_shape and (repeated_header or no_new_caption):
+            additions = cur_rows[1:] if repeated_header else cur_rows
+            prev["rows"] = list(prev_rows) + list(additions)
+            prev["n_rows"] = len(prev["rows"])
+            prev["end_page"] = cno
+            prev.setdefault("page_bboxes", []).append({"page_no": cno, "bbox": tuple(cb)})
+            prev["continued"] = True
+            prev["structure_confidence"] = min(float(prev.get("structure_confidence", 0.7)),
+                                                  float(current.get("structure_confidence", 0.7)), 0.8)
+            prev["needs_review"] = bool(prev.get("needs_review") or current.get("needs_review"))
+            prev["merged_cells"] = list(prev.get("merged_cells") or []) + [
+                {**m, "page_no": cno} for m in (current.get("merged_cells") or [])]
+        else:
+            item = dict(current)
+            item["page_bboxes"] = [{"page_no": cno, "bbox": tuple(cb)}]
+            item["end_page"] = cno
+            out.append(item)
+    return out
+
+
+def detect_tables(pdf_path, page_no: int | None = None,
+                  merge_pages: bool = False) -> list[dict]:
     """识别 PDF 里的表格区域。page_no 传 1-based 页码则只看那一页。
 
     返回按 (页码, y, x) 排序的列表，每项：
@@ -666,6 +904,8 @@ def detect_tables(pdf_path, page_no: int | None = None) -> list[dict]:
     PDF 打不开 / 加密抛 TableError；其余任何失败都降级为「这页没识别到表」。
     """
     tables, _ = _detect(pdf_path, page_no)
+    if merge_pages and page_no is None:
+        tables = merge_cross_page_tables(pdf_path, tables)
     return tables
 
 
@@ -799,6 +1039,8 @@ def chunk_table(table: dict, max_rows: int = 50, max_chars: int = 8000,
 
     def head_block(first: bool) -> str:
         lines: list[str] = []
+        if first and table.get("needs_review"):
+            lines.append(NOTE_MERGED_REVIEW)
         if first:
             if not has_header:
                 lines.append(NOTE_BORROWED_HEADER)
@@ -958,6 +1200,16 @@ def table_owned_blocks(blocks: list[dict], tables: list[dict]) -> set[int]:
     by_page: dict[int, list[dict]] = {}
     for t in tables:
         by_page.setdefault(t.get("page_no"), []).append(t)
+        # Continued tables carry one bbox per physical page.  Use lightweight
+        # page-specific proxy dicts for ownership removal while retaining the
+        # merged table itself for chunking and hashing.
+        for pb in t.get("page_bboxes") or []:
+            pg = pb.get("page_no")
+            if pg is None or pg == t.get("page_no"):
+                continue
+            proxy = dict(t)
+            proxy["page_no"], proxy["bbox"] = pg, tuple(pb.get("bbox") or ())
+            by_page.setdefault(pg, []).append(proxy)
     tok: dict[int, list[tuple[frozenset, frozenset]]] = {}
     for pg, ts in by_page.items():
         acc = []

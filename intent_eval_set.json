@@ -1,0 +1,274 @@
+[
+  {
+    "id": "i01",
+    "type": "intent",
+    "query": "推荐支持这段话的参考文献",
+    "gold_intent": "cite",
+    "category": "cn_cite_full",
+    "comment": "cite 域 + cite 动词"
+  },
+  {
+    "id": "i02",
+    "type": "intent",
+    "query": "找几篇 LLM Agent 综述的引用",
+    "gold_intent": "cite",
+    "category": "cn_cite_verb_survey_domain",
+    "comment": "推荐 + 综述域词，但目标是推荐引用，不是写综述"
+  },
+  {
+    "id": "i03",
+    "type": "intent",
+    "query": "recommend some papers for this paragraph",
+    "gold_intent": "cite",
+    "category": "en_cite",
+    "comment": "英文 cite"
+  },
+  {
+    "id": "i04",
+    "type": "intent",
+    "query": "补充几篇支持 Channel Estimation 的引用",
+    "gold_intent": "cite",
+    "category": "cn_cite_supplement",
+    "comment": "补充动词"
+  },
+  {
+    "id": "i05",
+    "type": "intent",
+    "query": "建议在这段加几篇关于 RAG 的引用",
+    "gold_intent": "cite",
+    "category": "cn_cite_add",
+    "comment": "加/添加动词"
+  },
+  {
+    "id": "i06",
+    "type": "intent",
+    "query": "写一篇 LLM Agent 综述",
+    "gold_intent": "survey",
+    "category": "cn_survey_full",
+    "comment": "survey 域 + 写动词"
+  },
+  {
+    "id": "i07",
+    "type": "intent",
+    "query": "生成一篇关于强化学习的综述",
+    "gold_intent": "survey",
+    "category": "cn_survey_generate",
+    "comment": "生成动词"
+  },
+  {
+    "id": "i08",
+    "type": "intent",
+    "query": "整理成 channel estimation 综述",
+    "gold_intent": "survey",
+    "category": "cn_survey_compile",
+    "comment": "整理成动词"
+  },
+  {
+    "id": "i09",
+    "type": "intent",
+    "query": "produce a survey on retrieval augmented generation",
+    "gold_intent": "survey",
+    "category": "en_survey",
+    "comment": "英文 survey"
+  },
+  {
+    "id": "i10",
+    "type": "intent",
+    "query": "精读论文 12",
+    "gold_intent": "read",
+    "category": "cn_paper_id",
+    "comment": "中文 paper_id 12"
+  },
+  {
+    "id": "i11",
+    "type": "intent",
+    "query": "精读 #7",
+    "gold_intent": "read",
+    "category": "cn_paper_id_hash",
+    "comment": "# 形式 paper_id"
+  },
+  {
+    "id": "i12",
+    "type": "intent",
+    "query": "read paper 42",
+    "gold_intent": "read",
+    "category": "en_paper_id",
+    "comment": "英文 paper_id"
+  },
+  {
+    "id": "i13",
+    "type": "intent",
+    "query": "读一下《Attention is all you need》",
+    "gold_intent": "read",
+    "category": "quoted_with_read_verb",
+    "comment": "引号标题 + 读动词"
+  },
+  {
+    "id": "i14",
+    "type": "intent",
+    "query": "精读《Large Language Model Agent: A Survey on Methodology, Applications and Challenges》",
+    "gold_intent": "read",
+    "category": "quoted_survey_with_read_verb",
+    "comment": "Survey 标题被精读——这正是 build_plan 注释里强调的边界 case"
+  },
+  {
+    "id": "i15",
+    "type": "intent",
+    "query": "LLM Agent 方法论",
+    "gold_intent": "qa",
+    "category": "qa_default",
+    "comment": "纯主题查询 → 默认 qa"
+  },
+  {
+    "id": "i16",
+    "type": "intent",
+    "query": "channel estimation 的最新进展",
+    "gold_intent": "qa",
+    "category": "qa_default_cn",
+    "comment": "中文主题查询"
+  },
+  {
+    "id": "i17",
+    "type": "intent",
+    "query": "为什么呢",
+    "gold_intent": "qa",
+    "category": "qa_pure_followup_cn",
+    "comment": "纯追问"
+  },
+  {
+    "id": "i18",
+    "type": "intent",
+    "query": "how does RAG work",
+    "gold_intent": "qa",
+    "category": "qa_default_en",
+    "comment": "英文主题"
+  },
+  {
+    "id": "i19",
+    "type": "intent",
+    "query": "what is the difference",
+    "gold_intent": "qa",
+    "category": "qa_pure_followup_en",
+    "comment": "纯追问英文"
+  },
+  {
+    "id": "i20",
+    "type": "intent",
+    "query": "库里有哪些和《Agent Survey》相关的文献？",
+    "gold_intent": "qa",
+    "category": "trick_quoted_no_verb",
+    "comment": "引号无 read 动词——只是 topic anchor，不是 read"
+  },
+  {
+    "id": "i21",
+    "type": "intent",
+    "query": "《Large Language Model Agent: A Survey on Methodology, Applications and Challenges》被引用了多少次？",
+    "gold_intent": "qa",
+    "category": "trick_survey_metadata",
+    "comment": "Survey 标题 + 问被引次数——是 qa 检索，不是 cite/survey"
+  },
+  {
+    "id": "i22",
+    "type": "intent",
+    "query": "Large Language Model Agent: A Survey on Methodology, Applications and Challenges 这篇论文的方法是什么？",
+    "gold_intent": "qa",
+    "category": "trick_survey_topic_qa",
+    "comment": "Survey 标题被引述，问的是方法——qa，不是 survey"
+  },
+  {
+    "id": "i23",
+    "type": "intent",
+    "query": "精读论文 1：Large Language Model Agent: A Survey on Methodology, Applications and Challenges",
+    "gold_intent": "read",
+    "category": "tricky_read_survives_survey_word",
+    "comment": "精读 + paper_id + Survey 标题——read 应胜出"
+  },
+  {
+    "id": "i24",
+    "type": "intent",
+    "query": "找一篇讲 elicited emotions 的论文",
+    "gold_intent": "qa",
+    "category": "trick_cite_verb_substring",
+    "comment": "找是 cite 动词，但没有任何 cite 域词——qa"
+  },
+  {
+    "id": "i25",
+    "type": "intent",
+    "query": "recommend a method for excited-state simulation",
+    "gold_intent": "qa",
+    "category": "trick_en_cite_substring",
+    "comment": "recommend 是 cite 动词，但无 cite 域词——qa"
+  },
+  {
+    "id": "i26",
+    "type": "intent",
+    "query": "LLM Agent 综述",
+    "gold_intent": "qa",
+    "category": "trick_survey_no_verb",
+    "comment": "Survey 域词无 survey 动词——qa（不能误触发 survey）"
+  },
+  {
+    "id": "i27",
+    "type": "intent",
+    "query": "对比一下 ZF 和 MMSE 检测器",
+    "gold_intent": "qa",
+    "category": "tricky_comparison",
+    "comment": "对比是常见句式但无 cite/survey/read 强信号——qa"
+  },
+  {
+    "id": "i28",
+    "type": "intent",
+    "query": "findings on RAG benchmark",
+    "gold_intent": "qa",
+    "category": "trick_en_substring",
+    "comment": "find 含于 findings——qa（英文词边界保护）"
+  },
+  {
+    "id": "i29",
+    "type": "intent",
+    "query": "asdf ghjk qwerty zxcv",
+    "gold_intent": "qa",
+    "category": "low_signal",
+    "comment": "启发式总会落到某个 tool；unknown 不是路由结果，Replanner 据 confidence 决定是否 ASK_USER"
+  },
+  {
+    "id": "i30",
+    "type": "intent",
+    "query": "......",
+    "gold_intent": "qa",
+    "category": "low_signal",
+    "comment": "启发式总会落到某个 tool；unknown 不是路由结果，Replanner 据 confidence 决定是否 ASK_USER"
+  },
+  {
+    "id": "i31",
+    "type": "intent",
+    "query": "找几篇支持 multi-agent debate 的引用 [3]",
+    "gold_intent": "cite",
+    "category": "cite_with_ordinal",
+    "comment": "cite + 序号引用"
+  },
+  {
+    "id": "i32",
+    "type": "intent",
+    "query": "写一篇关于 AI Agent 的 Survey",
+    "gold_intent": "survey",
+    "category": "en_survey_capitalized",
+    "comment": "英文 Survey 大小写敏感"
+  },
+  {
+    "id": "i33",
+    "type": "intent",
+    "query": "全文分析 paper 12",
+    "gold_intent": "read",
+    "category": "cn_paper_id_full",
+    "comment": "全文 + paper_id"
+  },
+  {
+    "id": "i34",
+    "type": "intent",
+    "query": "详细分析一下 BERT paper #5",
+    "gold_intent": "read",
+    "category": "read_verb_english",
+    "comment": "详细分析 + paper_id"
+  }
+]

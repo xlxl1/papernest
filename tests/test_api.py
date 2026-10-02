@@ -449,6 +449,17 @@ class PdfServingTests(ApiTestBase):
         self.assertEqual(r.headers["content-type"], "image/png")
         self.assertTrue(r.content.startswith(b"\x89PNG\r\n\x1a\n"))
 
+    def test_page_image_can_highlight_a_bbox(self):
+        pid = self._uploaded()
+        plain = self.client.get(f"/api/paper/{pid}/page/1.png")
+        marked = self.client.get(
+            f"/api/paper/{pid}/page/1.png",
+            params={"bbox_x1": 68, "bbox_y1": 80,
+                    "bbox_x2": 420, "bbox_y2": 115})
+        self.assertEqual(marked.status_code, 200)
+        self.assertTrue(marked.content.startswith(b"\x89PNG\r\n\x1a\n"))
+        self.assertNotEqual(marked.content, plain.content)
+
     def test_page_out_of_range_is_404_not_500(self):
         pid = self._uploaded()
         self.assertEqual(self.client.get(f"/api/paper/{pid}/page/99.png").status_code, 404)

@@ -74,6 +74,21 @@ main{flex:1;overflow:hidden}
   font-size:12.5px;padding:6px 14px;box-shadow:var(--shadow)}
 .chips button:hover{border-color:var(--accent);color:var(--accent)}
 .chatlist{flex:1;overflow-y:auto;padding:18px 4px 6px}
+
+/* ── Plan-Execute-Replan: clarification 提问卡片 ── */
+.clarif{background:var(--accent-soft);border:1px solid var(--accent);border-radius:12px;
+  padding:14px 18px;margin:10px 0;max-width:92%}
+.clarif .q{font-weight:600;margin-bottom:10px;color:var(--fg)}
+.clarif .opts{display:flex;flex-wrap:wrap;gap:8px;margin:8px 0}
+.clarif .opts button{background:var(--card);color:var(--accent-deep);border:1px solid var(--accent);
+  border-radius:999px;padding:6px 14px;font-size:13px;box-shadow:none}
+.clarif .opts button:hover{background:var(--accent);color:#fff}
+.clarif .opts button:disabled{opacity:.5;cursor:wait}
+.clarif .freetext{display:flex;gap:6px;margin-top:8px}
+.clarif .freetext input{flex:1;background:var(--card)}
+.clarif .freetext button{background:var(--accent);color:#fff;border:0;padding:6px 14px;
+  border-radius:8px;font-size:13px}
+.clarif .reason{font-size:12px;color:var(--muted);margin-bottom:8px}
 .msg{max-width:92%;margin:0 0 14px;border-radius:14px;padding:10px 16px;font-size:14px;
   white-space:pre-wrap;word-break:break-word;animation:rise .18s ease-out}
 @keyframes rise{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
@@ -492,6 +507,20 @@ const esc=s=>(s??'').toString().replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>
 // JSON.stringify 负责 JS 层转义（引号/反斜杠/控制字符），esc 负责 HTML 层，
 // 两层各管各的，顺序不能反。真库里已经有一篇会踩到（"Assessing BERT's ..."）。
 const jsArg=v=>esc(JSON.stringify(v??''));
+const sourceLocator=s=>{
+  if(!s||s.start_page==null||s.start_page===''||!Number.isFinite(+s.start_page)) return null;
+  const bbox=Array.isArray(s.bbox)&&s.bbox.length===4
+    &&s.bbox.every(v=>v!=null&&v!==''&&Number.isFinite(+v))
+    ? s.bbox.map(Number):null;
+  return {page:+s.start_page,bbox,chunk_no:s.chunk_no??null,
+          section_path:s.section_path||'',block_type:s.block_type||'text'};
+};
+const sourceLink=(s,meta=true)=>{
+  const loc=sourceLocator(s);
+  const where=loc?` · 第${loc.page}页${loc.section_path?' · '+esc(loc.section_path):''}`:'';
+  const suffix=meta?`（${esc(s.venue||'')} ${s.year||''}）`:'';
+  return `<a onclick="openPaper(${+s.paper_id},${jsArg(loc)})">[${s.idx??'?'}] ${esc(s.title||'')}${suffix}${where}</a>`;
+};
 
 /* ── 访问口令：让 PAPERNEST_API_KEY 这把锁真的能开起来 ──
    服务端的鉴权中间件一直是好的，但这个页面此前 30 处 fetch 加 1 处 EventSource
@@ -645,7 +674,7 @@ async function chatResume(id){
       hist.push({role:m.role,content:m.content});
       if(m.role==='user'){ pushMsg('user',m.content); continue; }
       const d=document.createElement('div'); d.className='msg bot';
-      const src=(m.sources||[]).map(x=>`<a onclick="openPaper(${x.paper_id})">[${x.idx}] ${esc(x.title)}</a>`).join('<br>');
+      const src=(m.sources||[]).map(x=>sourceLink(x,false)).join('<br>');
       d.innerHTML=esc(m.content).replace(/\[(\d{1,3})\]/g,'<sup class="cite">$1</sup>')
         +(src?`<div class="src">来源：<br>${src}</div>`:'');
       $('chat').appendChild(d);
@@ -702,12 +731,12 @@ async function doChat(){
         raw+=(raw?'\n\n':'')+'⚠ '+j.error;
         if(j.degraded) degraded=j.degraded;
         const body=esc(raw).replace(/\[(\d{1,3})\]/g,'<sup class="cite">$1</sup>');
-        const esrc=(sources||[]).map(s=>`<a onclick="openPaper(${s.paper_id})">[${s.idx}] ${esc(s.title)}（${esc(s.venue||'')} ${s.year||''}）</a>`).join('<br>');
+        const esrc=(sources||[]).map(s=>sourceLink(s)).join('<br>');
         hist.push({role:'assistant',content:raw});
         done(`${body}${esrc?`<div class="src">来源（点击查看详情）：<br>${esrc}</div>`:''}${degraded?`<div class="src">⚠ ${esc(degraded)}</div>`:''}`);
       }
       else if(ev==='done'){
-        const src=(sources||[]).map(s=>`<a onclick="openPaper(${s.paper_id})">[${s.idx}] ${esc(s.title)}（${esc(s.venue||'')} ${s.year||''}）</a>`).join('<br>');
+        const src=(sources||[]).map(s=>sourceLink(s)).join('<br>');
         hist.push({role:'assistant',content:j.answer||raw});
         done(`${esc(j.answer||raw).replace(/\[(\d{1,3})\]/g,'<sup class="cite">$1</sup>')}${src?`<div class="src">来源（点击查看详情）：<br>${src}</div>`:''}${(j.degraded||degraded)?`<div class="src">⚠ ${esc(j.degraded||degraded)}</div>`:''}`);
       }
@@ -746,7 +775,7 @@ async function doSurvey(){
       job=>{ el.innerHTML=`<span class="spin"></span>【${esc(job.stage||'')}】${esc(job.message||'生成中…')}`; });
     const r=j.result;
     const html=esc(r.survey).replace(/\[(\d{1,3})\]/g,'<sup class="cite">$1</sup>');
-    const src=(r.sources||[]).map(s=>`<a onclick="openPaper(${s.paper_id})">[${s.idx}] ${esc(s.title)}</a>`).join('<br>');
+    const src=(r.sources||[]).map(s=>sourceLink(s,false)).join('<br>');
     const bad=(r.checks||[]).filter(c=>c.ok===false).map(c=>`<li>${esc(c.claim)}…（相关度 ${c.score}）</li>`).join('');
     done(`${html}<div class="src">✓ ${esc(r.verified_summary||'')}${bad?`<br><b>未通过核验的论断：</b><ul style="margin:4px 0 0 18px">${bad}</ul>`:''}<br><br>来源：<br>${src}</div>`);
   }catch(e){ done('综述生成失败：'+e.message); }
@@ -776,6 +805,69 @@ function timelineHTML(plan,events){
       ${last&&last.error?`<div class="err">${esc(last.error)}</div>`:''}
     </div>`;}).join('')+`</div>`;
 }
+/* ── Plan-Execute-Replan: clarification 提问卡片的渲染 ──
+   当 agent 返回 status='needs_clarification' 时，把 clarification_questions
+   渲染成可点击的选项卡片。用户点击或自由文本提交后，调用
+   submitClarification(goal, intent) 重跑 agent。
+*/
+function renderClarificationCard(r){
+  const qs = r.clarification_questions || [];
+  if(!qs.length) return '';
+  const goal = esc(r.goal || '');
+  const intro = `<div class="reason">⚠ Agent 不确定你的意图。回答下面任一问题后会按你的选择继续执行。</div>`;
+  return intro + qs.map((q, i)=>{
+    const opts = (q.options||[]).map(o=>
+      `<button onclick="submitClarification(${jsArg(goal)}, ${jsArg(o.value)})"
+              data-qid="${esc(q.qid||'')}" data-value="${esc(o.value)}">
+         ${esc(o.label||o.value)}</button>`).join('');
+    const freeText = q.free_text===false ? '' :
+      `<div class="freetext">
+         <input type="text" placeholder="或者用一句话告诉我你想做什么…"
+                id="clarifFree_${i}" onkeydown="if(event.key==='Enter'){
+                  submitClarificationFree(${jsArg(goal)}, ${i});
+                  event.preventDefault();}">
+         <button onclick="submitClarificationFree(${jsArg(goal)}, ${i})">发送</button>
+       </div>`;
+    return `<div class="clarif" data-qid="${esc(q.qid||'')}">
+      <div class="q">${esc(q.question||'')}</div>
+      <div class="opts">${opts}</div>
+      ${freeText}
+    </div>`;
+  }).join('');
+}
+
+/* 用户点击选项按钮后调用：把意图锁定 + 重跑 agent */
+async function submitClarification(goal, intent){
+  // 禁用所有澄清按钮，防止重复点击
+  document.querySelectorAll('.clarif button').forEach(b=>b.disabled=true);
+  note('agentNote', `<span class="spin"></span>已选 intent=<b>${esc(intent)}</b>，重跑中…`);
+  try{
+    const r = await (await fetch('/api/agent/run', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({goal:goal, top_k:+$('agentTopk').value||5,
+                           timeout_s:+$('agentTimeout').value||240,
+                           intent_hint:intent})})).json();
+    $('agentResult').innerHTML = renderAgentRun(r);
+    note('agentNote', r.status==='completed' ? '✓ 完成' :
+                       r.status==='needs_clarification' ? '? 仍需澄清（深度不足）' :
+                       `状态：${esc(r.status)}`);
+    loadAgentRuns();
+  }catch(e){
+    note('agentNote', '✗ 重跑失败：'+e.message);
+    document.querySelectorAll('.clarif button').forEach(b=>b.disabled=false);
+  }
+}
+
+/* 自由文本回答：把文本当作 hint 塞进 goal 重新跑（保留 goal 原文） */
+async function submitClarificationFree(goal, idx){
+  const txt = ($('clarifFree_'+idx).value||'').trim();
+  if(!txt){ $('clarifFree_'+idx).focus(); return; }
+  // 把自由文本拼在 goal 前作为 hint 信号——后端不识别 free_text 字段，
+  // 所以走「goal 重写」这条路：保留原 goal + 在前面加 user 描述。
+  const merged = `[user hint: ${txt}] ${goal}`;
+  await submitClarification(merged, null);
+}
+
 function renderAgentRun(r){
   const head=`<div class="box"><div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
     <b>run ${esc((r.run_id||'').slice(0,8))}</b>
@@ -784,10 +876,14 @@ function renderAgentRun(r){
     ${r.degraded?`<span class="chip warn">有降级</span>`:''}</div>
     <div class="why">${esc(r.goal)}</div>
     ${timelineHTML(r.plan,r.events)}</div>`;
+  // Plan-Execute-Replan: needs_clarification 状态的特殊渲染
+  if(r.status==='needs_clarification'){
+    return head + renderClarificationCard(r);
+  }
   let body='';
   if(r.answer){
     const html=esc(r.answer).replace(/\[(\d{1,3})\]/g,'<sup class="cite">$1</sup>');
-    const src=(r.sources||[]).map(s=>`<a onclick="openPaper(${s.paper_id})">[${s.idx??'?'}] ${esc(s.title||'')}</a>`).join('<br>');
+    const src=(r.sources||[]).map(s=>sourceLink(s,false)).join('<br>');
     body=`<div class="msg bot" style="max-width:none">${html}
       ${src?`<div class="src">来源：<br>${src}</div>`:''}
       ${r.degraded?`<div class="src">⚠ ${esc(r.degraded)}</div>`:''}
@@ -1006,7 +1102,7 @@ async function openPaperByName(title){
 }
 
 /* ── 详情弹窗 ── */
-async function openPaper(id){
+async function openPaper(id,locator=null){
   const p=await (await fetch('/api/paper/'+id)).json();
   const c=p.card||{};
   const kw=(c.keywords||[]).map(k=>`<span class="kw">${esc(k)}</span>`).join('');
@@ -1039,6 +1135,9 @@ async function openPaper(id){
     ${kw?`<div style="margin-top:6px">${kw}</div>`:''}
     <div id="modalExport"></div>`;
   $('ov').classList.add('on');
+  if(locator&&p.has_pdf&&Number.isFinite(+locator.page)){
+    await pdfGoto(p.id,+locator.page,locator.bbox||null);
+  }
 }
 /* ── 内嵌 PDF 阅读器 ──
    用浏览器自带的 PDF 查看器 + `#page=N` 片段跳页，不引第三方 PDF 库。
@@ -1054,7 +1153,16 @@ function pdfToggle(id){
     style="width:100%;height:70vh;border:1px solid var(--line);border-radius:10px;margin-top:10px"
     title="论文原文"></iframe>`;
 }
-async function pdfGoto(id,page){
+function pdfPageUrl(id,page,dpi,bbox){
+  const q=new URLSearchParams();
+  if(dpi) q.set('dpi',dpi);
+  if(Array.isArray(bbox)&&bbox.length===4&&bbox.every(v=>Number.isFinite(+v))){
+    ['bbox_x1','bbox_y1','bbox_x2','bbox_y2'].forEach((k,i)=>q.set(k,+bbox[i]));
+  }
+  const tail=q.toString();
+  return `/api/paper/${id}/page/${page}.png${tail?'?'+tail:''}`;
+}
+async function pdfGoto(id,page,bbox=null){
   const box=$('pdfBox');
   box.dataset.on='page';
   const btn=$('btnPdf'); if(btn) btn.textContent='阅读原文';
@@ -1064,10 +1172,11 @@ async function pdfGoto(id,page){
         <button class="ghost" onclick="pdfGoto(${id},${Math.max(1,page-1)})">上一页</button>
         <button class="ghost" onclick="pdfGoto(${id},${page+1})">下一页</button>
         <button class="ghost" onclick="pdfToggle(${id})">整篇连读</button>
-        <a class="ghost" style="padding:4px 12px" href="${pnUrl(`/api/paper/${id}/page/${page}.png?dpi=200`)}"
+        <a class="ghost" style="padding:4px 12px" href="${pnUrl(pdfPageUrl(id,page,200,bbox))}"
            target="_blank">大图 ↗</a>
       </div>
-      <img src="${pnUrl(`/api/paper/${id}/page/${page}.png`)}" alt="第 ${page} 页"
+      ${bbox?'<div class="mkt" style="margin-bottom:6px">已高亮本次检索命中的原文区域</div>':''}
+      <img src="${pnUrl(pdfPageUrl(id,page,110,bbox))}" alt="第 ${page} 页"
            style="width:100%;border:1px solid var(--line);border-radius:8px"
            onerror="this.parentNode.querySelector('.note-img').style.display='block';this.style.display='none'">
       <div class="note note-img" style="display:none">这一页取不到（PDF 可能已删除，或页码超出范围）</div>
@@ -1164,7 +1273,7 @@ async function doReview(){
   $('btnPolish').disabled=false; $('btnReview').disabled=false;
 }
 function renderPolish(r){
-  const src=(r.sources||[]).map(s=>`<a onclick="openPaper(${s.paper_id})">[${s.idx}] ${esc(s.title)}</a>`).join(' · ');
+  const src=(r.sources||[]).map(s=>sourceLink(s,false)).join(' · ');
   const chg=(r.changes||[]).map(c=>`<div class="cand"><span class="chip acc">${esc(c.type||'修改')}</span>
     ${c.before?`<s style="color:var(--muted)">${esc(c.before)}</s> → <b>${esc(c.after)}</b>`:`<b>${esc(c.after||'')}</b>`}
     <div class="mkt">${esc(c.reason||'')}</div></div>`).join('');
@@ -1180,7 +1289,7 @@ function renderPolish(r){
   </div>`;
 }
 function renderReview(r){
-  const src=(r.sources||[]).map(s=>`<a onclick="openPaper(${s.paper_id})">[${s.idx}] ${esc(s.title)}</a>`).join(' · ');
+  const src=(r.sources||[]).map(s=>sourceLink(s,false)).join(' · ');
   const sevChip=s=>s==='major'?'<span class="chip bad">major</span>'
     :s==='minor'?'<span class="chip warn">minor</span>':'<span class="chip">suggestion</span>';
   const issues=(r.issues||[]).map(it=>`<div class="cand">${sevChip(esc(it.severity||'suggestion'))}

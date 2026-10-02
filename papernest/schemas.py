@@ -17,6 +17,12 @@ class AgentRequest(BaseModel):
     topic: str | None = Field(default=None, max_length=500)
     timeout_s: int = Field(default=240, ge=5, le=900)
     dry_run: bool = False
+    # intent_hint：前端从 clarification_questions 选完答案后回传的值。
+    # 例如 "cite" 锁定意图为引用推荐，run_agent 会直接构造 cite 工具链，
+    # 跳过 Replanner 的低置信度 ASK_USER 路径。None 表示没指定，仍走启发式。
+    # 与 intent.classify() 的 5 个 label 一致，但前端允许传"自定义文本"——后端
+    # 只识别 5 个已知 label，其它当作 topic_hint 处理（写到 topic 字段）。
+    intent_hint: str | None = Field(default=None, max_length=200)
 
 
 class PlanStep(BaseModel):
@@ -36,14 +42,47 @@ class ToolEvent(BaseModel):
     error: str | None = None
 
 
+
+class ClarificationQuestion(BaseModel):
+    """给前端的澄清提问模板。前端按 options 渲染单选 / 多选；free_text 允许用户改写。
+
+    设计：让前端控制 UI，不在前端拼字符串。agent 与前端之间的契约就是这个对象。
+    放在 schemas.py 而不是 replan.py，是因为它要出现在 AgentResponse.clarification_questions
+    里——属于 API 契约的一部分。
+    """
+    qid: str
+    question: str
+    options: list[dict[str, str]] = Field(default_factory=list)
+    # 每个 option: {"label": "推荐几篇", "value": "cite"}
+    free_text: bool = True  # 是否允许自由文本
+
+class Intent(BaseModel):
+    """结构化意图：路由决策 + 可审计的信号链。来自 intent.classify()。
+
+    放这里是因为它出现在 AgentResponse.intent 里——属于 API 契约的一部分。
+    """
+    primary: Literal["cite", "survey", "read", "qa", "unknown"]
+    confidence: float = Field(ge=0.0, le=1.0)
+    signals: list[str] = Field(default_factory=list)
+    paper_id: int | None = None
+    topic_hint: str | None = None
+
 class AgentResponse(BaseModel):
     run_id: str
-    status: Literal["planned", "completed", "blocked", "failed"]
+    # needs_clarification：Replanner 决定需要用户澄清时返回，
+    # clarification_questions 字段给出具体问题。这是 Plan-Execute-Replan
+    # 改造新增的状态，不替代原 blocked/failed/completed。
+    status: Literal["planned", "completed", "blocked", "failed", "needs_clarification"]
     goal: str
-    plan: list[PlanStep]
+    plan: list[PlanStep] = Field(default_factory=list)
     events: list[ToolEvent] = Field(default_factory=list)
     answer: str | None = None
     sources: list[dict[str, Any]] = Field(default_factory=list)
+    # Plan-Execute-Replan 改造新增（向后兼容，旧客户端忽略即可）：
+    intent: Intent | None = None  # 首次分类的意图与置信度
+    clarification_questions: list[ClarificationQuestion] = Field(default_factory=list)
+    # replan_events: Replanner 每次决策的结构化记录，trace 用
+    replan_events: list[dict[str, Any]] = Field(default_factory=list)
     result: dict[str, Any] = Field(default_factory=dict)
     degraded: str | None = None
     error: str | None = None

@@ -199,7 +199,9 @@ def pending(paper_ids=None) -> list[dict]:
         if not os.path.exists(r["pdf_path"]):
             continue
         try:
-            found = tables.detect_tables(r["pdf_path"])
+            # Use the same cross-page table identity as fulltext chunking so a
+            # continued table receives one summary and one stable hash.
+            found = tables.detect_tables(r["pdf_path"], merge_pages=True)
         except Exception:                               # noqa: BLE001
             continue            # 识别不了就是这篇没有表，不是本模块该处理的事
         for t in found:

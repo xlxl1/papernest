@@ -52,7 +52,9 @@ class ChunkHitsAreCarriedThrough(TempDbTestCase):
                 {"text": "Introduction. Transformers are large.",
                  "section_path": "1 Introduction", "start_page": 1},
                 {"text": "We apply quantization to reduce memory footprint.",
-                 "section_path": "3 Method", "start_page": 5},
+                 "section_path": "3 Method", "start_page": 5,
+                 "bbox_x1": 72.0, "bbox_y1": 180.0,
+                 "bbox_x2": 510.0, "bbox_y2": 245.0},
                 {"text": "Related work on pruning and distillation.",
                  "section_path": "2 Related Work", "start_page": 3}])
             c.commit()
@@ -74,6 +76,15 @@ class ChunkHitsAreCarriedThrough(TempDbTestCase):
                 "SELECT chunk_no FROM chunks WHERE paper_id=? AND section_path LIKE '3%'",
                 (self.pid,)).fetchone()["chunk_no"]
         self.assertIn(method, nos, "命中的不是含该词的那一节")
+
+    def test_prepare_source_carries_pdf_locator(self):
+        ctx = rag.prepare(
+            [{"role": "user", "content": "quantization memory footprint"}],
+            top_k=1)
+        source = ctx.sources[0]
+        self.assertEqual(source["start_page"], 5)
+        self.assertEqual(source["section_path"], "3 Method")
+        self.assertEqual(source["bbox"], [72.0, 180.0, 510.0, 245.0])
 
     def test_chunks_by_no_preserves_order(self):
         """chunk_no 是 1 基（replace_chunks 先自增再插）。"""

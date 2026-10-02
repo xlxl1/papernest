@@ -55,7 +55,11 @@ _ready = False
 def _setup() -> None:
     """幂等初始化。**只挂在 `papernest` 这个 logger 上**，不碰 root——
     动 root 会顺手改掉 uvicorn / httpx 的日志行为，那不是这个模块该管的事。"""
-    global _ready
+    global _ready, LOG_PATH
+    # DATA_DIR may be redirected by an embedding application or by tests.
+    # Resolve the log location at setup time instead of freezing the import-time
+    # default from config.py.
+    LOG_PATH = config.DATA_DIR / "papernest.log"
     if _ready:
         return
     with _lock:
