@@ -3,7 +3,9 @@
   python cli.py verify  [--query Q] [--limit N]   第 0 步数据源验证
   python cli.py ingest  "关键词" [--limit N] [--topic T]
   python cli.py stats                             成本与缓存证据
+  python cli.py backup [path]                     制作并校验 SQLite 一致性备份
   python cli.py eval    [--k 5] [--qa] [--limit N] 评测三指标（--qa 需 LLM key）
+  python cli.py writing-eval [--modes single,serial,multi] [--online] P5 写作模式对比
   python cli.py demo                              离线演示（不连外网不调模型）
   python cli.py search  "关键词"                  库内检索（FTS）
   python cli.py models                            列出 API 实际可用的模型 ID（配 key 后跑）
@@ -27,7 +29,9 @@
 import argparse
 import json
 import os
+import sqlite3
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -104,8 +108,42 @@ def cmd_stats(args):
           f"completion {s['completion_tokens']} tok{cost}{lat}")
     print("最近检索（增量缓存证据）:")
     for r in s["recent_search_runs"]:
-        print(f"  #{r['id']} [{r['ts']}] {r['query']!r} via {r['source']}: "
-              f"结果 {r['results']} / 新 {r['new_papers']} / LLM {r['llm_calls']}")
+            print(f"  #{r['id']} [{r['ts']}] {r['query']!r} via {r['source']}: "
+                  f"结果 {r['results']} / 新 {r['new_papers']} / LLM {r['llm_calls']}")
+
+
+def cmd_backup(args):
+    """制作一致性快照并做 integrity_check，避免直接复制 WAL 中的 db 文件。"""
+    db.init_db()
+    source = Path(config.DB_PATH).resolve()
+    if not source.is_file():
+        print(f"源数据库不存在：{source}", file=sys.stderr)
+        sys.exit(1)
+    if args.path:
+        target = Path(args.path).expanduser().resolve()
+    else:
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        target = (config.DATA_DIR / "backups" / f"papernest-{stamp}.db").resolve()
+    if target == source:
+        print("备份目标不能与源数据库相同", file=sys.stderr)
+        sys.exit(2)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.exists():
+        if not args.force:
+            print(f"目标已存在，使用 --force 覆盖：{target}", file=sys.stderr)
+            sys.exit(2)
+        target.unlink()
+    src = sqlite3.connect(source)
+    dst = sqlite3.connect(target)
+    try:
+        src.backup(dst)
+        check = dst.execute("PRAGMA integrity_check").fetchone()[0]
+        if check != "ok":
+            raise RuntimeError(f"备份完整性检查失败：{check}")
+    finally:
+        dst.close()
+        src.close()
+    print(f"备份完成：{target}")
 
 
 def cmd_search(args):
@@ -853,6 +891,10 @@ def cmd_qasper(args):
     print(f"QASPER 证据评测（{r['n_questions']} 题 · 论文级 {r['retrieval_mode']} 检索）")
     print(f"  ① paper_hit@{r['k']}          : {r['paper_hit_at_k']}   gold 论文进全库检索 top-{r['k']}")
     print(f"  ② evidence_recall@sec{r['sec_k']} : {r['evidence_recall_at_sec_k']}   gold 论文内 top-{r['sec_k']} 节命中证据片段")
+    if r.get("evidence_by_bucket"):
+        print("  ③ 按问题类型：" + " | ".join(
+            f"{k}={v['evidence_recall']:.1%} (n={v['n']})"
+            for k, v in r["evidence_by_bucket"].items()))
     out = config.DATA_DIR / "qasper_eval.json"
     out.write_text(json.dumps(r, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"  报告已存：{out}")
@@ -915,6 +957,48 @@ def cmd_eval(args):
                          qa_mode=args.qa_mode)
     ev.print_report(report)
     print(f"\n报告已存：{out}")
+
+
+def cmd_writing_eval(args):
+    """Run the fixed, isolated P5 writing benchmark."""
+    from papernest import writing_benchmark
+    modes = tuple(dict.fromkeys(x.strip() for x in args.modes.split(",") if x.strip()))
+    out = Path(args.out) if args.out else config.DATA_DIR / "writing_eval_report.json"
+    budget_guard = {
+        "max_total_cost_usd": getattr(args, "max_cost_usd", None),
+        "max_llm_calls": getattr(args, "max_llm_calls", None),
+        "max_total_tokens": getattr(args, "max_tokens", None),
+        "max_wallclock_s": getattr(args, "max_wallclock_s", None),
+    }
+    if args.online and not any(budget_guard.values()):
+        # Online mode without any guardrail is a foot-gun: stop before the
+        # first call so the user confirms a real ceiling.
+        print("[writing-eval] 在线模式未设置预算护栏：建议至少指定 --max-cost-usd 或 "
+              "--max-llm-calls；否则将按账户余额无限制跑。")
+    if budget_guard.get("max_total_cost_usd") is not None and not config.LLM_PRICES_JSON:
+        print(f"[writing-eval] 拒绝启动：cost_usd 闸门需要 LLM_PRICES_JSON（当前未配置）；"
+              f"去掉 --max-cost-usd 或在 .env 设置 LLM_PRICES_JSON。")
+        sys.exit(2)
+    report = writing_benchmark.run_benchmark(
+        path=args.dataset or None, modes=modes or ("single", "serial", "multi"),
+        limit=args.limit, offline=not args.online, out_path=out,
+        budget_guard=budget_guard)
+    print(f"P5 写作评测：{report['dataset_hash'][:12]}  模式={','.join(report['modes'])}  "
+          f"失败={report['failure_count']}  offline={report['offline']}")
+    for mode, metrics in report.get("by_mode", {}).items():
+        print(f"  {mode:7s} 覆盖={metrics.get('evidence_coverage', '—')}  "
+              f"引用精确={metrics.get('citation_precision', '—')}  "
+              f"引用字面={metrics.get('citation_string_match', '—')}  "
+              f"数字保真={metrics.get('numeric_fidelity', '—')}  "
+              f"无支撑率={metrics.get('unsupported_claim_rate', '—')}  "
+              f"重写={metrics.get('rewrite_count', '—')}  "
+              f"耗时ms={metrics.get('latency_ms', '—')}  "
+              f"成本={metrics.get('cost_usd', '—')}  "
+              f"usage_known={metrics.get('usage_known', '—')}")
+    if report.get("budget_stopped"):
+        print(f"[writing-eval] 预算命中提前停跑：{report['budget_stopped']}；"
+              f"已用 {report.get('budget_used')}")
+    print(f"报告已存：{out}")
 
 
 def cmd_demo(args):
@@ -1135,6 +1219,11 @@ def main():
 
     sub.add_parser("stats").set_defaults(fn=cmd_stats)
 
+    bk = sub.add_parser("backup", help="制作 SQLite 一致性备份并验证完整性")
+    bk.add_argument("path", nargs="?", help="目标 .db 路径（默认 data/backups/UTC 时间戳.db）")
+    bk.add_argument("--force", action="store_true", help="目标已存在时覆盖")
+    bk.set_defaults(fn=cmd_backup)
+
     hp = sub.add_parser("health", help="检索健康探针（配置/索引/活体/检索四项）")
     hp.add_argument("--offline", action="store_true",
                     help="只跑配置与索引比对，0 次网络请求（CI 门禁用）")
@@ -1185,6 +1274,24 @@ def main():
     ev.add_argument("--limit", type=int, default=None, help="每类条目上限（冒烟用）")
     ev.add_argument("--out", default=None, help="报告输出路径（默认 data/eval_report.json）")
     ev.set_defaults(fn=cmd_eval)
+
+    we = sub.add_parser("writing-eval", help="P5 固定写作评测：单 Agent/串行/多 Agent 对比")
+    we.add_argument("--modes", default="single,serial,multi",
+                    help="逗号分隔模式：single,serial,multi")
+    we.add_argument("--dataset", default=None, help="自定义 writing_eval_set.json 路径")
+    we.add_argument("--limit", type=int, default=None, help="只跑前 N 个主题（冒烟用）")
+    we.add_argument("--online", action="store_true",
+                    help="允许真实 LLM；默认离线临时库，不访问网络且不花费模型额度")
+    we.add_argument("--out", default=None, help="报告输出路径（默认 data/writing_eval_report.json）")
+    we.add_argument("--max-cost-usd", type=float, default=None,
+                    help="在线评测总花费上限（USD），命中后立即停跑")
+    we.add_argument("--max-llm-calls", type=int, default=None,
+                    help="在线评测总调用次数上限，命中后立即停跑")
+    we.add_argument("--max-tokens", type=int, default=None,
+                    help="在线评测总 token 上限，命中后立即停跑")
+    we.add_argument("--max-wallclock-s", type=float, default=None,
+                    help="在线评测总耗时上限（秒），命中后立即停跑")
+    we.set_defaults(fn=cmd_writing_eval)
 
     sub.add_parser("reindex", help="重建页级全文索引 pages_fts（排障/兜底用）"
                    ).set_defaults(fn=cmd_reindex)

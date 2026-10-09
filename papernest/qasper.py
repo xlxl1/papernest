@@ -312,6 +312,18 @@ def run_eval(k: int = 5, sec_k: int = 2, max_papers: int = 30,
     db.init_db()
     paper_items, sec_items = [], []
     n_q = 0
+    retrieval_cache: dict[str, dict] = {}
+    def question_bucket(text: str) -> str:
+        q = (text or '').lower()
+        if any(x in q for x in ('formula', 'equation', '公式', '推导')):
+            return 'formula'
+        if any(x in q for x in ('table', 'tab.', '表格', '准确率', '数值')):
+            return 'table_numeric'
+        if any(x in q for x in ('experiment', 'result', 'results', 'ablation',
+                                'evaluation', 'benchmark', 'outperform',
+                                'baseline', 'compared', 'performance', '实验', '结果', '评测')):
+            return 'experiment_result'
+        return 'general'
     with db.conn() as c:
         for paper_id, paper in list(data.items())[:min(max_papers, MAX_PAPERS)]:
             key = f"qasper:{paper_id}"
@@ -335,31 +347,60 @@ def run_eval(k: int = 5, sec_k: int = 2, max_papers: int = 30,
                     continue
 
                 # ① 论文级：gold 论文是否进入全库检索 top-k（干扰项 = 全库）
-                r = tools.retrieve_library(question, k)
+                # QASPER contains repeated/paraphrased questions across runs;
+                # cache identical queries so a full evaluation does not pay
+                # for the same remote embedding twice.
+                r = retrieval_cache.get(question)
+                if r is None:
+                    r = tools.retrieve_library(question, k)
+                    retrieval_cache[question] = r
                 paper_hit = 1.0 if pid in r["paper_ids"][:k] else 0.0
                 paper_items.append({"paper": paper_id, "qid": qid, "hit": paper_hit,
                                     "mode": r.get("retrieval_mode") or "fts"})
 
                 # ② 节级：gold 论文内按关键词重叠排节，top-sec_k 节是否含 gold 证据
-                words = [w for w in re.findall(r"[a-zA-Z][a-zA-Z-]{2,}", question)][:8]
+                words = [w.lower() for w in re.findall(r"[a-zA-Z][a-zA-Z-]{2,}", question)][:12]
+                # Rank evidence sections by BM25-like density rather than raw
+                # overlap. Raw counts systematically favor long related-work
+                # sections and reference lists, while rare question terms are
+                # more useful signals for locating the gold span.
+                n_sections = max(len(sec_norms), 1)
+                df = {w: sum(w in t for t in sec_norms.values()) for w in words}
+                idf = {w: __import__('math').log(1 + (n_sections - d + 0.5) / (d + 0.5))
+                       for w, d in df.items()}
                 def sec_score(no_txt):
                     no, t = no_txt
                     tl = t.lower()
-                    return sum(tl.count(w.lower()) for w in words)
+                    weighted = sum(tl.count(w) * idf[w] for w in words)
+                    # Slightly prefer compact evidence sections, but do not
+                    # suppress long sections that contain several signals.
+                    return weighted / ((len(tl) or 1) ** 0.35)
                 ranked = sorted(sec_norms.items(), key=sec_score, reverse=True)[:sec_k]
                 ev_hit = 0.0
                 for no, _ in ranked:
                     if any(g in sec_norms[no] for g in gold_norms):
                         ev_hit = 1.0
                         break
-                sec_items.append({"paper": paper_id, "qid": qid, "hit": ev_hit})
+                sec_items.append({"paper": paper_id, "qid": qid, "hit": ev_hit,
+                                  "bucket": question_bucket(question)})
+                if n_q % 10 == 0:
+                    print(f"[qasper] 已处理 {n_q} 题，paper_hit={sum(i['hit'] for i in paper_items)/max(len(paper_items),1):.1%}，"
+                          f"evidence={sum(i['hit'] for i in sec_items)/max(len(sec_items),1):.1%}", flush=True)
             if max_questions and n_q >= max_questions:
                 break
+    by_bucket = {}
+    for bucket in sorted({x['bucket'] for x in sec_items}):
+        xs = [x for x in sec_items if x['bucket'] == bucket]
+        by_bucket[bucket] = {
+            'n': len(xs),
+            'evidence_recall': round(sum(x['hit'] for x in xs) / max(len(xs), 1), 4),
+        }
     return {
         "paper_hit_at_k": round(sum(i["hit"] for i in paper_items) / max(len(paper_items), 1), 4),
         "evidence_recall_at_sec_k": round(sum(i["hit"] for i in sec_items) / max(len(sec_items), 1), 4),
         "k": k, "sec_k": sec_k, "n_questions": len(paper_items),
         "retrieval_mode": paper_items[0]["mode"] if paper_items else "unknown",
+        "evidence_by_bucket": by_bucket,
         "paper_items": paper_items[:30], "sec_items": sec_items[:30],
     }
 

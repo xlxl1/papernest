@@ -4,13 +4,16 @@ import hmac
 import json
 import math
 import os
+import re
+import uuid
 from pathlib import Path
 
-from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Request, Response, UploadFile
+from fastapi import (BackgroundTasks, File, FastAPI, HTTPException, Query, Request,
+                     Response, UploadFile)
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 
-from . import (agent, bibimport, cards, chat, cite, config, db, deepsearch, degrade,
+from . import (agent, bibimport, budget, cards, chat, cite, config, coordinator, db, deepsearch, degrade,
                embeddings, fulltext, graph, jobs, llm, log, matrix, pdfimport,
                pipeline, pptgen, rag, structure, subscribe, survey, symbols,
                tablegen, workspace, writing)
@@ -31,7 +34,9 @@ from .schemas import (
 
 _log = log.get("api")
 
-app = FastAPI(title="PaperNest", docs_url=None, redoc_url=None)
+# 文档端点默认关闭。生产环境如果需要 OpenAPI，应通过受保护的独立网关暴露，
+# 避免把完整接口契约和模型字段泄露给未认证请求。
+app = FastAPI(title="PaperNest", docs_url=None, redoc_url=None, openapi_url=None)
 WEB = Path(__file__).resolve().parent.parent / "web"
 
 # 可选访问口令：设了 PAPERNEST_API_KEY 才启用（本机自用默认不设，行为不变）。
@@ -89,8 +94,18 @@ def _check_exposure():
 @app.middleware("http")
 async def _auth(request: Request, call_next):
     if API_KEY and request.url.path.startswith("/api/"):
-        got = (request.headers.get("x-api-key")
-               or request.query_params.get("api_key") or "")
+        # 浏览器原生 EventSource / img / iframe 无法自定义请求头，SSE 才允许
+        # query 传 key；普通 API 即使带 api_key 也必须走请求头，避免密钥进入
+        # 代理访问日志、浏览器历史和 Referer。
+        is_sse = (request.url.path.endswith("/events")
+                  or request.url.path.endswith("/stream")
+                  or "text/event-stream" in request.headers.get("accept", ""))
+        got = request.headers.get("x-api-key", "")
+        authenticated_by_header = bool(got)
+        if not got:
+            got = request.cookies.get("papernest_auth", "")
+        if is_sse and not got:
+            got = request.query_params.get("api_key", "")
         # **必须先 encode**：`hmac.compare_digest` 对两个 str 只支持 ASCII，
         # 含中文的口令直接 TypeError —— 中间件里没有兜底、也没有全局异常处理器，
         # 结果是每个 /api/* 恒定 500 而不是 401，前端只在 401 时才弹口令输入框，
@@ -98,7 +113,28 @@ async def _auth(request: Request, call_next):
         # 填中文口令是完全正常的选择。encode 之后仍是常数时间比较。
         if not hmac.compare_digest(got.encode("utf-8"), API_KEY.encode("utf-8")):
             return JSONResponse({"detail": "缺少或错误的 API key"}, status_code=401)
+        response = await call_next(request)
+        # 浏览器的 img/iframe 无法设置请求头。首个 fetch 用 header 鉴权成功后，
+        # 写入 HttpOnly cookie，后续 PDF/PNG 原生请求无需把密钥放进 URL。
+        if authenticated_by_header:
+            response.set_cookie("papernest_auth", API_KEY, httponly=True,
+                                samesite="strict", secure=request.url.scheme == "https",
+                                max_age=86_400, path="/")
+        return response
     return await call_next(request)
+
+
+@app.middleware("http")
+async def _request_context(request: Request, call_next):
+    """为每个请求返回可关联的 request id，并补齐低风险安全响应头。"""
+    supplied = request.headers.get("x-request-id", "")
+    request_id = supplied[:128] if re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", supplied) else uuid.uuid4().hex
+    request.state.request_id = request_id
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = request_id
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    return response
 
 
 @app.exception_handler(Exception)
@@ -110,9 +146,39 @@ async def _log_unhandled(request: Request, exc: Exception):
     「500 Internal Server Error」。本机单用户不需要告警，但需要**事后查得到**。
     响应体保持 FastAPI 默认的形状，不把内部错误文本透给客户端。
     """
-    _log.exception("未处理的异常 %s %s", request.method, request.url.path)
+    _log.exception("未处理的异常 request_id=%s %s %s",
+                   getattr(request.state, "request_id", "-"),
+                   request.method, request.url.path)
+    rid = getattr(request.state, "request_id", "-")
     return JSONResponse({"detail": "服务器内部错误，详见 data/papernest.log"},
-                        status_code=500)
+                        status_code=500,
+                        headers={"X-Request-ID": rid,
+                                 "X-Content-Type-Options": "nosniff",
+                                 "Referrer-Policy": "strict-origin-when-cross-origin"})
+
+
+@app.exception_handler(budget.BudgetExceeded)
+async def _budget_exceeded(request: Request, exc: budget.BudgetExceeded):
+    _log.warning("预算闸门拒绝请求 request_id=%s path=%s",
+                 getattr(request.state, "request_id", "-"), request.url.path)
+    rid = getattr(request.state, "request_id", "-")
+    return JSONResponse({"detail": str(exc), "code": "daily_token_budget_exceeded"},
+                        status_code=429, headers={"Retry-After": "86400",
+                                                   "X-Request-ID": rid,
+                                                   "X-Content-Type-Options": "nosniff"})
+
+
+@app.exception_handler(budget.BudgetUnavailable)
+async def _budget_unavailable(request: Request, exc: budget.BudgetUnavailable):
+    _log.error("预算数据不可用 request_id=%s path=%s",
+               getattr(request.state, "request_id", "-"), request.url.path,
+               exc_info=True)
+    rid = getattr(request.state, "request_id", "-")
+    return JSONResponse({"detail": "预算服务暂时不可用，请稍后重试",
+                         "code": "budget_unavailable"},
+                        status_code=503,
+                        headers={"X-Request-ID": rid,
+                                 "X-Content-Type-Options": "nosniff"})
 
 
 @app.on_event("startup")
@@ -125,7 +191,10 @@ def _on_startup():
               f"（绑定 {BIND_HOST}）。对外提供服务前请设置口令。")
     n = jobs.recover_stale_jobs()
     if n:
-        print(f"[papernest] 已把 {n} 个中断任务标记为 failed（服务重启）")
+        recovered = jobs.drain_recovered()
+        for job_id in recovered:
+            jobs.submit(job_id)
+        print(f"[papernest] 已检查 {n} 个中断任务，自动恢复 {len(recovered)} 个")
 
 
 @app.get("/")
@@ -136,8 +205,12 @@ def index():
 # ── 库 ──
 
 @app.get("/api/papers")
-def papers(q: str = "", limit: int = 50,
-           year_from: int | None = None, year_to: int | None = None):
+def papers(q: str = Query("", max_length=500),
+           limit: int = Query(50, ge=1, le=200),
+           year_from: int | None = Query(None, ge=1800, le=2200),
+           year_to: int | None = Query(None, ge=1800, le=2200)):
+    if year_from is not None and year_to is not None and year_from > year_to:
+        raise HTTPException(status_code=422, detail="year_from 不能晚于 year_to")
     db.init_db()
     with db.conn() as c:
         rows = (db.search_fts(c, q, limit * 2) if q else
@@ -162,11 +235,25 @@ def papers(q: str = "", limit: int = 50,
 
 
 class IngestBody(BaseModel):
-    query: str = ""
-    keywords: list[str] = []
-    limit: int = 50
-    year_from: int | None = None
-    year_to: int | None = None
+    query: str = Field(default="", max_length=1000)
+    keywords: list[str] = Field(default_factory=list, max_length=20)
+    limit: int = Field(default=50, ge=1, le=100)
+    year_from: int | None = Field(default=None, ge=1800, le=2200)
+    year_to: int | None = Field(default=None, ge=1800, le=2200)
+
+    @field_validator("keywords")
+    @classmethod
+    def _keyword_lengths(cls, values: list[str]) -> list[str]:
+        if any(len(v) > 200 for v in values):
+            raise ValueError("单个关键词不能超过 200 个字符")
+        return values
+
+    @model_validator(mode="after")
+    def _year_range(self):
+        if (self.year_from is not None and self.year_to is not None
+                and self.year_from > self.year_to):
+            raise ValueError("year_from 不能晚于 year_to")
+        return self
 
 
 # ── Research Agent ──
@@ -189,7 +276,7 @@ def agent_run(body: AgentRequest):
 
 
 @app.get("/api/agent/runs")
-def agent_runs(limit: int = 20):
+def agent_runs(limit: int = Query(20, ge=1, le=100)):
     """历史执行轨迹（时间线 UI 的回放数据）。"""
     db.init_db()
     return {"runs": db.list_agent_runs(limit)}
@@ -206,8 +293,10 @@ def agent_run_detail(run_id: str):
 # ── 异步任务：提交 / 轮询 / SSE 进度 ──
 
 class JobCreate(BaseModel):
-    kind: str  # ingest | read | survey | agent | polish | review | write
-    params: dict = {}
+    kind: str = Field(min_length=1, max_length=40)  # ingest | read | survey | agent | polish | review | write
+    params: dict = Field(default_factory=dict)
+    idempotency_key: str | None = Field(default=None, min_length=1, max_length=120)
+    max_attempts: int = Field(default=1, ge=1, le=5)
 
 
 @app.post("/api/jobs")
@@ -219,15 +308,19 @@ def create_job(body: JobCreate, background: BackgroundTasks):
     dedupe = (f"write:{body.params.get('run_id')}"
               if body.kind == "write" and body.params.get("run_id") else None)
     try:
-        job_id = jobs.create_job(body.kind, body.params, dedupe_key=dedupe)
+        job_id = jobs.create_job(body.kind, body.params, dedupe_key=dedupe,
+                                 idempotency_key=body.idempotency_key,
+                                 max_attempts=body.max_attempts)
     except jobs.JobConflict as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     background.add_task(jobs.submit, job_id)
     return {"job_id": job_id, "kind": body.kind, "status": "queued"}
 
 
 @app.get("/api/jobs")
-def list_jobs(limit: int = 20):
+def list_jobs(limit: int = Query(20, ge=1, le=100)):
     db.init_db()
     return {"jobs": jobs.list_jobs(limit)}
 
@@ -265,13 +358,23 @@ def job_events(job_id: str):
                 if idle >= 15:
                     idle = 0.0
                     yield ": keepalive\n\n"
-            if job["status"] in ("done", "failed"):
+            if job["status"] in ("done", "failed", "cancelled"):
                 return
             await asyncio.sleep(0.5)
 
     return StreamingResponse(stream(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache",
-                                      "X-Accel-Buffering": "no"})
+                                     "X-Accel-Buffering": "no"})
+
+
+@app.post("/api/jobs/{job_id}/cancel")
+def cancel_job(job_id: str):
+    if not jobs.get_job(job_id):
+        raise HTTPException(status_code=404, detail="任务不存在")
+    job = jobs.cancel_job(job_id)
+    if not job:
+        raise HTTPException(status_code=409, detail="任务已完成，无法取消")
+    return job
 
 
 # ── Research workspace: projects, notes and writing documents ──
@@ -382,7 +485,17 @@ def get_document(document_id: int):
 
 @app.patch("/api/documents/{document_id}")
 def update_document(document_id: int, body: DocumentUpdate):
-    document = workspace.update_document(document_id, **body.model_dump(exclude_unset=True))
+    update = body.model_dump(exclude_unset=True)
+    version = update.pop("version", None)
+    if update.get("expected_version") is None and version is not None:
+        update["expected_version"] = version
+    try:
+        document = workspace.update_document(document_id,
+                                             **update)
+    except workspace.VersionConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not document:
         raise HTTPException(status_code=404, detail="文档不存在")
     return document
@@ -433,6 +546,8 @@ def do_ingest(body: IngestBody):
 # ── 本地入库：上传 PDF / 导入 BibTeX·RIS·Zotero CSV ──
 
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024
+MAX_UPLOAD_FILES = 20
+MAX_UPLOAD_TOTAL_BYTES = 200 * 1024 * 1024
 
 
 def _read_capped(fp, limit: int, chunk: int = 1 << 20) -> bytes | None:
@@ -464,15 +579,37 @@ def upload_pdfs(files: list[UploadFile] = File(...), topic: str = "",
     """
     if not files:
         raise HTTPException(status_code=400, detail="没有收到文件")
+    if len(files) > MAX_UPLOAD_FILES:
+        raise HTTPException(status_code=413,
+                            detail=f"单批最多上传 {MAX_UPLOAD_FILES} 个文件")
+    if len(topic) > 500:
+        raise HTTPException(status_code=422, detail="topic 不能超过 500 个字符")
+    declared_sizes = [getattr(f, "size", None) for f in files]
+    if all(size is not None for size in declared_sizes):
+        declared_total = sum(int(size) for size in declared_sizes)
+        if declared_total > MAX_UPLOAD_TOTAL_BYTES:
+            raise HTTPException(status_code=413,
+                                detail=f"单批文件总大小不能超过 {MAX_UPLOAD_TOTAL_BYTES // 1024 // 1024}MB")
     results, failed = [], []
+    total_read = 0
     for f in files:
+        if getattr(f, "size", None) is not None and int(f.size) > MAX_UPLOAD_BYTES:
+            failed.append({"filename": f.filename,
+                           "error": f"超过 {MAX_UPLOAD_BYTES // 1024 // 1024}MB 单文件上限"})
+            continue
         # 分块读到上限就停：原来是先 `await f.read()` 整个读进内存、**再**判大小，
         # 防线设在内存已经被占满之后，等于没有。
-        data = _read_capped(f.file, MAX_UPLOAD_BYTES)
-        if data is None:
-            failed.append({"filename": f.filename,
-                           "error": f"超过 {MAX_UPLOAD_BYTES // 1024 // 1024}MB 上限"})
+        remaining = MAX_UPLOAD_TOTAL_BYTES - total_read
+        if remaining <= 0:
+            failed.append({"filename": f.filename, "error": "超过单批总大小上限"})
             continue
+        data = _read_capped(f.file, min(MAX_UPLOAD_BYTES, remaining))
+        if data is None:
+            reason = (f"超过 {MAX_UPLOAD_BYTES // 1024 // 1024}MB 单文件上限"
+                      if remaining >= MAX_UPLOAD_BYTES else "超过单批总大小上限")
+            failed.append({"filename": f.filename, "error": reason})
+            continue
+        total_read += len(data)
         try:
             results.append(pdfimport.ingest_pdf(data, f.filename or "upload.pdf",
                                                 topic=topic or None,
@@ -491,18 +628,25 @@ def upload_pdfs(files: list[UploadFile] = File(...), topic: str = "",
 
 
 @app.get("/api/papers/uploads")
-def list_uploads(limit: int = 50):
+def list_uploads(limit: int = Query(50, ge=1, le=200)):
     return {"uploads": pdfimport.list_uploads(limit)}
 
 
 class MetadataFix(BaseModel):
-    title: str | None = None
-    authors: list[str] | None = None
-    year: int | None = None
-    venue: str | None = None
-    doi: str | None = None
-    arxiv_id: str | None = None
-    abstract: str | None = None
+    title: str | None = Field(default=None, max_length=1000)
+    authors: list[str] | None = Field(default=None, max_length=100)
+    year: int | None = Field(default=None, ge=1800, le=2200)
+    venue: str | None = Field(default=None, max_length=500)
+    doi: str | None = Field(default=None, max_length=300)
+    arxiv_id: str | None = Field(default=None, max_length=200)
+    abstract: str | None = Field(default=None, max_length=100_000)
+
+    @field_validator("authors")
+    @classmethod
+    def _author_lengths(cls, values: list[str] | None) -> list[str] | None:
+        if values is not None and any(len(author) > 300 for author in values):
+            raise ValueError("单个作者名不能超过 300 个字符")
+        return values
 
 
 @app.patch("/api/paper/{paper_id}/metadata")
@@ -521,10 +665,10 @@ def fix_metadata(paper_id: int, body: MetadataFix):
 
 
 class BibImportBody(BaseModel):
-    text: str
-    fmt: str = "auto"          # auto | bibtex | ris | csv
+    text: str = Field(min_length=1, max_length=5_000_000)
+    fmt: str = Field(default="auto", max_length=20)  # auto | bibtex | ris | csv
     enrich: bool = False       # 用 Semantic Scholar 补缺失摘要（会联网）
-    source_name: str = ""
+    source_name: str = Field(default="", max_length=500)
 
 
 @app.post("/api/import/bibliography")
@@ -550,7 +694,8 @@ def import_bibliography(body: BibImportBody, background: BackgroundTasks):
 @app.post("/api/import/bibliography/file")
 def import_bibliography_file(background: BackgroundTasks,
                              file: UploadFile = File(...),
-                             fmt: str = "auto", enrich: bool = False):
+                             fmt: str = Query("auto", max_length=20),
+                             enrich: bool = False):
     """同步 `def`：函数体里是解析与 SQLite 写，写成 async 会占死事件循环（同 upload_pdfs）。"""
     data = _read_capped(file.file, 20 * 1024 * 1024)
     if data is None:
@@ -569,7 +714,7 @@ def import_bibliography_file(background: BackgroundTasks,
 
 
 @app.get("/api/import/runs")
-def import_runs(limit: int = 20):
+def import_runs(limit: int = Query(20, ge=1, le=100)):
     return {"runs": bibimport.list_imports(limit)}
 
 
@@ -581,8 +726,9 @@ def graph_stats():
 
 
 @app.post("/api/paper/{paper_id}/edges")
-def graph_fetch_edges(paper_id: int, direction: str = "both", limit: int = 100,
-                      max_age_days: int = 30):
+def graph_fetch_edges(paper_id: int, direction: str = Query("both", max_length=20),
+                      limit: int = Query(100, ge=1, le=500),
+                      max_age_days: int = Query(30, ge=0, le=3650)):
     """拉该论文的 references / citations 入边表（会联网，已拉过的按 max_age_days 跳过）。"""
     try:
         return graph.fetch_edges(paper_id, direction, limit, max_age_days=max_age_days)
@@ -604,7 +750,8 @@ def graph_local_references(paper_id: int):
 
 
 @app.get("/api/paper/{paper_id}/neighbors")
-def graph_neighbors(paper_id: int, depth: int = 1, limit: int = 50):
+def graph_neighbors(paper_id: int, depth: int = Query(1, ge=1, le=5),
+                    limit: int = Query(50, ge=1, le=500)):
     # graph.neighbors 对不在库的 paper_id 抛 GraphError。不接就是 500 + 裸 traceback，
     # 而同一模块紧邻的另外两个路由都规规矩矩映射成 400——同一类错误两种口径。
     try:
@@ -613,9 +760,19 @@ def graph_neighbors(paper_id: int, depth: int = 1, limit: int = 50):
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-class RelatedBody(BaseModel):
-    paper_ids: list[int]
-    top_k: int = 20
+class _PaperIdsBody(BaseModel):
+    paper_ids: list[int] = Field(min_length=1, max_length=100)
+
+    @field_validator("paper_ids")
+    @classmethod
+    def _positive_ids(cls, values: list[int]) -> list[int]:
+        if any(pid < 1 for pid in values):
+            raise ValueError("paper_ids 必须是正整数")
+        return values
+
+
+class RelatedBody(_PaperIdsBody):
+    top_k: int = Field(default=20, ge=1, le=100)
 
 
 @app.post("/api/graph/related")
@@ -628,13 +785,13 @@ def graph_related(body: RelatedBody):
 
 
 @app.get("/api/graph/gaps")
-def graph_gaps(top_k: int = 20):
+def graph_gaps(top_k: int = Query(20, ge=1, le=100)):
     """被库内论文频繁引用、但自己不在库里的论文——最明确的阅读缺口。"""
     return {"gaps": graph.gap_papers(top_k)}
 
 
 @app.post("/api/graph/adopt")
-def graph_adopt(norm_key: str):
+def graph_adopt(norm_key: str = Query(..., min_length=1, max_length=300)):
     """把图里的库外论文一键入库。"""
     try:
         return graph.adopt(norm_key)
@@ -645,15 +802,22 @@ def graph_adopt(norm_key: str):
 # ── 新论文订阅推送 ──
 
 class DigestBody(BaseModel):
-    days: int = 3
-    top_k: int = 15
-    categories: list[str] | None = None
+    days: int = Field(default=3, ge=1, le=30)
+    top_k: int = Field(default=15, ge=1, le=50)
+    categories: list[str] | None = Field(default=None, max_length=20)
     use_llm: bool = False
-    repeat_after_days: int = 30
+    repeat_after_days: int = Field(default=30, ge=1, le=365)
+
+    @field_validator("categories")
+    @classmethod
+    def _category_lengths(cls, values: list[str] | None) -> list[str] | None:
+        if values is not None and any(len(category) > 100 for category in values):
+            raise ValueError("单个分类不能超过 100 个字符")
+        return values
 
 
 @app.get("/api/subscribe/profile")
-def subscribe_profile(limit: int = 200):
+def subscribe_profile(limit: int = Query(200, ge=1, le=500)):
     """从库内论文反推的兴趣画像（可解释：每个词项带权重）。"""
     return subscribe.build_profile(limit)
 
@@ -667,7 +831,7 @@ def subscribe_digest(body: DigestBody, background: BackgroundTasks):
 
 
 @app.get("/api/subscribe/digests")
-def subscribe_digests(limit: int = 20):
+def subscribe_digests(limit: int = Query(20, ge=1, le=100)):
     return {"digests": subscribe.list_digests(limit)}
 
 
@@ -680,7 +844,7 @@ def subscribe_digest_detail(digest_id: int):
 
 
 @app.post("/api/subscribe/digests/{digest_id}/adopt")
-def subscribe_adopt(digest_id: int, norm_key: str):
+def subscribe_adopt(digest_id: int, norm_key: str = Query(..., min_length=1, max_length=300)):
     try:
         return subscribe.adopt(digest_id, norm_key)
     except LookupError as exc:
@@ -690,7 +854,7 @@ def subscribe_adopt(digest_id: int, norm_key: str):
 
 
 @app.post("/api/subscribe/digests/{digest_id}/dismiss")
-def subscribe_dismiss(digest_id: int, norm_key: str):
+def subscribe_dismiss(digest_id: int, norm_key: str = Query(..., min_length=1, max_length=300)):
     try:
         return subscribe.dismiss(digest_id, norm_key)
     except LookupError as exc:
@@ -699,12 +863,19 @@ def subscribe_dismiss(digest_id: int, norm_key: str):
 
 # ── 结构化文献对比矩阵 ──
 
-class MatrixBody(BaseModel):
-    paper_ids: list[int]
-    columns: list[dict] | None = None
+class MatrixBody(_PaperIdsBody):
+    paper_ids: list[int] = Field(min_length=1, max_length=50)
+    columns: list[dict] | None = Field(default=None, max_length=30)
     use_llm: bool | None = None
-    topic: str | None = None
-    fmt: str | None = None       # 给了就直接返回导出文本（csv / markdown / latex）
+    topic: str | None = Field(default=None, max_length=1000)
+    fmt: str | None = Field(default=None, max_length=20)
+
+    @field_validator("columns")
+    @classmethod
+    def _column_payload_size(cls, values: list[dict] | None) -> list[dict] | None:
+        if values is not None and len(json.dumps(values, ensure_ascii=False)) > 200_000:
+            raise ValueError("columns 参数不能超过 200KB")
+        return values
 
 
 @app.post("/api/matrix")
@@ -731,8 +902,15 @@ def matrix_presets():
 
 
 class PresetBody(BaseModel):
-    name: str
-    columns: list[dict]
+    name: str = Field(min_length=1, max_length=100)
+    columns: list[dict] = Field(min_length=1, max_length=30)
+
+    @field_validator("columns")
+    @classmethod
+    def _column_payload_size(cls, values: list[dict]) -> list[dict]:
+        if len(json.dumps(values, ensure_ascii=False)) > 200_000:
+            raise ValueError("columns 参数不能超过 200KB")
+        return values
 
 
 @app.post("/api/matrix/presets")
@@ -753,7 +931,7 @@ def matrix_delete_preset(name: str):
 # ── PDF 版面结构（章节切分 + 参考文献抽取）──
 
 @app.get("/api/paper/{paper_id}/structure")
-def paper_structure(paper_id: int, max_chars: int = 4000):
+def paper_structure(paper_id: int, max_chars: int = Query(4000, ge=100, le=50_000)):
     """按字号/编号启发式识别章节，并抽参考文献条目。0 token、不联网。"""
     return structure.summarize(str(_local_pdf(paper_id)), max_chars=max_chars)
 
@@ -768,9 +946,16 @@ class DeepBody(BaseModel):
     一个请求打穿配额。max_rounds 上限与 deepsearch.MAX_CONTEXT_PAPERS 对齐
     （5 × top_k 上限 20 已远超篇数闸门，闸门兜底、这里挡住明显的误用）。
     """
-    question: str
+    question: str = Field(min_length=1, max_length=10_000)
     top_k: int = Field(5, ge=1, le=20)
     max_rounds: int = Field(2, ge=1, le=5)
+
+    @field_validator("question")
+    @classmethod
+    def _question_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("问题不能为空")
+        return value
 
 
 @app.post("/api/search/deep")
@@ -859,13 +1044,31 @@ def paper_detail(paper_id: int):
 # ── 问答 ──
 
 class ChatBody(BaseModel):
-    messages: list[dict]
+    messages: list[dict] = Field(min_length=1, max_length=50)
     # 必须有上下界。`top_k` 一路传到 SQL 的 LIMIT，而 **SQLite 的 `LIMIT -1` 是
     # 「不限」**（实测：10 行的表 `LIMIT -1` 返回 10 行）——传 -1 会让一次请求
     # 把全库拉回来拼进 prompt。上界与 `/api/answer/deep` 的 DeepBody 对齐（le=20）：
     # 同一个参数在相邻端点上两套口径本身就是坑。
     top_k: int = Field(5, ge=1, le=20)
     session_id: str | None = None   # 传了就启用服务端会话记忆；不传行为与以前一致
+
+    @field_validator("messages")
+    @classmethod
+    def _message_bounds(cls, values: list[dict]) -> list[dict]:
+        allowed = {"system", "user", "assistant"}
+        total = 0
+        for message in values:
+            if not isinstance(message, dict) or message.get("role") not in allowed:
+                raise ValueError("messages 中每项必须包含合法 role")
+            content = message.get("content")
+            if not isinstance(content, str) or not content.strip():
+                raise ValueError("消息内容不能为空")
+            if len(content) > 20_000:
+                raise ValueError("单条消息不能超过 20000 个字符")
+            total += len(content)
+        if total > 100_000:
+            raise ValueError("对话总长度不能超过 100000 个字符")
+        return values
 
 
 @app.post("/api/chat")
@@ -874,11 +1077,11 @@ def do_chat(body: ChatBody):
         sid = chat.ensure_session(body.session_id, _last_user(body.messages)) \
             if body.session_id is not None else None
         return rag.answer(body.messages, body.top_k, session_id=sid)
+    except (budget.BudgetExceeded, budget.BudgetUnavailable):
+        raise
     except Exception as e:
-        # 形状不改：前端把 answer 渲染成气泡里的 ⚠，改成非 2xx 会打坏它。
-        # 但异常必须留痕——否则 traceback 连同栈帧一起消失，事后无从复盘。
         _log.exception("chat 失败 session=%s", body.session_id)
-        return {"answer": f"⚠ {e}", "sources": [], "error": True}
+        raise HTTPException(status_code=502, detail="问答服务暂时不可用，请稍后重试") from e
 
 
 def _last_user(messages: list[dict]) -> str:
@@ -902,8 +1105,11 @@ def do_chat_stream(body: ChatBody):
     sid = chat.ensure_session(body.session_id, q_text) if body.session_id is not None else None
     try:
         ctx = rag.prepare(body.messages, body.top_k, session_id=sid)
+    except (budget.BudgetExceeded, budget.BudgetUnavailable):
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"检索失败：{e}") from e
+        _log.exception("流式问答检索失败 session=%s", sid)
+        raise HTTPException(status_code=502, detail="检索服务暂时不可用，请稍后重试") from e
     sys, q, sources, degraded, notes = ctx
 
     def gen():
@@ -927,7 +1133,8 @@ def do_chat_stream(body: ChatBody):
                 chat.append(sid, "user", q)
                 chat.append(sid, "assistant", "".join(acc), sources,
                             degrade.render(broken), broken)
-            yield _sse("error", {"error": f"{type(e).__name__}: {str(e)[:200]}",
+            _log.exception("流式问答输出失败 session=%s", sid)
+            yield _sse("error", {"error": "输出服务暂时不可用，请稍后重试",
                                  "degraded": degrade.render(broken),
                                  "degraded_detail": degrade.as_dicts(broken)})
             return
@@ -946,7 +1153,7 @@ def do_chat_stream(body: ChatBody):
 # ── 对话会话（历史可回放）──
 
 @app.get("/api/chat/sessions")
-def chat_sessions(limit: int = 30):
+def chat_sessions(limit: int = Query(30, ge=1, le=100)):
     return {"sessions": chat.list_sessions(limit)}
 
 
@@ -966,27 +1173,43 @@ def chat_session_delete(session_id: str):
 
 
 class SurveyBody(BaseModel):
-    topic: str
+    topic: str = Field(min_length=1, max_length=2000)
     # 综述比问答吃更多篇，但同样不能无界：`survey._context_blocks` 没有字符预算，
     # top_k 大到一定程度就会拼出十几万字符的 prompt，而 `llm.chat` 对 400 不重试
     # ——用户看到的是一句透传的 provider 英文报错。
     top_k: int = Field(10, ge=1, le=30)
+
+    @field_validator("topic")
+    @classmethod
+    def _topic_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("主题不能为空")
+        return value
 
 
 @app.post("/api/survey")
 def do_survey(body: SurveyBody):
     try:
         return survey.generate(body.topic, body.top_k)
+    except (budget.BudgetExceeded, budget.BudgetUnavailable):
+        raise
     except Exception as e:
         _log.exception("survey 生成失败 topic=%s", body.topic)
-        return {"survey": f"⚠ {e}", "sources": [], "checks": [], "error": True}
+        raise HTTPException(status_code=502, detail="综述服务暂时不可用，请稍后重试") from e
 
 
 # ── 引用推荐 ──
 
 class CiteBody(BaseModel):
-    text: str
-    top_k: int = 5
+    text: str = Field(min_length=1, max_length=20_000)
+    top_k: int = Field(default=5, ge=1, le=20)
+
+    @field_validator("text")
+    @classmethod
+    def _text_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("引用上下文不能为空")
+        return value
 
 
 @app.post("/api/cite")
@@ -994,9 +1217,9 @@ def do_cite(body: CiteBody):
     return cite.recommend(body.text, body.top_k)
 
 
-class ExportBody(BaseModel):
-    paper_ids: list[int]
-    fmt: str = "bibtex"
+class ExportBody(_PaperIdsBody):
+    paper_ids: list[int] = Field(min_length=1, max_length=100)
+    fmt: str = Field(default="bibtex", max_length=20)
 
 
 @app.post("/api/export", response_class=PlainTextResponse)
@@ -1004,7 +1227,7 @@ def do_export(body: ExportBody):
     try:
         return cite.export(body.paper_ids, body.fmt)
     except ValueError as e:
-        return str(e)
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
 
 # ── 写作流水线（选题/大纲/撰写/文献/润色 五 Agent 确定性流水线）──
@@ -1012,10 +1235,13 @@ def do_export(body: ExportBody):
 # 确认即提交下一阶段任务——断点续跑天然成立。文献 Agent 实施引用白名单制。
 
 def _start_write_job(run_id: str, stage: str, background: BackgroundTasks,
-                     extra: dict | None = None) -> str:
+                     extra: dict | None = None, max_attempts: int = 2) -> str:
     params = {"run_id": run_id, "stage": stage} | (extra or {})
     try:
-        job_id = jobs.create_job("write", params, dedupe_key=f"write:{run_id}")
+        # A transient provider/database failure should replay the idempotent
+        # stage once. The job table persists the attempt count across restarts.
+        job_id = jobs.create_job("write", params, dedupe_key=f"write:{run_id}",
+                                 max_attempts=max_attempts)
     except jobs.JobConflict as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     pipeline.attach_job(run_id, job_id)
@@ -1027,7 +1253,8 @@ def _start_write_job(run_id: str, stage: str, background: BackgroundTasks,
 def write_create_run(body: WriteRunCreate, background: BackgroundTasks):
     try:
         run = pipeline.create_run(body.topic, body.project_id,
-                                  body.target_words, body.max_rewrites)
+                                  body.target_words, body.max_rewrites,
+                                  body.pause_after_section)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     job_id = _start_write_job(run["id"], "topic", background)
@@ -1035,7 +1262,7 @@ def write_create_run(body: WriteRunCreate, background: BackgroundTasks):
 
 
 @app.get("/api/write/runs")
-def write_runs(limit: int = 20):
+def write_runs(limit: int = Query(20, ge=1, le=100)):
     db.init_db()
     return {"runs": pipeline.list_runs(limit)}
 
@@ -1098,6 +1325,20 @@ def write_polish(run_id: str, background: BackgroundTasks):
     return {"run": pipeline.get_run(run_id), "job_id": job_id}
 
 
+@app.post("/api/write/runs/{run_id}/audit")
+def write_audit(run_id: str, background: BackgroundTasks):
+    """Re-run the deterministic claim/citation/number/term audit."""
+    run = pipeline.get_run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="写作任务不存在")
+    if run["status"] not in ("drafted", "done", "failed", "polishing"):
+        raise HTTPException(status_code=400,
+                            detail=f"当前状态 {run['status']} 不能审计（先完成逐节撰写）")
+    job_id = _start_write_job(run_id, "audit", background)
+    pipeline._update_run(run_id, stage="机械一致性审计中", error=None)
+    return {"run": pipeline.get_run(run_id), "job_id": job_id}
+
+
 @app.get("/api/write/runs/{run_id}/report")
 def write_report(run_id: str):
     """引用一致性报告（纯机械，任意阶段可算）。"""
@@ -1109,19 +1350,52 @@ def write_report(run_id: str):
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@app.get("/api/write/runs/{run_id}/coordinator")
+def write_coordinator_state(run_id: str):
+    """Return the replayable Agent states, next action and hand-off messages."""
+    if not pipeline.get_run(run_id):
+        raise HTTPException(status_code=404, detail="写作任务不存在")
+    c = coordinator.Coordinator(run_id)
+    return {"plan": c.plan(), "states": c.states(), "messages": c.messages(200)}
+
+
 @app.get("/api/write/runs/{run_id}/export")
-def write_export(run_id: str, fmt: str = "md"):
+def write_export(run_id: str, fmt: str = "md", mode: str = "final"):
+    """Final-gated export.
+
+    ``mode=final`` only succeeds when ``status == "done"``.  ``mode=draft`` is
+    always available after a polish run and serves the last exported files with
+    a ``X-Papernest-Export-Mode`` header so the front-end can show the
+    ``needs_review`` banner instead of a clean final document.
+    """
     run = pipeline.get_run(run_id)
     if not run:
         raise HTTPException(status_code=404, detail="写作任务不存在")
-    if run["status"] != "done" or not (run.get("result") or {}).get("files"):
+    files = (run.get("result") or {}).get("files") or {}
+    if not files:
         raise HTTPException(status_code=400, detail="终稿还没导出（先完成润色终检阶段）")
-    path = (run["result"]["files"] or {}).get(fmt)
-    if not path or not Path(path).exists():
+    export_mode = (run.get("result") or {}).get("export_mode")
+    if mode == "final":
+        if run["status"] != "done":
+            raise HTTPException(
+                status_code=409,
+                detail=f"run 状态 {run['status']}，未通过审计闸门，禁止以 final 模式导出；"
+                       "改用 mode=draft 下载未通过审计的稿件")
+        effective_mode = "final"
+    else:
+        effective_mode = export_mode or "draft"
+    path = files.get(fmt)
+    if not path:
         raise HTTPException(status_code=404, detail=f"没有 {fmt} 格式的导出文件")
+    resolved = Path(path).resolve()
+    if (not resolved.is_relative_to(Path(config.DATA_DIR).resolve())
+            or not resolved.is_file()):
+        raise HTTPException(status_code=404, detail="导出文件不存在或不在数据目录内")
     media = ("application/vnd.openxmlformats-officedocument.wordprocessingml.document"
              if fmt == "docx" else "text/markdown; charset=utf-8")
-    return FileResponse(path, filename=Path(path).name, media_type=media)
+    headers = {"X-Papernest-Export-Mode": effective_mode}
+    return FileResponse(resolved, filename=resolved.name, media_type=media,
+                        headers=headers)
 
 
 # ── L2 精读 ──
@@ -1194,11 +1468,18 @@ def paper_page_image(paper_id: int, page_no: int, dpi: int = 110,
 
 
 @app.get("/api/paper/{paper_id}/pages")
-def paper_pages(paper_id: int):
+def paper_pages(paper_id: int, offset: int = Query(0, ge=0),
+                limit: int = Query(50, ge=1, le=200)):
     with db.conn() as c:
-        rows = c.execute("SELECT page_no, text FROM pages WHERE paper_id=? ORDER BY page_no",
-                         (paper_id,)).fetchall()
-    return {"count": len(rows), "pages": [dict(r) for r in rows]}
+        if not c.execute("SELECT 1 FROM papers WHERE id=?", (paper_id,)).fetchone():
+            raise HTTPException(status_code=404, detail="论文不存在")
+        total = c.execute("SELECT COUNT(*) n FROM pages WHERE paper_id=?",
+                          (paper_id,)).fetchone()["n"]
+        rows = c.execute("""SELECT page_no, text FROM pages WHERE paper_id=?
+                           ORDER BY page_no LIMIT ? OFFSET ?""",
+                         (paper_id, limit, offset)).fetchall()
+    return {"count": total, "returned": len(rows), "offset": offset, "limit": limit,
+            "pages": [dict(r) for r in rows]}
 
 
 @app.get("/api/paper/{paper_id}/formulas")
@@ -1213,13 +1494,11 @@ def paper_formulas(paper_id: int):
 @app.get("/api/paper/{paper_id}/markdown")
 def paper_markdown(paper_id: int, rebuild: bool = False):
     from . import formulas, fulltext
+    pdf_path = _local_pdf(paper_id) if rebuild else None
     with db.conn() as c:
         if rebuild:
-            row = c.execute("SELECT pdf_path FROM papers WHERE id=?", (paper_id,)).fetchone()
-            if not row:
-                raise HTTPException(status_code=404, detail="paper not found")
-            if row["pdf_path"] and Path(row["pdf_path"]).exists():
-                chunks = fulltext.build_chunks(row["pdf_path"], c, paper_id)
+            if pdf_path:
+                chunks = fulltext.build_chunks(str(pdf_path), c, paper_id)
                 db.replace_chunks(c, paper_id, chunks)
                 content = fulltext.rebuild_canonical_markdown(c, paper_id, chunks)
             else:
@@ -1240,38 +1519,43 @@ def paper_markdown(paper_id: int, rebuild: bool = False):
 def do_extract_symbols(paper_id: int):
     try:
         return symbols.extract_for_paper(paper_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception as e:
         _log.exception("符号抽取失败 paper_id=%s", paper_id)
-        return {"error": str(e)}
+        raise HTTPException(status_code=500, detail="符号抽取失败，请查看服务日志") from e
 
 
 @app.get("/api/symbols")
-def get_symbols(q: str = "", kind: str = "", limit: int = 200):
+def get_symbols(q: str = Query("", max_length=500), kind: str = Query("", max_length=100),
+                limit: int = Query(200, ge=1, le=500)):
     db.init_db()
     return {"count": 0, "items": symbols.library_symbols(q, kind, limit)}
 
 
 # ── 方法对比表 ──
 
-class TableBody(BaseModel):
-    paper_ids: list[int]
-    aspect: str = ""
+class TableBody(_PaperIdsBody):
+    paper_ids: list[int] = Field(min_length=1, max_length=50)
+    aspect: str = Field(default="", max_length=1000)
 
 
 @app.post("/api/table")
 def do_table(body: TableBody):
     try:
         return tablegen.compare(body.paper_ids, body.aspect)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception as e:
         _log.exception("对比表生成失败 paper_ids=%s", body.paper_ids)
-        return {"error": str(e)}
+        raise HTTPException(status_code=500, detail="对比表生成失败，请查看服务日志") from e
 
 
 # ── 汇报 PPT（从已核验卡片零 LLM 装配；单篇=论文汇报，多篇=文献汇报）──
 
-class PptxBody(BaseModel):
-    paper_ids: list[int]
-    topic: str = ""
+class PptxBody(_PaperIdsBody):
+    paper_ids: list[int] = Field(min_length=1, max_length=50)
+    topic: str = Field(default="", max_length=1000)
 
 
 @app.post("/api/pptx")

@@ -187,6 +187,32 @@ TARGET_WINDOW_CHARS = 800
 #: 一篇最多取几个块。再多只是把上下文剁碎——问题召回还在涨，片段召回已经在掉。
 MAX_CHUNKS_PER_PAPER = 3
 
+def _evidence_depth(query: str) -> int:
+    """Choose evidence blocks per paper from the question shape.
+
+    Broad synthesis questions need several independent passages; a short
+    factual lookup does not. Keep the default at three (the measured QASPER
+    knee) and expand to five for questions that explicitly ask for methods,
+    comparisons, results, numbers, tables, or formulas.
+    """
+    q = (query or '').lower()
+    complex_terms = (
+        '比较', '对比', '差异', '优缺点', '实验', '结果', '提升', '准确率',
+        '多少', '数值', '表格', '表', '公式', '推导', '方法', '如何实现',
+        'compare', 'difference', 'experiment', 'result', 'accuracy',
+        'improve', 'improvement', 'table', 'formula', 'method', 'ablation',
+    )
+    return 5 if any(t in q for t in complex_terms) else 3
+
+def _needs_structured_candidates(query: str) -> bool:
+    q = (query or '').lower()
+    return any(t in q for t in (
+        '表格', '表', '公式', '实验结果', '实验', '评测', '准确率', '数值',
+        '对比', '基线', '提升', '性能', 'table', 'formula', 'experiment',
+        'evaluation', 'benchmark', 'accuracy', 'results', 'result', 'ablation',
+        'outperform', 'baseline', 'compared', 'comparison', 'performance',
+    ))
+
 HIT_BOOST = 1.6
 
 
@@ -238,12 +264,24 @@ def _rank_chunks(chunks: list[dict], hits: list[dict], terms: list[str],
         df = sum(1 for _, t in lowered if k in t)
         idf[k] = math.log(1 + (n_docs - df + 0.5) / (df + 0.5))
     scored = []
+    structured_query = any(x in (" ".join(terms)).lower()
+                           for x in ("table", "formula", "result", "results",
+                                     "experiment", "evaluation", "benchmark",
+                                     "outperform", "baseline", "comparison",
+                                     "表", "公式", "实验", "结果", "评测",
+                                     "准确率", "数值", "基线", "对比"))
     for ch, t in lowered:
         raw = sum(t.count(k) for k in idf)          # 仍按原始命中判「词面全 0」
         weighted = sum(t.count(k) * idf[k] for k in idf)
         density = weighted / ((len(t) or 1) ** 0.5)
         if ch["chunk_no"] in hit_nos:
             density *= HIT_BOOST
+        # Tables and formulas are high-value evidence for quantitative and
+        # experimental questions, but should not displace prose for ordinary
+        # conceptual lookups.
+        if structured_query and (ch.get("kind") in {"table", "formula"} or
+                                  ch.get("block_type") in {"table", "formula"}):
+            density *= 1.35
         scored.append((density, raw, ch["chunk_no"], ch))
     if any(s[1] for s in scored):
         scored.sort(key=lambda x: (-x[0], x[2]))   # 全序：并列按 chunk_no 决胜
@@ -462,6 +500,13 @@ def prepare(messages: list[dict], top_k: int = 5,
     search_q, rewrite_note = chat.rewrite_query(q, prior_qs)
     if candidate_ids is None:
         ids, notes, chunk_hits = _vector_candidates(search_q, top_k)
+        # Add a small, type-aware candidate lane for structured questions.
+        # This runs locally via FTS and prevents table/formula papers from
+        # being lost before the per-chunk structured boost is applied.
+        if _needs_structured_candidates(search_q):
+            structured_ids = embeddings.search_by_type(search_q, max(top_k, 5))
+            head = max(1, top_k // 2)
+            ids = list(dict.fromkeys(list(ids)[:head] + structured_ids + list(ids)[head:]))[:top_k]
         ids, ref_notes = _carry_over(session_id, q, ids, top_k)
         notes += ref_notes
     else:
@@ -488,14 +533,18 @@ def prepare(messages: list[dict], top_k: int = 5,
     # 页块配额按篇数摊。宁可让每篇的原文引用短一些，也不要整篇论文连同它的 [n]
     # 一起被预算挤掉——丢一篇是丢掉一条可引用的来源，缩一篇只是证据少一点。
     # 0.55 是页块能占的份额，其余留给标题 / TL;DR / key_findings / 摘要。
-    page_cap = max(600, min(2400, int(max_context_chars * 0.55) // max(len(ids), 1)))
+    requested_depth = _evidence_depth(search_q)
+    # Reserve enough room for the requested number of 800-char evidence
+    # windows, while retaining the global context budget as the hard ceiling.
+    page_cap = max(600, min(4000,
+                             int(max_context_chars * 0.55) // max(len(ids), 1)))
     # 每篇取几个块：**由窗口下限反推**，不拍常数。QASPER 上等预算扫描
     # （274 篇 / 917 题 / 4556 条 gold）：片段召回在每窗 800 字时见顶，
     #   per=1 窗2400 → 0.0935 | per=2 窗1200 → 0.0904 | **per=3 窗800 → 0.0961**
     #   per=4 窗600  → 0.0915 | per=6 窗400  → 0.0832
     # 问题召回一路涨到 per=6（0.2159），但那是把上下文剁成 400 字碎片换来的——
     # 证据总量反而在掉，而且短碎片更难支撑逐字引用。所以取「窗口不低于 800」这条线。
-    per_paper = max(1, min(MAX_CHUNKS_PER_PAPER, page_cap // TARGET_WINDOW_CHARS))
+    per_paper = max(1, min(requested_depth, page_cap // TARGET_WINDOW_CHARS))
     with db.conn() as c:
         for pid in ids:
             r = c.execute("SELECT * FROM papers WHERE id=?", (pid,)).fetchone()
@@ -533,6 +582,7 @@ def prepare(messages: list[dict], top_k: int = 5,
             blocks.append(paper_block)
             sources.append({"idx": i, "paper_id": pid, "title": r["title"],
                             "year": r["year"], "venue": r["venue"],
+                            "evidence_depth": per_paper,
                             **_source_locator(chunk_hits.get(pid))})
     sources.sort(key=lambda s: s["idx"])
     context = "\n\n".join(blocks) or "（库内没有检索到相关文献）"

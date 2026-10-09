@@ -14,6 +14,13 @@ from typing import Any
 from . import db
 
 
+_UNSET = object()
+
+
+class VersionConflict(ValueError):
+    """客户端基于旧版本更新文档。"""
+
+
 def _dict(row: Any) -> dict[str, Any] | None:
     return dict(row) if row else None
 
@@ -131,6 +138,10 @@ def create_note(project_id: int, title: str, content: str = "",
                 paper_id: int | None = None) -> dict[str, Any]:
     if not get_project(project_id):
         raise ValueError("项目不存在")
+    if paper_id is not None:
+        with db.conn() as conn:
+            if not conn.execute("SELECT 1 FROM papers WHERE id=?", (paper_id,)).fetchone():
+                raise ValueError("论文不存在")
     title = title.strip() or "未命名笔记"
     with db.conn() as conn:
         cur = conn.execute(
@@ -148,20 +159,27 @@ def create_note(project_id: int, title: str, content: str = "",
 
 def update_note(note_id: int, *, title: str | None = None, content: str | None = None,
                 note_type: str | None = None, tags: list[str] | None = None,
-                paper_id: int | None = None) -> dict[str, Any] | None:
+                paper_id: Any = _UNSET) -> dict[str, Any] | None:
     current = get_note(note_id)
     if not current:
         return None
+    if paper_id is not _UNSET and paper_id is not None:
+        with db.conn() as conn:
+            if not conn.execute("SELECT 1 FROM papers WHERE id=?", (paper_id,)).fetchone():
+                raise ValueError("论文不存在")
+    new_title = title.strip() if title is not None else current["title"]
+    if not new_title:
+        raise ValueError("笔记标题不能为空")
     with db.conn() as conn:
         conn.execute(
             """UPDATE notes SET title=?, content=?, note_type=?, tags_json=?,
                       paper_id=?, updated_at=datetime('now','localtime') WHERE id=?""",
-            (title.strip() if title is not None else current["title"],
+            (new_title,
              content if content is not None else current["content"],
              note_type if note_type is not None else current["note_type"],
              json.dumps(_tags(tags if tags is not None else current["tags"]),
                         ensure_ascii=False),
-             paper_id if paper_id is not None else current["paper_id"], note_id),
+             current["paper_id"] if paper_id is _UNSET else paper_id, note_id),
         )
         conn.execute("UPDATE projects SET updated_at=datetime('now','localtime') WHERE id=?",
                      (current["project_id"],))
@@ -222,18 +240,30 @@ def create_document(project_id: int, title: str, content: str = "",
 
 
 def update_document(document_id: int, *, title: str | None = None,
-                    content: str | None = None, status: str | None = None) -> dict[str, Any] | None:
+                    content: str | None = None, status: str | None = None,
+                    expected_version: int | None = None) -> dict[str, Any] | None:
     current = get_document(document_id)
     if not current:
         return None
-    with db.conn() as conn:
-        conn.execute(
-            """UPDATE documents SET title=?, content=?, status=?, version=version+1,
-                      updated_at=datetime('now','localtime') WHERE id=?""",
-            (title.strip() if title is not None else current["title"],
-             content if content is not None else current["content"],
-             status if status is not None else current["status"], document_id),
-        )
+    if expected_version is not None and expected_version != current["version"]:
+        raise VersionConflict(
+            f"文档版本已变化：期望 {expected_version}，当前 {current['version']}，请先重新读取")
+    new_title = title.strip() if title is not None else current["title"]
+    if not new_title:
+        raise ValueError("文档标题不能为空")
+    with db.conn(immediate=True) as conn:
+        where = "id=?"
+        args: list[Any] = [new_title,
+                           content if content is not None else current["content"],
+                           status if status is not None else current["status"], document_id]
+        if expected_version is not None:
+            where += " AND version=?"
+            args.append(expected_version)
+        cur = conn.execute(
+            f"""UPDATE documents SET title=?, content=?, status=?, version=version+1,
+                      updated_at=datetime('now','localtime') WHERE {where}""", args)
+        if cur.rowcount == 0:
+            raise VersionConflict("文档已被其他请求更新，请重新读取后再保存")
         conn.execute("UPDATE projects SET updated_at=datetime('now','localtime') WHERE id=?",
                      (current["project_id"],))
         conn.commit()

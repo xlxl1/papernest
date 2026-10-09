@@ -147,6 +147,8 @@ python cli.py vec embed-chunks
 | `S2_API_KEY` | Semantic Scholar API 密钥，可选 |
 | `RESEARCH_TOPIC` | 精读卡片中的研究方向上下文 |
 | `PAPERNEST_API_KEY` | 对外绑定地址时的服务访问口令 |
+| `PAPERNEST_DAILY_TOKEN_BUDGET` | 每日 prompt+completion+embedding token 上限，默认 300 万；设 0 关闭 |
+| `PAPERNEST_BUDGET_FAIL_OPEN` | 预算库不可读时是否放行，仅建议离线开发设为 `1`，生产默认关闭 |
 
 ### OCR
 

@@ -16,7 +16,18 @@ import json
 import re
 import uuid
 
-from . import cards, cite, config, db, embeddings, llm, writing
+from . import auditor, cards, cite, config, coordinator, db, embeddings, evidence as evidence_agent, llm, writing, math_export
+from .writing_schemas import Claim, Evidence
+
+
+def build_evidence_bundle(section: dict,
+                          candidate_ids: list[int] | None = None):
+    """Pipeline-facing Evidence Agent wrapper.
+
+    Keeping this seam in the orchestrator makes the evidence hand-off easy to
+    replace or instrument while preserving the standalone agent contract.
+    """
+    return evidence_agent.build_evidence_bundle(section, candidate_ids)
 
 PROMPT_VER = "p2v1"          # 写作 prompt 版本：升级 prompt 后缓存自然失效
 CHECKPOINT_THRESHOLD = 7     # 节评审分 < 7 触发重写
@@ -44,12 +55,11 @@ WRITER_SYSTEM = """你是严谨的学术写作者，负责撰写论文的一个�
 - 严禁编造数字、实验结果或白名单之外的文献；
 - 用词与给定术语表一致，与其它章节自然衔接；
 - 输出本节 Markdown 正文（不要输出章节标题，不要重复任务描述）。"""
-
-
 # ── 运行记录 CRUD ──
 
 def create_run(topic: str, project_id: int | None = None,
-               target_words: int = 3000, max_rewrites: int = 2) -> dict:
+               target_words: int = 3000, max_rewrites: int = 2,
+               pause_after_section: bool = False) -> dict:
     topic = (topic or "").strip()
     if len(topic) < 4:
         raise ValueError("课题描述太短（至少 4 个字）")
@@ -60,9 +70,14 @@ def create_run(topic: str, project_id: int | None = None,
                      VALUES(?,?,?,?)""",
                   (run_id, project_id, topic,
                    json.dumps({"target_words": target_words,
-                               "max_rewrites": max(0, min(int(max_rewrites), 3))},
+                               "max_rewrites": max(0, min(int(max_rewrites), 3)),
+                               "pause_after_section": bool(pause_after_section)},
                               ensure_ascii=False)))
         c.commit()
+    run_coordinator = coordinator.Coordinator(run_id)
+    run_coordinator.initialize()
+    run_coordinator.send("coordinator", "topic", "run_created",
+                         {"topic": topic, "target_words": target_words})
     return get_run(run_id)
 
 
@@ -71,6 +86,10 @@ def _row_to_run(r) -> dict:
     d["topics"] = json.loads(d.pop("topics_json") or "[]")
     d["glossary"] = json.loads(d.pop("glossary_json") or "{}")
     d["config"] = json.loads(d.pop("config_json") or "{}")
+    d["audit"] = json.loads(d.pop("audit_json") or "{}")
+    # Schema columns past the legacy boundary are absent on older DBs; fall back
+    # to sensible defaults so callers can rely on the field shape.
+    d.setdefault("last_paused_section", 0)
     if d.get("result_json"):
         d["result"] = json.loads(d.pop("result_json"))
     else:
@@ -94,7 +113,7 @@ def list_runs(limit: int = 20) -> list[dict]:
 
 
 _COLS = {"topics": "topics_json", "glossary": "glossary_json",
-         "config": "config_json", "result": "result_json"}
+         "config": "config_json", "result": "result_json", "audit": "audit_json"}
 
 
 def _update_run(run_id: str, **fields):
@@ -204,6 +223,81 @@ def _wl_entry(paper_id: int, evidence: str | None) -> dict:
     return d
 
 
+def _bound_verified_evidence(bundle: dict | None) -> list[dict]:
+    """Return only evidence that is verified, claim-bound and independently sourced.
+
+    EvidenceBundle may contain useful retrieval candidates that were not
+    mechanically verified, or verified records that are no longer referenced
+    by a claim after normalization.  Neither category is writer input.  Keep
+    the order from the bundle so citation numbering is deterministic.
+
+    The writer boundary additionally rejects evidence whose ``source_kind``
+    is ``model_summary`` or ``unverified_recall`` even when the bundle marks
+    them ``verified=True`` (the older heuristic could set this when a quote
+    landed in card_json or any chunk including the row that produced it).
+    """
+    if not isinstance(bundle, dict):
+        return []
+    evidence = bundle.get("evidence")
+    claims = bundle.get("claims")
+    if not isinstance(evidence, list) or not isinstance(claims, list):
+        return []
+    by_id = {
+        str(item.get("evidence_id")): item
+        for item in evidence
+        if isinstance(item, dict) and item.get("evidence_id")
+    }
+    bound_ids: set[str] = set()
+    for claim in claims:
+        if not isinstance(claim, dict):
+            continue
+        ids = claim.get("evidence_ids")
+        if isinstance(ids, (str, int)):
+            ids = [ids]
+        for evidence_id in ids or []:
+            if str(evidence_id) in by_id:
+                bound_ids.add(str(evidence_id))
+    out = []
+    for item in evidence:
+        if not isinstance(item, dict):
+            continue
+        eid = str(item.get("evidence_id"))
+        if eid not in bound_ids:
+            continue
+        if not item.get("verified"):
+            continue
+        kind = item.get("source_kind")
+        if kind not in {"native_page", "imported_fulltext"}:
+            continue
+        if not item.get("quote"):
+            continue
+        out.append(item)
+    return out
+
+
+def _evidence_whitelist(bundle: dict | None, k: int = 6) -> list[dict]:
+    """Build the citation whitelist from verified, claim-bound evidence.
+
+    A paper earns a citation slot only when at least one quote from it is
+    verified against the source and referenced by a section claim.  This keeps
+    retrieval candidates outside the writer's citation boundary.
+    """
+    out: list[dict] = []
+    seen: set[int] = set()
+    for item in _bound_verified_evidence(bundle):
+        try:
+            paper_id = int(item.get("paper_id"))
+        except (TypeError, ValueError):
+            continue
+        if paper_id <= 0 or paper_id in seen:
+            continue
+        seen.add(paper_id)
+        out.append(_wl_entry(paper_id, str(item.get("quote") or "")))
+        if len(out) >= k:
+            break
+    return out
+
+
 # ── Agent 1：选题 ────────────────────────────────────────────────
 
 def _topic_context(run: dict, limit: int = 20) -> tuple[list[dict], str]:
@@ -296,11 +390,25 @@ def stage_topic(run_id: str, progress=None) -> dict:
     for t in topics:
         try:
             evs = _as_list_of_dicts(t.get("evidence"))
-            for ev in evs:
-                ev["verified"] = _verify_quote(ev.get("paper_id"), ev.get("quote"))
-            t["evidence"] = evs
+            normalized_evidence = []
+            for j, ev in enumerate(evs, 1):
+                verified = _verify_quote(ev.get("paper_id"), ev.get("quote"))
+                evidence = Evidence(
+                    evidence_id=f"topic-{run_id[:8]}-{len(clean)+1}-{j}",
+                    paper_id=int(ev.get("paper_id")),
+                    quote=str(ev.get("quote") or ""),
+                    verified=verified,
+                    confidence=1.0 if verified else 0.0,
+                )
+                normalized_evidence.append(evidence.model_dump())
+            t["evidence"] = normalized_evidence
             t["title"] = str(t.get("title") or "").strip()
-            t["evidence_ok"] = f"{sum(1 for e in evs if e['verified'])}/{len(evs)}"
+            # Count the normalized records.  The raw model objects do not
+            # contain the verification field; reading it from ``evs`` made
+            # every otherwise valid candidate raise KeyError and silently
+            # fall back to the un-normalized offline payload.
+            t["evidence_ok"] = (f"{sum(1 for e in normalized_evidence if e['verified'])}/"
+                                 f"{len(normalized_evidence)}")
             if t["title"]:
                 clean.append(t)
         except Exception as exc:                        # noqa: BLE001
@@ -432,6 +540,20 @@ def stage_outline(run_id: str, progress=None) -> dict:
         outline = {"title": run["title"], "sections": _offline_outline(papers)}
         degraded = degraded or "未配置 LLM：大纲为离线模板"
 
+    # Normalize outline points into claim records.  The writer and later
+    # auditors can now reason about claims independently of the prose JSON.
+    for section in outline["sections"]:
+        claims = []
+        for j, point in enumerate(section.get("points") or [], 1):
+            claim = Claim(
+                claim_id=f"sec-{section.get('no') or 0}-claim-{j}",
+                text=str(point),
+                claim_type="section_point",
+                status="needs_review",
+            )
+            claims.append(claim.model_dump())
+        section["claims"] = claims
+
     warnings = validate_outline(outline["sections"], valid_ids)
     if progress:
         progress(0.9, "outline", f"大纲 {len(outline['sections'])} 节，"
@@ -507,9 +629,15 @@ def save_outline(run_id: str, sections: list[dict] | None) -> dict:
 
 # ── Agent 3：撰写（含节评审闭环）──────────────────────────────────
 
-def _cache_key(title: str, points: list, words: int, glossary: dict) -> str:
+def _cache_key(title: str, points: list, words: int, glossary: dict,
+               paper_ids: list[int] | None = None) -> str:
+    # Evidence retrieval is bounded by the outline's candidate papers. Include
+    # that boundary so editing a section's source set cannot reuse a draft
+    # backed by a different EvidenceBundle.
     material = json.dumps([PROMPT_VER, title, points, words,
-                           sorted(glossary.items())], ensure_ascii=False, sort_keys=True)
+                           sorted(glossary.items()),
+                           sorted(int(pid) for pid in (paper_ids or []))],
+                          ensure_ascii=False, sort_keys=True)
     return hashlib.sha1(material.encode("utf-8")).hexdigest()[:16]
 
 
@@ -518,6 +646,16 @@ def _find_cached(run_id: str, cache_key: str) -> dict | None:
         r = c.execute("""SELECT * FROM sections WHERE run_id=? AND cache_key=?
                          AND status IN ('done','reused') AND content != ''
                          ORDER BY id DESC LIMIT 1""", (run_id, cache_key)).fetchone()
+    return dict(r) if r else None
+
+
+def _find_checkpoint(run_id: str, cache_key: str) -> dict | None:
+    """返回尚未完成评审的章节草稿，供进程重启后继续。"""
+    with db.conn() as c:
+        r = c.execute("""SELECT * FROM sections WHERE run_id=? AND cache_key=?
+                         AND checkpoint IN ('draft_saved','review_pending')
+                         AND raw_content != '' ORDER BY id DESC LIMIT 1""",
+                      (run_id, cache_key)).fetchone()
     return dict(r) if r else None
 
 
@@ -550,10 +688,27 @@ def _latest_sections(run_id: str) -> list[dict]:
 
 
 def _draft_section(run: dict, sec: dict, whitelist: list[dict], attempt: int,
-                   feedback: list[dict] | None) -> str:
+                   feedback: list[dict] | None,
+                   evidence_bundle: dict | None = None) -> str:
     """撰写 Agent：一节草稿。attempt=1 初稿；>1 带评审意见重写。"""
-    context, _sources = writing._paper_context([w["paper_id"] for w in whitelist],
-                                               sec["title"] + " " + " ".join(sec.get("points") or []))
+    # With an EvidenceBundle, expose only verified claim-bound quotes.  The
+    # generic paper-context loader also includes cards, abstracts, and page
+    # snippets that may not have been bound to a claim and therefore cannot be
+    # treated as writer evidence.
+    if evidence_bundle is None:
+        context, _sources = writing._paper_context(
+            [w["paper_id"] for w in whitelist],
+            sec["title"] + " " + " ".join(sec.get("points") or []))
+    else:
+        paper_numbers = {int(w["paper_id"]): i
+                         for i, w in enumerate(whitelist, 1)
+                         if w.get("paper_id") is not None}
+        context = "\n".join(dict.fromkeys(
+            f"[{paper_numbers[int(item['paper_id'])]}] 已核验引文（第{item.get('page') or '?'}页）："
+            f"{str(item.get('quote') or '')[:2000]}"
+            for item in _bound_verified_evidence(evidence_bundle)
+            if str(item.get("paper_id") or "").isdigit()
+            and int(item["paper_id"]) in paper_numbers))
     other_titles = "；".join(s["title"] for s in
                              (get_outline(run["id"]) or {}).get("sections", [])
                              if s["no"] != sec["no"])
@@ -563,6 +718,27 @@ def _draft_section(run: dict, sec: dict, whitelist: list[dict], attempt: int,
             f"术语表（用词须一致）：{'、'.join(run['glossary']) or '（无）'}\n"
             f"其它章节标题（衔接参考）：{other_titles}\n"
             f"本节目标字数：约 {sec.get('words', 600)} 字")
+    if evidence_bundle:
+        claims = evidence_bundle.get("claims") or []
+        evs = {e.get("evidence_id"): e for e in evidence_bundle.get("evidence") or []}
+        lines = []
+        for claim in claims:
+            # P2 boundary: the writer sees only evidence that is both bound to
+            # this claim and mechanically verified against the source. An
+            # unverified retrieval hit remains auditable in the bundle, but it
+            # cannot become a factual sentence through the writing prompt.
+            bound = [evs[eid] for eid in claim.get("evidence_ids") or []
+                     if eid in evs and evs[eid].get("verified")]
+            if not bound:
+                lines.append(f"- [{claim.get('claim_id', '')}] {claim.get('text', '')}：待补证据")
+                continue
+            lines.append(f"- [{claim.get('claim_id', '')}] {claim.get('text', '')}：" + "；".join(
+                f"{e.get('quote', '')[:500]}（{e.get('block_type', 'text')}，"
+                f"第{e.get('page') or '?'}页，已核验）"
+                for e in bound[:3]))
+        if lines:
+            user += ("\n章节级 EvidenceBundle（必须覆盖下列 claim_id；仅可使用已核验引文，"
+                      "未核验项不得写成事实）：\n" + "\n".join(lines))
     if attempt > 1 and feedback:
         lines = "\n".join(f"- [{it.get('severity')}] {it.get('location')}：{it.get('problem')}→{it.get('fix')}"
                           for it in feedback[:6])
@@ -596,75 +772,181 @@ def _offline_draft(sec: dict, whitelist: list[dict]) -> str:
     return "\n\n".join(lines)
 
 
+def _claim_bound_paper_ids(evidence_bundle: dict | None) -> set[int]:
+    """Return papers attached to claims by verified evidence only.
+
+    This is the P2 hand-off boundary: a paper retrieved for the section but
+    not bound to a claim must not enter the writer's citation whitelist.
+    """
+    if not isinstance(evidence_bundle, dict):
+        return set()
+    evidence = {str(e.get("evidence_id")): e
+                for e in evidence_bundle.get("evidence") or []
+                if isinstance(e, dict)}
+    out: set[int] = set()
+    for claim in evidence_bundle.get("claims") or []:
+        if not isinstance(claim, dict):
+            continue
+        for eid in claim.get("evidence_ids") or []:
+            item = evidence.get(str(eid))
+            if item and item.get("verified"):
+                try:
+                    pid = int(item.get("paper_id"))
+                except (TypeError, ValueError):
+                    continue
+                if pid > 0:
+                    out.add(pid)
+    return out
+
+
+def _section_audit(run: dict, sec: dict, text: str, bundle: dict,
+                   citations: dict) -> dict:
+    no = sec.get("no", sec.get("sec_no", "document"))
+    return auditor.summarize_issues(auditor.audit_section(
+        text, bundle, citations, run.get("glossary") or {},
+        section_id=f"section-{no}"))
+
+
 def _write_one(run: dict, sec: dict, outline_version: int, force: bool,
-               progress=None, frac0: float = 0.0, frac1: float = 1.0) -> dict:
+               progress=None, frac0: float = 0.0, frac1: float = 1.0,
+               evidence_bundle=None) -> dict:
     """单节全流程：缓存查 → 白名单 → 撰写⇄评审重写闭环 → 落库。"""
     run_id = run["id"]
     key = _cache_key(sec["title"], sec.get("points") or [], sec.get("words", 600),
-                     run["glossary"])
+                     run["glossary"], sec.get("paper_ids") or [])
+    # Evidence retrieval is local and deterministic.  It runs for cache hits as
+    # well so old sections gain a persisted bundle on their next replay.
+    if evidence_bundle is not None:
+        bundle_json = (evidence_bundle.model_dump()
+                       if hasattr(evidence_bundle, "model_dump") else dict(evidence_bundle))
+    else:
+        try:
+            bundle = build_evidence_bundle(
+                sec, candidate_ids=sec.get("paper_ids") or None)
+            bundle_json = bundle.model_dump()
+        except Exception as exc:  # noqa: BLE001
+            bundle_json = {"section_id": f"section-{sec.get('no', '')}",
+                           "query": str(sec.get("title") or ""), "evidence": [],
+                           "claims": [], "coverage": 0.0, "agent": "evidence_agent",
+                           "degraded": f"Evidence Agent 失败：{type(exc).__name__}: {str(exc)[:120]}"}
     if not force:
         hit = _find_cached(run_id, key)
         if hit:
+            hit_bundle = json.loads(hit.get("evidence_json") or "{}") or bundle_json
+            audit = _section_audit(run, sec, hit["content"] or "", hit_bundle,
+                                   json.loads(hit["citations_json"] or "{}"))
             _upsert_section(run_id, outline_version, sec,
                             whitelist_json=json.loads(hit["whitelist_json"] or "[]"),
                             cache_key=key, content=hit["content"],
                             citations_json=hit["citations_json"],
+                            evidence_json=(hit.get("evidence_json") or
+                                           json.dumps(bundle_json, ensure_ascii=False)),
+                            audit_json=audit,
                             removed_json=hit["removed_json"], status="reused",
                             attempt=hit["attempt"], score=hit["score"],
                             review_json=hit["review_json"])
             if progress:
                 progress(frac1, f"节{sec['no']}", f"「{sec['title'][:20]}」缓存命中，0 token 复用")
-            return {"sec_no": sec["no"], "status": "reused", "cache_hit": True}
+            return {"sec_no": sec["no"], "status": "reused", "cache_hit": True,
+                    "evidence_coverage": bundle_json.get("coverage", 0.0),
+                    "evidence_bundle": bundle_json, "audit": audit}
+
+    # If the previous process stopped after model generation, reuse that exact
+    # draft and continue from review instead of spending another generation call.
+    checkpoint = None if force else _find_checkpoint(run_id, key)
+    if checkpoint:
+        content = checkpoint.get("raw_content") or checkpoint.get("content") or ""
+        removed = json.loads(checkpoint.get("removed_json") or "[]")
+        citations = json.loads(checkpoint.get("citations_json") or "{}")
+        review = None
+        wl = json.loads(checkpoint.get("whitelist_json") or "[]")
+        if progress:
+            progress(frac0 + 0.2, f"节{sec['no']}", f"「{sec['title'][:20]}」恢复断点，进入评审")
+    else:
+        content = citations = removed = review = None
 
     if progress:
         progress(frac0 + 0.02, f"节{sec['no']}", f"「{sec['title'][:20]}」文献 Agent 核验白名单")
-    wl, wl_error = _whitelist(sec["title"] + " " + " ".join(sec.get("points") or []),
-                              k=6, extra_ids=sec.get("paper_ids") or [])
+    # Construct the writer boundary directly from the EvidenceBundle.  The
+    # legacy recommendation path can return a verified quote for a paper that
+    # is not bound to any claim, so filtering it by paper_id is insufficient.
+    # Evidence-derived entries preserve the exact verified quote instead.
+    if not checkpoint:
+        wl = _evidence_whitelist(bundle_json, k=6)
+    wl_error = bundle_json.get("degraded") if isinstance(bundle_json, dict) else None
 
     if not llm.available():
         # 离线：结构占位稿 + 真实白名单（有则挂），不调评审、不盲目重写
         content, removed = _offline_draft(sec, wl), []
         citations = {str(i + 1): wl[i] for i in range(len(wl))
                      if f"[{i + 1}]" in content}
+        audit = _section_audit(run, sec, content, bundle_json, citations)
         _upsert_section(run_id, outline_version, sec, whitelist_json=wl, cache_key=key,
-                        content=content, citations_json=citations, removed_json=removed,
+                        content=content, citations_json=citations,
+                        evidence_json=bundle_json, audit_json=audit, removed_json=removed,
                         status="done", attempt=1, score=None, review_json=None)
         if progress:
             progress(frac1, f"节{sec['no']}", f"「{sec['title'][:20]}」离线模板稿（未接 LLM）")
         return {"sec_no": sec["no"], "status": "done", "attempt": 1, "score": None,
                 "citations": len(citations), "removed": 0, "cache_hit": False,
+                "evidence_coverage": bundle_json.get("coverage", 0.0),
+                "evidence_bundle": bundle_json, "audit": audit,
                 "degraded": f"offline-template；{wl_error}" if wl_error
                             else "offline-template"}
 
     max_rewrites = int(run["config"].get("max_rewrites", 2))
-    attempt, feedback = 0, None
-    content, citations, removed, review = "", {}, [], None
+    attempt, feedback = (int(checkpoint.get("attempt") or 1), None) if checkpoint else (0, None)
+    content, citations, removed, review = content or "", citations or {}, removed or [], review
     met_bar = False        # 是否达到评审门槛（用尽重写次数仍不达标时如实交付并标注）
     while attempt <= max_rewrites:
-        attempt += 1
+        resuming_draft = bool(checkpoint and content and attempt == int(checkpoint.get("attempt") or 1))
+        if not resuming_draft:
+            attempt += 1
         if progress:
             progress(frac0 + 0.1 + (0.5 / (max_rewrites + 1)) * (attempt - 1),
                      f"节{sec['no']}", f"「{sec['title'][:20]}」撰写（第 {attempt} 稿）")
-        content = _draft_section(run, sec, wl, attempt, feedback)
-        content, removed = _sanitize(content, wl)
-        citations = {str(i + 1): wl[i] for i in range(len(wl))
-                     if f"[{i + 1}]" in content}
+        if not resuming_draft:
+            content = _draft_section(run, sec, wl, attempt, feedback, bundle_json)
+            content, removed = _sanitize(content, wl)
+            citations = {str(i + 1): wl[i] for i in range(len(wl))
+                         if f"[{i + 1}]" in content}
+            # Persist the model output before the expensive review call. A killed
+            # worker or provider timeout can therefore resume from this checkpoint.
+            _upsert_section(run_id, outline_version, sec, whitelist_json=wl,
+                            cache_key=key, raw_content=content, content=content,
+                            citations_json=citations, evidence_json=bundle_json,
+                            removed_json=removed, checkpoint="draft_saved",
+                            status="drafting", attempt=attempt)
         if progress:
             progress(frac0 + 0.1 + (0.5 / (max_rewrites + 1)) * (attempt - 1) + 0.2,
                      f"节{sec['no']}", f"「{sec['title'][:20]}」评审（重档模型）")
-        review = writing.review_text(content, paper_ids=[w["paper_id"] for w in wl])
+        try:
+            review = writing.review_text(content, paper_ids=[w["paper_id"] for w in wl])
+        except Exception:
+            _upsert_section(run_id, outline_version, sec, raw_content=content,
+                            content=content, citations_json=citations,
+                            evidence_json=bundle_json, removed_json=removed,
+                            checkpoint="review_pending", status="review_pending",
+                            attempt=attempt)
+            raise
+        checkpoint = None
+        audit = _section_audit(run, sec, content, bundle_json, citations)
         score = review.get("score")
         majors = [i for i in (review.get("issues") or []) if i.get("severity") == "major"]
-        if score is not None and score >= CHECKPOINT_THRESHOLD and not majors:
+        audit_feedback = auditor.issues_to_feedback(audit.get("issues") or [])
+        audit_majors = [i for i in audit_feedback if i.get("severity") == "major"]
+        if score is not None and score >= CHECKPOINT_THRESHOLD and not majors and not audit_majors:
             met_bar = True
             break  # 达标
-        if score is None and not majors:
+        if score is None and not majors and not audit_majors:
             break  # 离线/解析失败：无从判定，不盲目重写
-        feedback = (review.get("issues") or [])[:6]
+        feedback = (audit_majors + (review.get("issues") or []) + audit_feedback)[:6]
         # 不达标 → 带意见重写；用尽重写次数则如实交付（score/review 落库，UI 明示）
     _upsert_section(run_id, outline_version, sec,
                     whitelist_json=wl, cache_key=key, content=content,
-                    citations_json=citations, removed_json=removed,
+                    citations_json=citations, evidence_json=bundle_json, audit_json=audit,
+                    removed_json=removed,
+                    raw_content=content, checkpoint="done",
                     status="done", attempt=attempt,
                     score=review.get("score") if review else None,
                     review_json=review)
@@ -672,7 +954,9 @@ def _write_one(run: dict, sec: dict, outline_version: int, force: bool,
             "met_bar": met_bar,
             "score": review.get("score") if review else None,
             "citations": len(citations), "removed": len(removed),
-            "cache_hit": False, "degraded": wl_error}
+            "cache_hit": False, "degraded": wl_error,
+            "evidence_coverage": bundle_json.get("coverage", 0.0),
+            "evidence_bundle": bundle_json, "audit": audit}
 
 
 def stage_sections(run_id: str, progress=None, force_sec: int | None = None) -> dict:
@@ -684,26 +968,107 @@ def stage_sections(run_id: str, progress=None, force_sec: int | None = None) -> 
     secs = outline["sections"]
     _update_run(run_id, status="drafting", error=None)
     results = []
+    selected = [sec for sec in secs
+                if force_sec is None or int(sec["no"]) == int(force_sec)]
+    run_coordinator = coordinator.Coordinator(run_id)
+    run_coordinator.set_state("evidence", "running",
+                              input={"sections": [int(s["no"]) for s in selected]},
+                              increment_attempt=True)
+    if progress:
+        progress(0.03, "evidence", f"并行准备 {len(selected)} 个章节的证据包")
+    # Evidence retrieval is read-heavy and independent across sections. Build
+    # bundles in parallel, then keep the LLM writing/review loop deterministic
+    # and serialized so section cache writes cannot interleave.
+    prefetched, evidence_errors = run_coordinator.parallel_evidence(
+        selected,
+        lambda section: build_evidence_bundle(
+            section, candidate_ids=section.get("paper_ids") or None),
+        max_workers=int(run["config"].get("evidence_workers", 4) or 4))
+    if evidence_errors:
+        run_coordinator.send("evidence_agent", "coordinator", "evidence_batch_partial",
+                             {"errors": evidence_errors}, requires_review=True)
+    run_coordinator.set_state("evidence", "done",
+                              output={"bundles": sorted(prefetched),
+                                      "errors": evidence_errors})
+    if progress:
+        progress(0.08, "evidence", f"证据包完成：{len(prefetched)} 个，{len(evidence_errors)} 个失败")
     n = len(secs)
+    pause_after = bool(run.get("config", {}).get("pause_after_section"))
+    last_paused = int(run.get("last_paused_section") or 0)
     for i, sec in enumerate(secs):
         f0, f1 = 0.05 + i / n * 0.9, 0.05 + (i + 1) / n * 0.9
         if force_sec is not None and int(sec["no"]) != int(force_sec):
             continue
-        results.append(_write_one(run, sec, outline["version"],
-                                  force=(force_sec is not None),
-                                  progress=progress, frac0=f0, frac1=f1))
+        no = int(sec["no"])
+        # Skip sections already delivered in an earlier paused batch.  Forced
+        # reruns still execute regardless of cursor.
+        if pause_after and force_sec is None and last_paused and no <= last_paused:
+            results.append({"sec_no": no, "status": "reused",
+                            "cache_hit": True, "evidence_bundle": {}})
+            continue
+        run_coordinator.set_state(f"writer:{no}", "running", input=sec,
+                                  increment_attempt=True)
+        try:
+            result = _write_one(run, sec, outline["version"],
+                                force=(force_sec is not None),
+                                progress=progress, frac0=f0, frac1=f1,
+                                evidence_bundle=prefetched.get(no))
+            results.append(result)
+            run_coordinator.set_state(f"writer:{no}", "done", output=result)
+            run_coordinator.send("writer", "coordinator", "section_written",
+                                 {"sec_no": no, "evidence_coverage": result.get("evidence_coverage", 0.0)})
+            # Only pause on a section that actually generated new content.
+            # Cache hits (``cache_hit=True``) and reused replay must not
+            # retrigger the checkpoint; doing so keeps the writer stuck on
+            # the first section after each resume.
+            is_fresh = not result.get("cache_hit")
+            if pause_after and is_fresh:
+                _update_run(run_id, status="paused", stage=f"第 {no} 节完成，等待检查后继续",
+                            error=None)
+                # Persist a cursor so the next invocation only writes sections
+                # strictly after ``completed_until``.  Cached replays of the
+                # same section must not retrigger the pause; only freshly
+                # generated (or freshly rewritten) sections count.
+                _update_run(run_id, last_paused_section=no)
+                run_coordinator.set_state("writer", "paused",
+                                          output={"completed_until": no,
+                                                  "message": "章节检查点已保存，可重新运行 sections 继续"})
+                return {"sections": len(results), "paused": True,
+                        "completed_until": no, "failed": [],
+                        "evidence_bundles": {r["sec_no"]: r.get("evidence_bundle", {})
+                                              for r in results}}
+        except Exception as exc:
+            run_coordinator.set_state(f"writer:{no}", "failed",
+                                      error=f"{type(exc).__name__}: {str(exc)[:300]}")
+            run_coordinator.send("writer", "coordinator", "section_failed",
+                                 {"sec_no": no, "error": str(exc)[:300]}, requires_review=True)
+            raise
     rows = _latest_sections(run_id)
     failed = [r["sec_no"] for r in rows if r["status"] == "failed"]
     reused = sum(1 for r in results if r.get("cache_hit"))
     # 用尽重写次数仍未达评审门槛的节：如实交付但单列出来，不假装全绿
     below_bar = [r["sec_no"] for r in results
                  if r.get("score") is not None and not r.get("met_bar")]
+    audit = _document_audit(run_id)
     _update_run(run_id, status="drafted" if not failed else "failed",
                 stage="全节完成" if not failed else f"第 {failed} 节失败，可单节重跑",
                 error=None)
+    run_coordinator.set_state("writer", "done", output={"sections": len(results),
+                                                         "failed": failed})
+    # Reviewer owns the per-section LLM review, while the deterministic
+    # document-level consistency pass is a distinct Auditor hand-off.
+    run_coordinator.set_state("reviewer", "done", output={"sections": len(results)})
+    run_coordinator.set_state("auditor", "done", output=audit)
+    run_coordinator.send("auditor", "coordinator", "audit_completed", audit,
+                         requires_review=bool(audit.get("major_count")))
     return {"sections": len(results), "cache_reused": reused,
             "failed": failed, "below_bar": below_bar,
-            "scores": {r["sec_no"]: r.get("score") for r in results}}
+            "scores": {r["sec_no"]: r.get("score") for r in results},
+            "evidence_coverage": {r["sec_no"]: r.get("evidence_coverage", 0.0)
+                                  for r in results},
+            "evidence_bundles": {r["sec_no"]: r.get("evidence_bundle", {})
+                                  for r in results},
+            "audit": audit}
 
 
 # ── 装配与机械终检 ───────────────────────────────────────────────
@@ -730,10 +1095,25 @@ def assemble(run_id: str) -> tuple[str, dict[int, dict], list[dict]]:
             return f"[{gmap[pid]}]"
 
         text2 = re.sub(r"\[(\d{1,2})\]", repl, text)
-        infos.append({"sec_no": row["sec_no"], "title": row["title"],
+        # Keep the transformed global citation map and evidence bundle beside
+        # the display metadata.  The auditor uses these exact per-section
+        # boundaries so a quote in another chapter cannot support a number.
+        sec_refs = {}
+        for local_no, entry in cit.items():
+            try:
+                pid = int(entry["paper_id"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            sec_refs[str(gmap.get(pid, 0))] = entry
+        infos.append({"sec_no": row["sec_no"], "outline_version": row["outline_version"],
+                      "title": row["title"],
                       "status": row["status"], "score": row["score"],
                       "attempt": row["attempt"],
-                      "removed": json.loads(row["removed_json"] or "[]")})
+                      "removed": json.loads(row["removed_json"] or "[]"),
+                      "content": text2, "citations": sec_refs,
+                      "evidence_bundle": json.loads(row["evidence_json"] or "{}"),
+                      "audit": json.loads(row["audit_json"] or "{}")
+                      if "audit_json" in row.keys() else {}})
         parts.append(f"## {row['sec_no']}. {row['title']}\n\n{text2}")
     title = (outline or {}).get("title") or ""
     body = (f"# {title}\n\n" + "\n\n".join(parts)) if title else "\n\n".join(parts)
@@ -754,8 +1134,77 @@ def _reference_lines(refs: dict[int, dict]) -> list[str]:
     return out
 
 
-def final_check(text: str, refs: dict[int, dict]) -> dict:
-    """机械终检（不加 LLM）：悬空/未核验编号、待补证据数、字数、引用核验率。"""
+def _audit_sections(sections: list[dict], glossary: dict | None = None) -> dict:
+    """Run the deterministic auditor and return its JSON-safe summary."""
+    try:
+        return auditor.summarize_issues(auditor.audit_document(
+            sections, glossary=glossary or {}))
+    except Exception as exc:  # a malformed historic row must not hide report
+        return {"ok": False, "issue_count": 1, "major_count": 1,
+                "minor_count": 0, "suggestion_count": 0,
+                "issues": [{"issue_type": "claim_conflict", "locations": [],
+                             "description": f"审计执行失败：{type(exc).__name__}: {str(exc)[:200]}",
+                             "severity": "major", "fix": "检查章节证据包格式"}],
+                "error": str(exc)[:300]}
+
+
+def _split_for_audit(text: str, infos: list[dict]) -> list[dict]:
+    """Align a polished document back to its original chapter evidence.
+
+    The polish model is required to preserve headings; when it does not, we
+    still audit the complete text against each chapter only as a last resort,
+    which reports citation/term issues but never treats another chapter's
+    evidence as support for numeric claims.
+    """
+    out = []
+    for info in infos:
+        no, title = info.get("sec_no"), info.get("title", "")
+        pat = rf"(?ms)^##\s*{re.escape(str(no))}\.\s*{re.escape(str(title))}\s*\n?(.*?)(?=^##\s*\d+\.\s|\Z)"
+        m = re.search(pat, text)
+        content = m.group(1).strip() if m else ""
+        row = dict(info)
+        row["content"] = content
+        out.append(row)
+    if any(not s.get("content") for s in out):
+        # Avoid duplicate numeric reports for a heading-less model response.
+        merged = dict(infos[0]) if infos else {}
+        merged["content"] = text
+        return [merged]
+    return out
+
+
+def _document_audit(run_id: str, *, body: str | None = None,
+                    refs: dict[int, dict] | None = None,
+                    infos: list[dict] | None = None) -> dict:
+    """Audit and persist the latest complete document snapshot."""
+    if body is None or refs is None or infos is None:
+        body, refs, infos = assemble(run_id)
+    run = get_run(run_id) or {}
+    audit = _audit_sections(infos, run.get("glossary") or {})
+    rewrite = set()
+    for info in infos:
+        try:
+            local = info.get("audit") or _section_audit(
+                run, info, info.get("content", ""),
+                info.get("evidence_bundle") or {}, info.get("citations") or {})
+            if local.get("major_count"):
+                rewrite.add(int(info["sec_no"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+    # Also honor explicit section IDs emitted by the document auditor.
+    for issue in audit.get("issues") or []:
+        for loc in issue.get("locations") or []:
+            m = re.search(r"section[- :]?(\d+)", str(loc), re.I)
+            if m and issue.get("severity") == "major":
+                rewrite.add(int(m.group(1)))
+    audit["rewrite_sections"] = sorted(rewrite)
+    _update_run(run_id, audit=audit)
+    return audit
+
+
+def final_check(text: str, refs: dict[int, dict], sections: list[dict] | None = None,
+                glossary: dict | None = None) -> dict:
+    """机械终检（不加 LLM）：引用、数字、术语和主张一致性。"""
     used = [int(x) for x in re.findall(r"\[(\d{1,2})\]", text)]
     dangling = sorted({n for n in used if n not in refs})
     unused = sorted(n for n in refs if n not in used)
@@ -763,20 +1212,27 @@ def final_check(text: str, refs: dict[int, dict]) -> dict:
     verified_used = [n for n in used if n in refs and refs[n].get("verified")]
     rate = round(len(verified_used) / len(used), 3) if used else None
     clean = re.sub(r"\[\d{1,2}\]", "", text)
-    return {"ok": not dangling and not unverified,
+    audit = _audit_sections(sections or [{"content": text, "citations": refs,
+                                          "sec_no": "document"}], glossary)
+    return {"ok": not dangling and not unverified and not audit.get("major_count"),
             "citation_count": len(used),
             "verified_rate": rate,               # 草稿引用核验率
             "dangling": dangling, "unused": unused, "unverified": unverified,
             "pending_evidence": clean.count("待补证据"),
-            "words": len(re.sub(r"\s+", "", clean))}
+            "words": len(re.sub(r"\s+", "", clean)),
+            "audit": audit,
+            "audit_ok": bool(audit.get("ok", False))}
 
 
 def report(run_id: str) -> dict:
     """任意时刻可算的引用一致性报告（纯机械，不加 LLM）：装配 → 终检。"""
     body, refs, infos = assemble(run_id)
-    rep = final_check(body, refs)
+    run = get_run(run_id) or {}
+    rep = final_check(body, refs, infos, run.get("glossary") or {})
     rep["sections"] = infos
     rep["references"] = [r.split("] ", 1)[-1] for r in _reference_lines(refs)]
+    # Report is intentionally read-only; the latest persisted audit is updated
+    # by stage_sections/stage_polish and never by a GET request.
     return {"body": body, "report": rep}
 
 
@@ -806,9 +1262,34 @@ def _docx_document(path, run: dict, body: str, refs: dict[int, dict], report: di
     from docx import Document
     doc = Document()
     md = _md_document(run, body, refs, report)
-    for raw in md.splitlines():
+    lines = md.splitlines()
+    i = 0
+    while i < len(lines):
+        raw = lines[i]
+        # Convert display equations into native Word OMML. A failed conversion
+        # falls through to the literal LaTeX paragraph, preserving the source.
+        if raw.strip().startswith("$$"):
+            formula_lines = [raw.strip()]
+            if not raw.strip().endswith("$$") or raw.strip() == "$$":
+                i += 1
+                while i < len(lines):
+                    formula_lines.append(lines[i].strip())
+                    if lines[i].strip().endswith("$$"):
+                        break
+                    i += 1
+            formula = "\n".join(formula_lines)
+            try:
+                eq = math_export.omml_paragraph(formula)
+                para = doc.add_paragraph()
+                for child in list(eq):
+                    para._p.append(child)
+                i += 1
+                continue
+            except Exception:
+                pass
         line = raw.rstrip()
         if not line.strip():
+            i += 1
             continue
         clean = re.sub(r"\*\*|``?|__", "", line)
         if line.startswith("### "):
@@ -823,6 +1304,7 @@ def _docx_document(path, run: dict, body: str, refs: dict[int, dict], report: di
             doc.add_paragraph(clean[2:], style="List Bullet")
         else:
             doc.add_paragraph(clean)
+        i += 1
     doc.save(str(path))
 
 
@@ -836,6 +1318,7 @@ def stage_polish(run_id: str, progress=None) -> dict:
     if progress:
         progress(0.1, "assemble", "装配全文（局部 [n] → 全局编号）")
     body, refs, infos = assemble(run_id)
+    pre_audit = _audit_sections(infos, run.get("glossary") or {})
     removed_total = sum(len(i["removed"]) for i in infos)
     if progress:
         progress(0.35, "polish", "润色 Agent（重档模型，保留事实与引用编号）")
@@ -843,13 +1326,51 @@ def stage_polish(run_id: str, progress=None) -> dict:
         body, instruction="统一术语与行文风格，保持所有事实、数字与 [n] 引用编号完全不变",
         paper_ids=[e["paper_id"] for e in refs.values()])
     text = polished.get("revised") or body
+    # Audit the polished text against each chapter's own evidence.  If polish
+    # introduces a new major issue, discard only that model transformation and
+    # deliver the already audited assembled draft instead.
+    polished_infos = _split_for_audit(text, infos)
+    polished_audit = _audit_sections(polished_infos, run.get("glossary") or {})
+    def _fp(issue):
+        return (issue.get("issue_type"), tuple(issue.get("locations") or []),
+                issue.get("description", ""))
+    old_major = {_fp(i) for i in pre_audit.get("issues", [])
+                 if i.get("severity") == "major"}
+    introduced = [i for i in polished_audit.get("issues", [])
+                  if i.get("severity") == "major" and _fp(i) not in old_major]
+    polish_rejected = bool(introduced)
+    if polish_rejected:
+        text = body
+        polished_audit = pre_audit
     if progress:
         progress(0.8, "final-check", "机械终检（悬空/未核验编号、待补证据、字数）")
-    report = final_check(text, refs)
+    final_infos = infos if polish_rejected else polished_infos
+    report = final_check(text, refs, final_infos, run.get("glossary") or {})
     report["polish_degraded"] = polished.get("degraded")
     report["removed_local_citations"] = removed_total
-    report["sections"] = infos
+    # Keep the report aligned with the exact text that will be exported.  A
+    # rejected polish uses the assembled draft; an accepted polish uses the
+    # heading-aligned snapshot that was audited above.
+    report["sections"] = final_infos
     report["references"] = [r.split("] ", 1)[-1] for r in _reference_lines(refs)]
+    report["polish_rejected"] = polish_rejected
+    report["introduced_issues"] = introduced
+    report["audit"] = report.get("audit") or polished_audit
+
+    # Keep the section rows replayable with the exact audit snapshot used for
+    # this final document.  Existing evidence/citation JSON stays untouched.
+    for pinfo in final_infos:
+        sec_no = pinfo.get("sec_no")
+        summary = auditor.summarize_issues(auditor.audit_section(
+            pinfo.get("content", ""), pinfo.get("evidence_bundle") or {},
+            pinfo.get("citations") or {}, run.get("glossary") or {},
+            section_id=f"section-{sec_no}"))
+        with db.conn() as c:
+            c.execute("UPDATE sections SET audit_json=?, updated_at=datetime('now','localtime') "
+                      "WHERE run_id=? AND outline_version=? AND sec_no=?",
+                      (json.dumps(summary, ensure_ascii=False), run_id,
+                       pinfo.get("outline_version"), sec_no))
+            c.commit()
 
     md_path = _export_dir() / f"{run_id}.md"
     md_path.write_text(_md_document(run, text, refs, report), encoding="utf-8")
@@ -861,12 +1382,133 @@ def stage_polish(run_id: str, progress=None) -> dict:
     except ImportError:
         report["docx_note"] = "未安装 python-docx，仅导出 Markdown"
     report["files"] = files
+
+    # Final-gate decision: any unresolved major issue keeps the run out of the
+    # ``done`` state.  Drafts are still exported so the writer can keep
+    # iterating, but the API and front-end must treat the document as a draft
+    # until a manual override records the reason and timestamp.
+    audit_summary = report.get("audit") or {}
+    major_count = int(audit_summary.get("major_count") or 0)
+    polish_rejected_flag = bool(report.get("polish_rejected"))
+    failed_audit = major_count > 0
+
+    # Coordinator-driven bounded rewrite loop.  The plan is computed from
+    # the freshly persisted audit snapshot; each round reruns the affected
+    # sections with ``force=True`` so cache hits cannot trivially satisfy
+    # the requirement.  ``max_coordinator_rounds`` defaults to 1 to keep the
+    # user-visible wall-clock bounded; setting it to 0 disables the loop.
+    coord_log: list[dict] = []
+    if failed_audit and not polish_rejected_flag:
+        max_rounds = int(run.get("config", {}).get("max_coordinator_rounds", 1) or 0)
+        round_idx = 0
+        while round_idx < max_rounds:
+            run_coordinator = coordinator.Coordinator(run_id)
+            plan = run_coordinator.plan()
+            sections_to_rewrite = [int(s) for s in (plan.get("sections") or []) if int(s) > 0]
+            if not sections_to_rewrite:
+                break
+            run_coordinator.set_state(
+                "writer", "running",
+                input={"reason": "coordinator_rewrite", "sections": sections_to_rewrite,
+                       "round": round_idx + 1},
+                increment_attempt=True)
+            run_coordinator.send(
+                "coordinator", "writer", "rewrite_requested",
+                {"sections": sections_to_rewrite, "round": round_idx + 1})
+            rebuilt = 0
+            for sec_no in sections_to_rewrite:
+                outline = get_outline(run_id)
+                sec = next((s for s in (outline or {}).get("sections", [])
+                            if int(s.get("no", -1)) == int(sec_no)), None)
+                if not sec:
+                    continue
+                try:
+                    _write_one(run, sec, outline["version"],
+                               force=True, evidence_bundle=None)
+                    rebuilt += 1
+                except Exception as exc:  # noqa: BLE001
+                    run_coordinator.send("writer", "coordinator", "section_failed",
+                                         {"sec_no": sec_no,
+                                          "error": f"{type(exc).__name__}: {str(exc)[:200]}",
+                                          "round": round_idx + 1},
+                                         requires_review=True)
+            run_coordinator.set_state("writer", "done",
+                                      output={"sections": sections_to_rewrite,
+                                              "rebuilt": rebuilt,
+                                              "round": round_idx + 1})
+            run_coordinator.send("writer", "coordinator", "rewrite_completed",
+                                 {"sections": sections_to_rewrite, "rebuilt": rebuilt,
+                                  "round": round_idx + 1})
+            # Re-audit the rebuilt text.  ``assemble`` re-numbers citations
+            # globally, so the rebuilt sections feed the next round verbatim.
+            body, refs, infos = assemble(run_id)
+            pre_audit = _audit_sections(infos, run.get("glossary") or {})
+            run_coordinator.set_state("auditor", "done", output=pre_audit)
+            new_major = int(pre_audit.get("major_count") or 0)
+            coord_log.append({"round": round_idx + 1,
+                              "sections": sections_to_rewrite,
+                              "rebuilt": rebuilt,
+                              "major_after": new_major})
+            if new_major == 0:
+                # Mark polished export with the rebuilt text so the file the
+                # user downloads reflects the post-rewrite content.
+                text = body
+                md_path.write_text(_md_document(run, text, refs, report), encoding="utf-8")
+                files["md"] = str(md_path)
+                try:
+                    docx_path = _export_dir() / f"{run_id}.docx"
+                    _docx_document(docx_path, run, text, refs, report)
+                    files["docx"] = str(docx_path)
+                except ImportError:
+                    pass
+                report["files"] = files
+                audit_summary = pre_audit
+                major_count = 0
+                failed_audit = False
+                break
+            round_idx += 1
+        report["coordinator_rounds"] = coord_log
+    if failed_audit or polish_rejected_flag:
+        final_status = "needs_review"
+        stage_text = ("润色引入重大问题" if polish_rejected_flag
+                      else f"审计未通过：{major_count} 项重大问题")
+        report["export_mode"] = "draft"
+    else:
+        final_status = "done"
+        stage_text = "终稿已导出"
+        report["export_mode"] = "final"
+    report["failed_audit"] = failed_audit
+    report["major_count"] = major_count
     if progress:
-        progress(0.98, "done", f"完成：{report['words']} 字，引用核验率 "
-                               f"{report['verified_rate'] if report['verified_rate'] is not None else '—'}")
-    _update_run(run_id, status="done", stage="终稿已导出", result=report, error=None)
+        progress(0.98, final_status, f"完成：{report['words']} 字，引用核验率 "
+                                      f"{report['verified_rate'] if report['verified_rate'] is not None else '—'}")
+    _update_run(run_id, status=final_status, stage=stage_text, result=report,
+                audit=audit_summary, error=None)
     return {"words": report["words"], "verified_rate": report["verified_rate"],
-            "ok": report["ok"], "files": files}
+            "ok": report["ok"], "files": files,
+            "audit": audit_summary, "export_mode": report["export_mode"],
+            "failed_audit": failed_audit, "major_count": major_count,
+            "polish_rejected": polish_rejected_flag,
+            "coordinator_rounds": report.get("coordinator_rounds", [])}
+
+
+def stage_audit(run_id: str, progress=None) -> dict:
+    """Run the deterministic P4 audit without invoking a model or rewriting."""
+    run = get_run(run_id)
+    rows = _latest_sections(run_id)
+    if not run or not rows:
+        raise ValueError("还没有可审计的章节")
+    if progress:
+        progress(0.2, "audit", "主张、引用、数字与术语一致性审计")
+    audit = _document_audit(run_id)
+    c = coordinator.Coordinator(run_id)
+    c.set_state("auditor", "done", output=audit)
+    c.send(
+        "auditor", "coordinator", "audit_completed", audit,
+                         requires_review=bool(audit.get("major_count")))
+    if progress:
+        progress(1.0, "audit", f"审计完成：{audit.get('issue_count', 0)} 项")
+    return audit
 
 
 # ── 任务分发（jobs.kind='write'）─────────────────────────────────
@@ -881,19 +1523,35 @@ def run_stage(run_id: str, params: dict, progress=None) -> dict:
     run = get_run(run_id)
     if not run:
         raise ValueError("写作任务不存在")
+    stage = params.get("stage", "")
+    stage_agent = {"topic": "topic", "outline": "outline", "sections": "writer",
+                   "section": "writer", "audit": "auditor", "polish": "polisher"}.get(stage, stage or "unknown")
+    run_coordinator = coordinator.Coordinator(run_id)
+    run_coordinator.set_state(stage_agent, "running", input=params, increment_attempt=True)
+    run_coordinator.send("coordinator", stage_agent, "stage_started", params)
     try:
         if stage == "topic":
-            return stage_topic(run_id, progress)
-        if stage == "outline":
-            return stage_outline(run_id, progress)
-        if stage == "sections":
-            return stage_sections(run_id, progress)
-        if stage == "section":
-            return stage_sections(run_id, progress, force_sec=int(params["sec_no"]))
-        if stage == "polish":
-            return stage_polish(run_id, progress)
-        raise ValueError(f"未知写作阶段：{stage}")
+            result = stage_topic(run_id, progress)
+        elif stage == "outline":
+            result = stage_outline(run_id, progress)
+        elif stage == "sections":
+            result = stage_sections(run_id, progress)
+        elif stage == "section":
+            result = stage_sections(run_id, progress, force_sec=int(params["sec_no"]))
+        elif stage == "polish":
+            result = stage_polish(run_id, progress)
+        elif stage == "audit":
+            result = stage_audit(run_id, progress)
+        else:
+            raise ValueError(f"未知写作阶段：{stage}")
+        run_coordinator.set_state(stage_agent, "done", output=result)
+        run_coordinator.send(stage_agent, "coordinator", "stage_completed", result)
+        return result
     except Exception as exc:
+        run_coordinator.set_state(stage_agent, "failed",
+                                  error=f"{type(exc).__name__}: {str(exc)[:300]}")
+        run_coordinator.send(stage_agent, "coordinator", "stage_failed",
+                             {"stage": stage, "error": str(exc)[:300]}, requires_review=True)
         _update_run(run_id, status="failed", error=f"{type(exc).__name__}: {str(exc)[:300]}")
         raise
 
@@ -911,7 +1569,14 @@ def get_run_state(run_id: str) -> dict | None:
             d["points"] = json.loads(d.pop("points_json") or "[]")
             d["whitelist"] = json.loads(d.pop("whitelist_json") or "[]")
             d["citations"] = json.loads(d.pop("citations_json") or "{}")
+            d["evidence_bundle"] = json.loads(d.pop("evidence_json") or "{}")
+            d["audit"] = json.loads(d.pop("audit_json") or "{}") if "audit_json" in d else {}
             d["removed"] = json.loads(d.pop("removed_json") or "[]")
-            d["review"] = json.loads(d.pop("review_json")) if d.pop("review_json") else None
+            review_json = d.pop("review_json")
+            d["review"] = json.loads(review_json) if review_json else None
             sections.append(d)
-    return {"run": run, "outline": outline, "sections": sections}
+    run_coordinator = coordinator.Coordinator(run_id)
+    return {"run": run, "outline": outline, "sections": sections,
+            "coordinator": {"plan": run_coordinator.plan(),
+                            "states": run_coordinator.states(),
+                            "messages": run_coordinator.messages(100)}}

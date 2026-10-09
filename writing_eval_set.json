@@ -1,0 +1,411 @@
+{
+  "schema_version": 1,
+  "name": "PaperNest Writing Evaluation Set",
+  "description": "固定主题集，用于比较单 Agent、串行流水线与多 Agent 写作的证据覆盖、引用准确率、数字保真度、重写次数、延迟和成本。所有 quote 均逐字来自本地只读数据库中的 source.abstract；pages 未加载时不虚构页码。",
+  "topics": [
+    {
+      "id": "agent-evaluation",
+      "query": "LLM agent benchmark and fact-checking evaluation",
+      "title": "智能体评测框架与事实核验",
+      "sections": [
+        {
+          "id": "agent-evaluation-s1",
+          "no": 1,
+          "title": "多环境基准的覆盖范围",
+          "points": [
+            "比较统一环境基准的任务覆盖与交互能力。"
+          ],
+          "claims": [
+            {
+              "claim_id": "ae-s1-c1",
+              "text": "AgentGym覆盖7个真实场景、14个环境和89项任务。",
+              "source_key": "s02",
+              "quote": "framework featuring 7 real-world scenarios, 14 environments, and 89 tasks",
+              "numbers": [
+                "7",
+                "14",
+                "89"
+              ]
+            },
+            {
+              "claim_id": "ae-s1-c2",
+              "text": "AgentGym支持多轮交互和实时反馈，用于探索与学习。",
+              "source_key": "s02",
+              "quote": "supports interactive exploration and learning for agents through multi-turn interactions and real-time feedback"
+            }
+          ],
+          "source_keys": [
+            "s02"
+          ]
+        },
+        {
+          "id": "agent-evaluation-s2",
+          "no": 2,
+          "title": "事实核验评测的不足",
+          "points": [
+            "识别静态评测的覆盖盲点与自适应审计方向。"
+          ],
+          "claims": [
+            {
+              "claim_id": "ae-s2-c1",
+              "text": "现有自动事实核验评测依赖静态数据集和分类指标，难以自动评估理由生成。",
+              "source_key": "s07",
+              "quote": "existing automated fact-checking evaluation methods rely on static datasets and classification metrics"
+            },
+            {
+              "claim_id": "ae-s2-c2",
+              "text": "FACT-AUDIT通过自适应数据集和迭代式模型中心评测改进审计。",
+              "source_key": "s07",
+              "quote": "FACT-AUDIT generates adaptive and scalable datasets, performs iterative model-centric evaluations"
+            }
+          ],
+          "source_keys": [
+            "s07"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "clinical-engineering",
+      "query": "multi-agent clinical prediction and CFD automation",
+      "title": "临床预测与工程自动化案例",
+      "sections": [
+        {
+          "id": "clinical-engineering-s1",
+          "no": 1,
+          "title": "临床风险预测",
+          "points": [
+            "记录多智能体临床预测的性能数字与时间范围。"
+          ],
+          "claims": [
+            {
+              "claim_id": "ce-s1-c1",
+              "text": "CARE-AD在预测首次诊断编码前10年的阿尔茨海默病风险时，准确率为0.53，高于基线的0.26–0.45。",
+              "source_key": "s03",
+              "quote": "achieved higher accuracy (0.53 vs. 0.26–0.45) than baseline single-model approaches in predicting AD risk 10 years",
+              "numbers": [
+                "0.53",
+                "0.26–0.45",
+                "10"
+              ]
+            },
+            {
+              "claim_id": "ce-s1-c2",
+              "text": "CARE-AD让专门化智能体提取症状并进行领域评估。",
+              "source_key": "s03",
+              "quote": "CARE-AD assigns specialized LLM agents to extract signs and symptoms relevant to AD and conduct domain-specific evaluations"
+            }
+          ],
+          "source_keys": [
+            "s03"
+          ]
+        },
+        {
+          "id": "clinical-engineering-s2",
+          "no": 2,
+          "title": "CFD配置自动化",
+          "points": [
+            "核对数据规模、测试案例和成功率。"
+          ],
+          "claims": [
+            {
+              "claim_id": "ce-s2-c1",
+              "text": "AutoCFD使用28716对自然语言到OpenFOAM配置的数据，并在21个流动案例上评估。",
+              "source_key": "s04",
+              "quote": "custom dataset of 28716 natural language-to-OpenFOAM configuration pairs",
+              "numbers": [
+                "28716"
+              ]
+            },
+            {
+              "claim_id": "ce-s2-c2",
+              "text": "AutoCFD在测试中达到88.7%的解准确率和82.6%的一次尝试成功率。",
+              "source_key": "s04",
+              "quote": "21 diverse flow cases demonstrates state-of-the-art performance, achieving 88.7% solution accuracy and 82.6% first-attempt success rate",
+              "numbers": [
+                "88.7%",
+                "82.6%"
+              ]
+            }
+          ],
+          "source_keys": [
+            "s04"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "agent-methods",
+      "query": "LLM agent methodology and web navigation",
+      "title": "智能体方法与网页导航",
+      "sections": [
+        {
+          "id": "agent-methods-s1",
+          "no": 1,
+          "title": "方法论分类",
+          "points": [
+            "概括综述提出的分类视角与研究脉络。"
+          ],
+          "claims": [
+            {
+              "claim_id": "am-s1-c1",
+              "text": "综述以方法论为中心对LLM智能体系统进行系统拆解。",
+              "source_key": "s01",
+              "quote": "This survey systematically deconstructs LLM agent systems through a methodology-centered taxonomy"
+            },
+            {
+              "claim_id": "am-s1-c2",
+              "text": "综述从构建、协作和演化三个方面考察智能体。",
+              "source_key": "s01",
+              "quote": "examining how agents are constructed, how they collaborate, and how they evolve over time"
+            }
+          ],
+          "source_keys": [
+            "s01"
+          ]
+        },
+        {
+          "id": "agent-methods-s2",
+          "no": 2,
+          "title": "网页导航挑战",
+          "points": [
+            "描述开放域网页导航的困难与缓解方法。"
+          ],
+          "claims": [
+            {
+              "claim_id": "am-s2-c1",
+              "text": "现有网页智能体在真实导航中表现不理想，原因包括HTML复杂、动作多样和开放域任务困难。",
+              "source_key": "s08",
+              "quote": "most existing ones perform far from satisfying in real-world web navigation tasks due to three factors"
+            },
+            {
+              "claim_id": "am-s2-c2",
+              "text": "AutoWebGLM使用HTML简化算法保留网页关键信息。",
+              "source_key": "s08",
+              "quote": "design an HTML simplification algorithm to represent webpages with vital information preserved succinctly"
+            }
+          ],
+          "source_keys": [
+            "s08"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "xlmimo-limitations",
+      "query": "near-field XL-MIMO channel estimation robustness limitations",
+      "title": "近场XL-MIMO估计与限制",
+      "sections": [
+        {
+          "id": "xlmimo-limitations-s1",
+          "no": 1,
+          "title": "MBPD鲁棒性",
+          "points": [
+            "总结MBPD的检测改进与复杂度证据。"
+          ],
+          "claims": [
+            {
+              "claim_id": "xl-s1-c1",
+              "text": "MBPD通过自适应权重矩阵和每轮多个候选模式提升检测准确率。",
+              "source_key": "s05",
+              "quote": "We introduce the multicandidate BPD (MBPD) algorithm, which improves detection accuracy by incorporating adaptive weight matrix adjustments"
+            },
+            {
+              "claim_id": "xl-s1-c2",
+              "text": "论文通过复杂度分析论证MBPD的计算可行性。",
+              "source_key": "s05",
+              "quote": "a detailed complexity analysis demonstrates the computational feasibility"
+            }
+          ],
+          "source_keys": [
+            "s05"
+          ]
+        },
+        {
+          "id": "xlmimo-limitations-s2",
+          "no": 2,
+          "title": "低信噪比下的边界",
+          "points": [
+            "保留低信噪比优势及不能泛化到所有情形的限制。"
+          ],
+          "claims": [
+            {
+              "claim_id": "xl-s2-c1",
+              "text": "增强方法在低信噪比场景下尤其有效，但并非所有情况下都优于MBPD。",
+              "source_key": "s06",
+              "quote": "While not consistently better than MBPD in all cases"
+            },
+            {
+              "claim_id": "xl-s2-c2",
+              "text": "该方法在角域和极域均优于传统压缩感知技术。",
+              "source_key": "s06",
+              "quote": "outperforms traditional compressed sensing techniques in both angle-domain and polar-domain settings"
+            }
+          ],
+          "source_keys": [
+            "s06"
+          ]
+        }
+      ]
+    }
+  ],
+  "sources": [
+    {
+      "norm_key": "doi:10.48550/arxiv.2503.21460",
+      "title": "Large Language Model Agent: A Survey on Methodology, Applications and Challenges",
+      "abstract": "The era of intelligent agents is upon us, driven by revolutionary advancements in large language models. Large Language Model (LLM) agents, with goal-driven behaviors and dynamic adaptation capabilities, potentially represent a critical pathway toward artificial general intelligence. This survey systematically deconstructs LLM agent systems through a methodology-centered taxonomy, linking architectural foundations, collaboration mechanisms, and evolutionary pathways. We unify fragmented research threads by revealing fundamental connections between agent design principles and their emergent behaviors in complex environments. Our work provides a unified architectural perspective, examining how agents are constructed, how they collaborate, and how they evolve over time, while also addressing evaluation methodologies, tool applications, practical challenges, and diverse application domains. By surveying the latest developments in this rapidly evolving field, we offer researchers a structured taxonomy for understanding LLM agents and identify promising directions for future research. The collection is available at https://github.com/luo-junyu/Awesome-Agent-Papers.",
+      "year": 2025,
+      "authors": [
+        "Junyu Luo",
+        "Weizhi Zhang",
+        "Ye Yuan",
+        "Yusheng Zhao",
+        "Junwei Yang",
+        "Yiyang Gu",
+        "Bohan Wu",
+        "Binqi Chen",
+        "Ziyue Qiao",
+        "Qingqing Long",
+        "Rongcheng Tu",
+        "Xiaoming Luo",
+        "Wei Ju",
+        "Zhiping Xiao",
+        "Yifan Wang",
+        "Mengxue Xiao",
+        "Chen-Wuing Liu",
+        "Jingyang Yuan",
+        "Shichang Zhang",
+        "Yiqiao Jin",
+        "Fan Zhang",
+        "Xianhong Wu",
+        "Hanqing Zhao",
+        "Dacheng Tao",
+        "Philip S. Yu",
+        "Ming Zhang"
+      ],
+      "source_key": "s01"
+    },
+    {
+      "norm_key": "doi:10.18653/v1/2025.acl-long.1355",
+      "title": "AgentGym: Evaluating and Training Large Language Model-based Agents across Diverse Environments",
+      "abstract": "Large language models (LLMs) have emerged as a promising foundation to build generally-capable agents (LLM-based agents) that can handle multi-turn decision-making tasks across various environments. However, the community lacks a unified interactive framework that covers diverse environments for comprehensive evaluation of agents, and enables exploration and learning for their self-improvement. To address this, we propose A GENT G YM , a framework featuring 7 real-world scenarios, 14 environments, and 89 tasks for unified, real-time, and concurrent agent interaction. We construct expanded instruction set, high-quality trajectories, and comprehensive benchmarking suite for developing LLM-based agents. Moreover, A GENT G YM supports interactive exploration and learning for agents through multi-turn interactions and real-time feedback. Based on A GENT G YM , we take the initial step to develop LLM-based agents that can handle diverse tasks via methods like self-improvement or reinforcement learning. Experimental re-sults show that the trained agents can achieve results comparable to commercial models. We hope our work can help the community develop more advanced LLM-based agents. We release the code, dataset, benchmark, and checkpoints at https://agentgym.github.io/.",
+      "year": 2025,
+      "authors": [
+        "Zhiheng Xi",
+        "Yiwen Ding",
+        "Wenxiang Chen",
+        "Boyang Hong",
+        "Honglin Guo",
+        "Junzhe Wang",
+        "Xin Guo",
+        "Dingwen Yang",
+        "Chenyang Liao",
+        "Wei He",
+        "Songyang Gao",
+        "Luyao Chen",
+        "Rui Zheng",
+        "Yicheng Zou",
+        "Tao Gui",
+        "Qi Zhang",
+        "Xipeng Qiu",
+        "Xuanjing Huang",
+        "Zuxuan Wu",
+        "Yu-Gang Jiang"
+      ],
+      "source_key": "s02"
+    },
+    {
+      "norm_key": "doi:10.1038/s41746-025-01940-4",
+      "title": "CARE-AD: a multi-agent large language model framework for Alzheimer’s disease prediction using longitudinal clinical notes",
+      "abstract": "Large language models (LLMs) have shown promising capabilities across diverse domains, yet their application to complex clinical prediction tasks remains limited. In this study, we present CARE-AD (Collaborative Analysis and Risk Evaluation for Alzheimer’s Disease), a multi-agent LLM-based framework for forecasting Alzheimer’s disease (AD) onset by analyzing longitudinal electronic health record (EHR) notes. CARE-AD assigns specialized LLM agents to extract signs and symptoms relevant to AD and conduct domain-specific evaluations—emulating a collaborative diagnostic process. In a retrospective evaluation, CARE-AD achieved higher accuracy (0.53 vs. 0.26–0.45) than baseline single-model approaches in predicting AD risk 10 years prior to the first recorded diagnosis code. These findings highlight the feasibility of using multi-agent LLM systems to support early risk assessment for AD and motivate further research on their integration into clinical decision support workflows.",
+      "year": 2025,
+      "authors": [
+        "Rumeng Li",
+        "Xun Wang",
+        "Dan Berlowitz",
+        "J. Mez",
+        "Honghuang Lin",
+        "Hong Yu"
+      ],
+      "source_key": "s03"
+    },
+    {
+      "norm_key": "doi:10.1016/j.taml.2025.100594",
+      "title": "Fine-tuning a Large Language Model for Automating Computational Fluid Dynamics Simulations",
+      "abstract": "Configuring computational fluid dynamics (CFD) simulations typically demands extensive domain expertise, limiting broader access. Although large language models (LLMs) have advanced scientific computing, their use in automating CFD workflows is underdeveloped. We introduce a novel approach centered on domain-specific LLM adaptation. By fine-tuning Qwen2.5-7B-Instruct on NL2FOAM, our custom dataset of 28716 natural language-to-OpenFOAM configuration pairs with chain-of-thought (CoT) annotations, we enable direct translation from natural language descriptions to executable CFD setups. A multi-agent framework orchestrates the process, autonomously verifying inputs, generating configurations, running simulations, and correcting errors. Evaluation on a benchmark of 21 diverse flow cases demonstrates state-of-the-art performance, achieving 88.7% solution accuracy and 82.6% first-attempt success rate. This significantly outperforms larger general-purpose models like Qwen2.5-72B-Instruct, DeepSeek-R1, and Llama3.3-70B-Instruct, while also requiring fewer correction iterations and maintaining high computational efficiency. The results highlight the critical role of domain-specific adaptation in deploying LLM assistants for complex engineering workflows. Our code and fine-tuned model have been deposited at https://github.com/YYgroup/AutoCFD.",
+      "year": 2025,
+      "authors": [
+        "Zhehao Dong",
+        "Zhen Lu",
+        "Yue Yang"
+      ],
+      "source_key": "s04"
+    },
+    {
+      "norm_key": "doi:10.1109/jiot.2024.3477573",
+      "title": "MBPD: A Robust Algorithm for Polar-Domain Channel Estimation in Near-Field Wideband XL-MIMO Systems",
+      "abstract": "In the evolving landscape of wireless communications, extremely large-scale multiple-input-multiple-output (XL-MIMO) systems offer promising enhancements in capacity and spectral efficiency, particularly in near-field scenarios. This article investigates polar-domain channel estimation methods for near-field wideband XL-MIMO systems, proposing a novel approach based on the bilinear pattern detection (BPD) method. We introduce the multicandidate BPD (MBPD) algorithm, which improves detection accuracy by incorporating adaptive weight matrix adjustments and evaluating multiple candidate modes per iteration. Comprehensive simulations validate the superiority of MBPD over traditional BPD in terms of estimation accuracy and robustness. Furthermore, a detailed complexity analysis demonstrates the computational feasibility of the proposed algorithm. The MBPD algorithm greatly improves polar-domain channel estimation, facilitating more efficient implementations of near-field wideband XL-MIMO systems.",
+      "year": 2025,
+      "authors": [
+        "Han Wang",
+        "Peiqing Guo",
+        "Xingwang Li",
+        "Fangqing Wen",
+        "Xianpeng Wang",
+        "Arumugam Nallanathan"
+      ],
+      "source_key": "s05"
+    },
+    {
+      "norm_key": "doi:10.1109/tvt.2025.3589352",
+      "title": "Enhanced Polar-Domain Channel Estimation for Near-Field XL-MIMO in Low-SNR Scenarios",
+      "abstract": "This paper presents an enhanced approach for polar-domain channel estimation in near-field extremelylarge scale multiple input multiple output (XL-MIMO) systems, focusing on improving performance under low signal-to-noise ratio (SNR) conditions. The proposed method combines a lazy residual update strategy with adaptive weight adjustments, optimizing estimation accuracy in challenging environments. Extensive simulations demonstrate that the proposed algorithm outperforms traditional compressed sensing techniques in both angle-domain and polar-domain settings, as well as the bilinear pattern detection (BPD) based algorithm. Compared to the multi-candidate BPD (MBPD) method, the proposed approach exhibits superior mean squared error (MSE) performance, particularly in low-SNR scenarios. Both methods employ adaptive weighting, but the lazy residual update reduces the frequency of full updates, enhancing computational efficiency without sacrificing accuracy. While not consistently better than MBPD in all cases, the proposed algorithm proves particularly effective under low-SNR conditions. These findings confirm its robustness and efficiency for near-field XL-MIMO systems.",
+      "year": 2025,
+      "authors": [
+        "Han Wang",
+        "Tianyu Yan",
+        "Nanrun Zhou",
+        "Xingwang Li",
+        "Fangqing Wen",
+        "Wencai Du"
+      ],
+      "source_key": "s06"
+    },
+    {
+      "norm_key": "doi:10.48550/arxiv.2502.17924",
+      "title": "FACT-AUDIT: An Adaptive Multi-Agent Framework for Dynamic Fact-Checking Evaluation of Large Language Models",
+      "abstract": "Large Language Models (LLMs) have significantly advanced the fact-checking studies. However, existing automated fact-checking evaluation methods rely on static datasets and classification metrics, which fail to automatically evaluate the justification production and uncover the nuanced limitations of LLMs in fact-checking. In this work, we introduce FACT-AUDIT, an agent-driven framework that adaptively and dynamically assesses LLMs' fact-checking capabilities. Leveraging importance sampling principles and multi-agent collaboration, FACT-AUDIT generates adaptive and scalable datasets, performs iterative model-centric evaluations, and updates assessments based on model-specific responses. By incorporating justification production alongside verdict prediction, this framework provides a comprehensive and evolving audit of LLMs' factual reasoning capabilities, to investigate their trustworthiness. Extensive experiments demonstrate that FACT-AUDIT effectively differentiates among state-of-the-art LLMs, providing valuable insights into model strengths and limitations in model-centric fact-checking analysis.",
+      "year": 2025,
+      "authors": [
+        "Hongzhan Lin",
+        "Yang Deng",
+        "Yuxuan Gu",
+        "Wenxuan Zhang",
+        "Jing Ma",
+        "See-Kiong Ng",
+        "Tat-Seng Chua"
+      ],
+      "source_key": "s07"
+    },
+    {
+      "norm_key": "doi:10.1145/3637528.3671620",
+      "title": "AutoWebGLM: A Large Language Model-based Web Navigating Agent",
+      "abstract": "Large language models (LLMs) have fueled many intelligent web agents, but most existing ones perform far from satisfying in real-world web navigation tasks due to three factors: (1) the complexity of HTML text data (2) versatility of actions on webpages, and (3) task difficulty due to the open-domain nature of the web. In light of these challenges, we develop the open AutoWebGLM based on ChatGLM3-6B. AutoWebGLM can serve as a powerful automated web navigation agent that outperform GPT-4. Inspired by human browsing patterns, we first design an HTML simplification algorithm to represent webpages with vital information preserved succinctly. We then employ a hybrid human-AI method to build web browsing data for curriculum training. Finally, we bootstrap the model by reinforcement learning and rejection sampling to further facilitate webpage comprehension, browser operations, and efficient task decomposition by itself. For comprehensive evaluation, we establish a bilingual benchmark---AutoWebBench---for real-world web navigation tasks. We evaluate AutoWebGLM across diverse web navigation benchmarks, demonstrating its potential to tackle challenging tasks in real environments. Related code, model, and data are released at https://github.com/THUDM/AutoWebGLM.",
+      "year": 2024,
+      "authors": [
+        "Hanyu Lai",
+        "Xiao Liu",
+        "Iat Long Iong",
+        "Shuntian Yao",
+        "Yuxuan Chen",
+        "Pengbo Shen",
+        "Hao Yu",
+        "Hanchen Zhang",
+        "Xiaohan Zhang",
+        "Yuxiao Dong",
+        "Jie Tang"
+      ],
+      "source_key": "s08"
+    }
+  ]
+}

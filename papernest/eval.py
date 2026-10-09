@@ -12,7 +12,7 @@ import re
 import time
 from pathlib import Path
 
-from . import db, intent as intent_mod, tools
+from . import config, db, intent as intent_mod, tools
 
 # 意图评测集路径——与 eval_set.json 分开，因为 gold 字段（gold_intent vs gold_keys）
 # 不同；放一起会让 load_eval_set 的断言更难维护。两条入口共用同一个 load_eval_set
@@ -365,12 +365,34 @@ def _library_snapshot() -> dict:
     with db.conn() as c:
         n = c.execute("SELECT COUNT(*) n FROM papers").fetchone()["n"]
         vectors = c.execute("SELECT COUNT(DISTINCT paper_id) n FROM vectors WHERE kind='paper'").fetchone()["n"]
-    return {"papers": n, "papers_with_vectors": vectors}
+        chunks = c.execute("SELECT COUNT(*) n FROM chunks").fetchone()["n"]
+        fulltext_papers = c.execute(
+            "SELECT COUNT(DISTINCT paper_id) n FROM pages WHERE text IS NOT NULL AND trim(text) <> ''"
+        ).fetchone()["n"]
+        pages = c.execute("SELECT COUNT(*) n FROM pages").fetchone()["n"]
+    # Keep the resolved locations in every report.  The project has several
+    # export/checkouts, and a zero-result evaluation is otherwise easy to
+    # mistake for a retrieval regression when the command opened the wrong DB.
+    return {
+        "data_dir": str(config.DATA_DIR.resolve()),
+        "db_path": str(config.DB_PATH.resolve()),
+        "papers": n,
+        "chunks": chunks,
+        "pages": pages,
+        "papers_with_fulltext": fulltext_papers,
+        "papers_with_vectors": vectors,
+    }
 
 
 def print_report(r: dict) -> None:
     print(f"PaperNest 评测报告  {r['ts']}  （库内 {r['library']['papers']} 篇，"
           f"{r['library']['papers_with_vectors']} 篇有向量 · 检索口径 {r.get('retrieval', 'auto')}）")
+    lib = r["library"]
+    print(f"   数据目录: {lib.get('data_dir', '未记录')}\n"
+          f"   数据库: {lib.get('db_path', '未记录')} · pages: {lib.get('pages', '未知')} · "
+          f"chunks: {lib.get('chunks', '未知')} · 有全文论文: {lib.get('papers_with_fulltext', '未知')}")
+    if not lib["papers"]:
+        print("   [警告] 当前数据库没有论文；请检查工作目录或 PAPERNEST_DATA 配置。")
     ret = r["retrieval_metric"]
     print(f"\n① Recall@{ret['k']}          : {ret['recall_at_k']}"
           f"   （关键词串形态 {ret['n']} 条 · 检索链路 {ret['retrieval_mode']}）")

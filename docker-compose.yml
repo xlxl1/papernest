@@ -9,10 +9,10 @@ services:
       # 或挂到反向代理后面。
       - "127.0.0.1:8765:8765"
     environment:
-      # 容器内 uvicorn 必然绑 0.0.0.0，所以这里**强制要求**口令：
-      # 缺失时 compose 直接报错拒绝启动，而不是悄悄跑起一个裸奔的服务。
-      # 本机自用又确实不想设口令，就显式写 PAPERNEST_ALLOW_NO_AUTH=1。
-      PAPERNEST_API_KEY: ${PAPERNEST_API_KEY:?必须设置访问口令，请用 ASCII 字符（HTTP 头装不下非 ASCII）；确实要裸奔则显式设 PAPERNEST_ALLOW_NO_AUTH=1}
+      # 容器内 uvicorn 必然绑 0.0.0.0；无口令时由应用启动守卫拒绝，
+      # 本机隔离环境若确实要裸奔，显式设置 PAPERNEST_ALLOW_NO_AUTH=1。
+      PAPERNEST_API_KEY: ${PAPERNEST_API_KEY:-}
+      PAPERNEST_ALLOW_NO_AUTH: ${PAPERNEST_ALLOW_NO_AUTH:-0}
       PAPERNEST_BIND_HOST: "0.0.0.0"
     env_file:
       - .env            # key 只从宿主机 .env 注入，不进镜像

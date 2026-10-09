@@ -35,6 +35,8 @@
 """
 from __future__ import annotations
 
+import os
+
 from . import config, db
 
 
@@ -42,13 +44,21 @@ class BudgetExceeded(RuntimeError):
     """今日用量已达上限。**故意是个显式异常**：静默降级会让人以为模型变笨了。"""
 
 
+class BudgetUnavailable(RuntimeError):
+    """预算数据不可读取；默认 fail-closed，避免闸门失效后继续消费。"""
+
+
 #: 每日 token 上限（prompt + completion 之和，含 embedding）。0 = 不限。
 DAILY_TOKEN_BUDGET = config._env_int(3_000_000, "PAPERNEST_DAILY_TOKEN_BUDGET",
                                      minimum=0)
+# 只有明确配置才允许数据库异常时继续请求。开发/离线环境可显式设置 1。
+BUDGET_FAIL_OPEN = os.environ.get("PAPERNEST_BUDGET_FAIL_OPEN", "").lower() in {
+    "1", "true", "yes", "on"
+}
 
 
 def spent_today() -> int:
-    """今天已经用掉的 token。库不可用时返回 0——**闸门坏了不该把功能一起锁死**。"""
+    """今天已经用掉的 token；生产环境无法读库时默认停止付费请求。"""
     try:
         with db.conn() as c:
             row = c.execute(
@@ -56,8 +66,12 @@ def spent_today() -> int:
                 " + COALESCE(completion_tokens,0)), 0) n FROM llm_calls "
                 "WHERE date(ts) = date('now','localtime')").fetchone()
         return int(row["n"] if row else 0)
-    except Exception:                                   # noqa: BLE001
-        return 0
+    except Exception as exc:                             # noqa: BLE001
+        if BUDGET_FAIL_OPEN:
+            return 0
+        raise BudgetUnavailable(
+            "无法读取今日 token 用量，已停止付费请求（如确认是离线开发环境，"
+            "可显式设置 PAPERNEST_BUDGET_FAIL_OPEN=1）") from exc
 
 
 def remaining() -> int | float:

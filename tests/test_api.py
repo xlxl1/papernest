@@ -11,7 +11,7 @@ from unittest import mock
 
 from fastapi.testclient import TestClient
 
-from papernest import api, config, db, jobs  # noqa: F401  (config 用于路径归属校验用例)
+from papernest import api, config, db, jobs, pipeline  # noqa: F401  (config 用于路径归属校验用例)
 
 
 class ApiTestBase(unittest.TestCase):
@@ -168,6 +168,15 @@ class WriteRunEndpointTests(ApiTestBase):
         state = self.client.get(f"/api/write/runs/{body['run']['id']}")
         self.assertEqual(state.status_code, 200)
         self.assertEqual(state.json()["run"]["job_id"], body["job_id"])
+
+    def test_audit_endpoint_accepts_completed_run(self):
+        run = pipeline.create_run("大模型 Agent 评测方法")
+        with db.conn() as c:
+            c.execute("UPDATE writing_runs SET status='drafted' WHERE id=?", (run["id"],))
+            c.commit()
+        r = self.client.post(f"/api/write/runs/{run['id']}/audit")
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(r.json()["job_id"])
 
 
 class WorkspaceEndpointTests(ApiTestBase):

@@ -56,13 +56,17 @@ CREATE TABLE IF NOT EXISTS jobs (
   id TEXT PRIMARY KEY,
   kind TEXT NOT NULL,
   params_json TEXT NOT NULL DEFAULT '{}',
-  status TEXT NOT NULL DEFAULT 'queued',  -- queued | running | done | failed
+  status TEXT NOT NULL DEFAULT 'queued',  -- queued | running | done | failed | cancelled
   stage TEXT DEFAULT '',
   progress REAL DEFAULT 0,                -- 0 ~ 1
   message TEXT DEFAULT '',
   result_json TEXT,
   error TEXT,
   dedupe_key TEXT,                        -- 同一资源同时只允许一个在跑（如 write:<run_id>）
+  idempotency_key TEXT,                   -- 客户端重试同一请求时复用原任务
+  attempt INTEGER NOT NULL DEFAULT 0,
+  max_attempts INTEGER NOT NULL DEFAULT 1,
+  cancel_requested INTEGER NOT NULL DEFAULT 0,
   created_at TEXT DEFAULT (datetime('now','localtime')),
   updated_at TEXT DEFAULT (datetime('now','localtime'))
 );
@@ -280,6 +284,7 @@ CREATE TABLE IF NOT EXISTS writing_runs (
   topics_json TEXT DEFAULT '[]',          -- 选题 Agent 的候选（带 [n] 证据）
   glossary_json TEXT DEFAULT '{}',        -- 全局术语表（长文一致性）
   config_json TEXT DEFAULT '{}',          -- target_words / max_rewrites 等
+  audit_json TEXT DEFAULT '{}',           -- 最近一次主张/数字/术语一致性审计
   result_json TEXT,                       -- 终检报告 + 导出路径（done 后）
   error TEXT,
   created_at TEXT DEFAULT (datetime('now','localtime')),
@@ -307,6 +312,8 @@ CREATE TABLE IF NOT EXISTS sections (
   cache_key TEXT DEFAULT '',              -- 内容寻址：hash(prompt 版本,论点,白名单,词表…)
   content TEXT DEFAULT '',                -- 节草稿 Markdown（[n] 为白名单局部编号）
   citations_json TEXT DEFAULT '{}',       -- {"n": {paper_id,title,evidence,verified,…}}
+  evidence_json TEXT DEFAULT '{}',         -- 章节级 EvidenceBundle（可回放）
+  audit_json TEXT DEFAULT '{}',           -- 章节机械审计报告（可回放）
   removed_json TEXT DEFAULT '[]',         -- 生成稿中被剥离的白名单外编号（如实记录）
   status TEXT DEFAULT 'pending',          -- pending|drafting|done|failed|reused
   attempt INTEGER DEFAULT 0,              -- 1=初稿，2/3=带评审意见重写
@@ -317,6 +324,35 @@ CREATE TABLE IF NOT EXISTS sections (
   UNIQUE(run_id, outline_version, sec_no)
 );
 CREATE INDEX IF NOT EXISTS idx_sections_cache ON sections(run_id, cache_key);
+-- Coordinator state and message bus. These rows make agent hand-offs
+-- replayable after a process restart instead of leaving only transient logs.
+CREATE TABLE IF NOT EXISTS writing_agent_states (
+  run_id TEXT NOT NULL,
+  agent TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  attempt INTEGER NOT NULL DEFAULT 0,
+  input_json TEXT NOT NULL DEFAULT '{}',
+  output_json TEXT NOT NULL DEFAULT '{}',
+  error TEXT,
+  updated_at TEXT DEFAULT (datetime('now','localtime')),
+  PRIMARY KEY(run_id, agent),
+  FOREIGN KEY(run_id) REFERENCES writing_runs(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS writing_messages (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id TEXT NOT NULL,
+  message_id TEXT NOT NULL,
+  sender TEXT NOT NULL,
+  recipient TEXT NOT NULL,
+  message_type TEXT NOT NULL,
+  payload_json TEXT NOT NULL DEFAULT '{}',
+  confidence REAL NOT NULL DEFAULT 0,
+  requires_review INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT DEFAULT (datetime('now','localtime')),
+  UNIQUE(run_id, message_id),
+  FOREIGN KEY(run_id) REFERENCES writing_runs(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_writing_messages_run ON writing_messages(run_id, id);
 CREATE TABLE IF NOT EXISTS chat_sessions (
   id TEXT PRIMARY KEY,
   title TEXT DEFAULT '',
@@ -405,7 +441,7 @@ def conn(immediate: bool = False):
 # 每个版本一个「幂等」迁移函数；PRAGMA user_version 记录已应用到哪一版。
 # 旧库（user_version=0）会顺序补齐，新库建表后直接盖到最新版。
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 19
 
 
 def _columns(c: sqlite3.Connection, table: str) -> set[str]:
@@ -597,11 +633,72 @@ def _migrate_13(c: sqlite3.Connection):
     _migrate_10(c)
 
 
+def _migrate_14(c: sqlite3.Connection):
+    """v14：任务取消、幂等和持久化重试字段。"""
+    _add_column(c, "jobs", "idempotency_key", "TEXT")
+    _add_column(c, "jobs", "attempt", "INTEGER NOT NULL DEFAULT 0")
+    _add_column(c, "jobs", "max_attempts", "INTEGER NOT NULL DEFAULT 1")
+    _add_column(c, "jobs", "cancel_requested", "INTEGER NOT NULL DEFAULT 0")
+    # 历史库如果曾经错误地产生过重复幂等键，保留最新一条，避免迁移被旧脏数据卡住。
+    c.execute("""UPDATE jobs SET idempotency_key=NULL
+                 WHERE idempotency_key IS NOT NULL AND id NOT IN (
+                   SELECT id FROM jobs j2 WHERE j2.idempotency_key=jobs.idempotency_key
+                   ORDER BY j2.created_at DESC LIMIT 1)""")
+    c.execute("""CREATE UNIQUE INDEX IF NOT EXISTS ux_jobs_idempotency
+                 ON jobs(idempotency_key) WHERE idempotency_key IS NOT NULL""")
+
+
+def _migrate_15(c: sqlite3.Connection):
+    """v15：持久化章节级 EvidenceBundle，供断点恢复与审计回放。"""
+    _add_column(c, "sections", "evidence_json", "TEXT DEFAULT '{}'" )
+
+
+
+def _migrate_16(c: sqlite3.Connection):
+    """v16：Coordinator 的持久化 Agent 状态与结构化消息表。"""
+    c.executescript("""
+    CREATE TABLE IF NOT EXISTS writing_agent_states (
+      run_id TEXT NOT NULL, agent TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending', attempt INTEGER NOT NULL DEFAULT 0,
+      input_json TEXT NOT NULL DEFAULT '{}', output_json TEXT NOT NULL DEFAULT '{}',
+      error TEXT, updated_at TEXT DEFAULT (datetime('now','localtime')),
+      PRIMARY KEY(run_id, agent), FOREIGN KEY(run_id) REFERENCES writing_runs(id) ON DELETE CASCADE
+    );
+    CREATE TABLE IF NOT EXISTS writing_messages (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL,
+      message_id TEXT NOT NULL, sender TEXT NOT NULL, recipient TEXT NOT NULL,
+      message_type TEXT NOT NULL, payload_json TEXT NOT NULL DEFAULT '{}',
+      confidence REAL NOT NULL DEFAULT 0, requires_review INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT DEFAULT (datetime('now','localtime')),
+      UNIQUE(run_id, message_id), FOREIGN KEY(run_id) REFERENCES writing_runs(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_writing_messages_run ON writing_messages(run_id, id);
+    """)
+
+
+def _migrate_17(c: sqlite3.Connection):
+    """v17：章节和全稿的结构化一致性审计结果。"""
+    _add_column(c, "sections", "audit_json", "TEXT DEFAULT '{}'" )
+    _add_column(c, "writing_runs", "audit_json", "TEXT DEFAULT '{}'" )
+
+
+def _migrate_18(c: sqlite3.Connection):
+    """v18：章节级断点，允许正文生成后在评审失败时继续。"""
+    _add_column(c, "sections", "checkpoint", "TEXT DEFAULT 'pending'")
+    _add_column(c, "sections", "raw_content", "TEXT DEFAULT ''")
+    _add_column(c, "sections", "checkpoint_json", "TEXT DEFAULT '{}'")
+
+
+def _migrate_19(c: sqlite3.Connection):
+    """v19：写作流水线暂停游标，避免重跑时反复停在已缓存的章节。"""
+    _add_column(c, "writing_runs", "last_paused_section", "INTEGER DEFAULT 0")
+
 
 MIGRATIONS = {1: _migrate_1, 2: _migrate_2, 3: _migrate_3, 4: _migrate_4,
               5: _migrate_5, 6: _migrate_6, 7: _migrate_7, 8: _migrate_8, 9: _migrate_9,
               10: _migrate_10, 11: _migrate_11, 12: _migrate_12,
-              13: _migrate_13}
+              13: _migrate_13, 14: _migrate_14, 15: _migrate_15,
+              16: _migrate_16, 17: _migrate_17, 18: _migrate_18, 19: _migrate_19}
 
 _init_lock = threading.Lock()
 _initialized: set[str] = set()
