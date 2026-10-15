@@ -527,7 +527,8 @@ const sourceLink=(s,meta=true)=>{
    一个都不带 key——于是「设了 key 界面全线 401、不设就裸奔」，这道锁事实上不可启用。
    这里包一层 window.fetch 与 EventSource，所有 /api/ 请求自动带上口令：
    - fetch 走 x-api-key 请求头（不进访问日志）
-   - EventSource **不能设请求头**，只能拼 ?api_key=，因此仅在确有口令时才拼
+   - EventSource **不能设请求头**，SSE 才使用 ?api_key=；首个 fetch 成功后服务端
+     写入 HttpOnly cookie，img/iframe 继续走 cookie，不把口令写进资源 URL
    口令存 localStorage（每个浏览器各存各的，不随代码分发）。401 时弹一次输入框并重试。 */
 const PN_KEY='papernest_api_key';
 const pnKey=()=>{try{return localStorage.getItem(PN_KEY)||'';}catch(e){return '';}};
@@ -541,14 +542,10 @@ function pnIsApi(u){
   try{ return new URL(u,location.href).pathname.startsWith('/api/'); }catch(e){ return false; }
 }
 /* 浏览器**自己**发起的加载——<img src>、<iframe src>、<a href> 的顶层导航——
-   不经过 window.fetch，包装器碰不到它们，也没法给它们设请求头。
-   这类 URL 只能把口令拼进 query。设了口令却不拼，PDF 阅读视图与「跳到第 N 页」
-   的证据链会整条 401，而 <img> 的 onerror 会把它显示成「这一页取不到」，
-   看起来像渲染 bug 而不是鉴权失败。 */
+   不经过 window.fetch。服务端在 header 鉴权成功后下发 HttpOnly cookie，
+   这些原生请求自动携带 cookie；保留这个助手是为了让资源 URL 构造集中且可审计。 */
 function pnUrl(u){
-  const k=pnKey();
-  if(!k||!pnIsApi(u)) return u;
-  return u+(u.indexOf('?')<0?'?':'&')+'api_key='+encodeURIComponent(k);
+  return u;
 }
 (function(){
   const rawFetch=window.fetch.bind(window);
@@ -1369,20 +1366,28 @@ function wrStagesBar(st){
     return `<span class="${cls}">${n}</span>`;}).join('')
     +(st==='failed'?'<span class="chip bad">✗ 失败</span>':'')+'</div>';
 }
+function wrCoordinatorPanel(){
+  const c=wrRun&&wrRun.coordinator; if(!c||!c.states) return '';
+  const rows=Object.entries(c.states).filter(([k])=>!k.includes(':')).map(([k,v])=>
+    `<span class="chip ${v.status==='done'?'ok':(v.status==='failed'?'bad':'warn')}">${esc(k)}: ${esc(v.status)}</span>`).join(' ');
+  const next=c.plan&&c.plan.next?`下一步：${esc(c.plan.next)}`:'流程完成';
+  return `<div class="mkt" style="margin-top:6px">Coordinator　${rows}　${next}</div>`;
+}
 function renderWr(){
   if(!wrRun){ $('wrDetail').innerHTML=''; return; }
   const run=wrRun.run;
   let h=`<div class="box"><div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
     <b>${esc(run.title||run.topic.slice(0,36))}</b>
     ${wrChip(run.status)}<span class="mkt">${esc(run.stage||'')}</span></div>
-    ${wrStagesBar(run.status)}</div>`;
+    ${wrStagesBar(run.status)}${wrCoordinatorPanel()}</div>`;
   if(run.status==='pending_user_topic') h+=wrTopicPanel(run);
   if(run.status==='pending_user_outline') h+=wrOutlinePanel()+wrSectionsPanel();
   if(['drafting','drafted','failed'].includes(run.status)){
     h+=wrSectionsPanel();
     if(run.status==='drafted') h+=`<div class="box"><div class="frow" style="margin:0">
+      <button class="ghost" onclick="wrAudit()">运行一致性审计</button>
       <button onclick="wrPolish()">润色并终检导出</button>
-      <span class="mkt">润色 Agent 保持事实与引用编号不变 → 机械终检（悬空/未核验编号、待补证据、字数）</span></div></div>`;
+      <span class="mkt">审计检查主张、引用、数字与术语；润色 Agent 保持事实与引用编号不变 → 机械终检</span></div></div>`;
   }
   if(run.status==='done') h+=wrSectionsPanel()+wrDonePanel(run);
   if(run.error) h+=`<div class="box" style="border-left:3px solid var(--bad)"><span style="color:var(--bad)">✗ ${esc(run.error)}</span></div>`;
@@ -1480,17 +1485,27 @@ function wrSectionsPanel(){
       :s.status==='failed'?'<span class="chip bad">✗ 失败</span>':wrChip(s.status);
     const scoreChip=s.score!=null?`<span class="chip ${s.score>=7?'ok':'warn'}">评审 ${s.score}/10</span>`
       :'<span class="chip">评审 —</span>';
+    const eb=s.evidence_bundle||{};
+    const evCoverage=typeof eb.coverage==='number'?`<span class="chip ${eb.coverage>=0.8?'ok':eb.coverage>0?'warn':'bad'}">证据覆盖 ${(eb.coverage*100).toFixed(0)}%</span>`:'';
     const att=s.attempt>1?`<span class="chip warn">${s.attempt} 稿</span>`:'';
     const rm=(s.removed||[]).length?`<span class="chip bad">剥离白名单外编号 ${s.removed.length}</span>`:'';
+    const au=s.audit||{};
+    const ac=au.issue_count?`<span class="chip ${au.major_count?'bad':'warn'}">审计 ${au.issue_count} 项${au.major_count?`（重大 ${au.major_count}）`:''}</span>`
+      :(au.ok===true?'<span class="chip ok">审计通过</span>':'');
     const ev=(s.whitelist||[]).length?`<details style="margin-top:4px"><summary class="mkt">引用白名单 ${s.whitelist.length} 条（均经机械核验）</summary>${
       s.whitelist.map(w=>`<div class="ev"><a onclick="openPaper(${w.paper_id})">${esc(w.title||('#'+w.paper_id))}</a>：${esc((w.evidence_sentence||'').slice(0,120))}</div>`).join('')}</details>`:'';
     return `<div class="cand">
       <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
-        <b>第 ${s.sec_no} 节 ${esc(s.title)}</b>${chip}${scoreChip}${att}${rm}
+        <b>第 ${s.sec_no} 节 ${esc(s.title)}</b>${chip}${scoreChip}${evCoverage}${att}${rm}${ac}
         <button class="ghost" style="margin-left:auto;padding:2px 12px;font-size:12px"
           onclick="wrRegen(${s.sec_no})">重新生成本节</button></div>
       ${s.review&&s.review.overall?`<div class="mkt">评审总评：${esc(String(s.review.overall).slice(0,150))}</div>`:''}
       <div style="font-size:13.5px;line-height:1.85;margin-top:6px">${wrCitedText(s)}</div>
+      ${au.issues&&au.issues.length?`<details style="margin-top:4px"><summary class="mkt">审计问题（${au.issues.length}）</summary>${au.issues.slice(0,8).map(i=>`<div class="ev"><b>${esc(i.severity||'minor')}</b> ${esc(i.description||'')} ${i.fix?`<span class="mkt">→ ${esc(i.fix)}</span>`:''}</div>`).join('')}</details>`:''}
+      ${eb.claims&&eb.claims.length?`<details style="margin-top:4px"><summary class="mkt">主张—证据绑定（${eb.claims.length} 条）</summary>${eb.claims.map(c=>{
+        const ids=new Set(c.evidence_ids||[]); const bound=(eb.evidence||[]).filter(e=>ids.has(e.evidence_id));
+        return `<div class="ev"><b>${esc(c.status||'needs_review')}</b> ${esc(c.text||'')} ${bound.slice(0,2).map(e=>`<span class="mkt">▸ ${esc((e.quote||'').slice(0,140))}${e.page?`（第 ${e.page} 页）`:''}</span>`).join('')}</div>`;
+      }).join('')}</details>`:''}
       ${ev}</div>`;}).join('');
   return `<div class="box"><b>章节草稿</b><span class="mkt" style="margin-left:8px">角标 [n] 悬浮可看证据句，点击开文献详情；「待补证据」= 库内外都找不到支撑，需人工补</span>${cards}</div>`;
 }
@@ -1514,6 +1529,16 @@ async function wrPolish(){
     note('wrNote','');
   }catch(e){ note('wrNote','✗ 润色失败：'+e.message); }
 }
+async function wrAudit(){
+  note('wrNote','<span class="spin"></span>一致性审计中…');
+  try{
+    const r=await (await fetch(`/api/write/runs/${wrRun.run.id}/audit`,{method:'POST'})).json();
+    if(r.detail) throw new Error(r.detail);
+    await wrWait(r.job_id,'一致性审计');
+    await wrLoad(wrRun.run.id);
+    note('wrNote','');
+  }catch(e){ note('wrNote','✗ 审计失败：'+e.message); }
+}
 /* 终检报告 + 导出 */
 function wrDonePanel(run){
   const r=run.result||{}; if(!r.files) return '';
@@ -1523,9 +1548,11 @@ function wrDonePanel(run){
       字数 <b>${r.words}</b>｜引用 <b>${r.citation_count}</b> 条｜
       草稿引用核验率 <b>${r.verified_rate==null?'—':(r.verified_rate*100).toFixed(1)+'%'}</b>｜
       悬空编号 <b>${(r.dangling||[]).length}</b>｜待补证据段 <b>${r.pending_evidence}</b>
+      ${r.audit?`｜一致性问题 <b>${r.audit.issue_count||0}</b>（重大 ${r.audit.major_count||0}）`:''}
       ${r.removed_local_citations?`｜撰写期剥离白名单外编号 <b>${r.removed_local_citations}</b>`:''}
       ${r.polish_degraded?`<br><span style="color:var(--warn)">润色降级：${esc(r.polish_degraded)}</span>`:''}</div>
     ${(r.dangling||[]).length?`<div class="mkt" style="color:var(--bad)">悬空编号：${r.dangling.join(', ')}</div>`:''}
+    ${r.audit&&r.audit.issues&&r.audit.issues.length?`<details style="margin-top:6px"><summary class="mkt">一致性审计详情（${r.audit.issues.length}）</summary><div class="mkt">${r.audit.issues.slice(0,20).map(i=>`<div class="ev"><b>${esc(i.severity||'minor')}</b> ${esc(i.description||'')} ${i.fix?`<span class="mkt">→ ${esc(i.fix)}</span>`:''}</div>`).join('')}</div></details>`:''}
     ${(r.references||[]).length?`<details style="margin-top:6px" open><summary class="mkt">参考文献（GB/T 7714，${r.references.length} 条）</summary>
       <div class="mkt" style="margin-top:4px">${r.references.map(esc).join('<br>')}</div></details>`:''}
     <div class="frow" style="margin-top:10px">

@@ -41,6 +41,16 @@ def _fallback_scores(text: str) -> list[dict]:
     out.sort(key=lambda x: -x["score"])
     return out[:8]
 
+def _lexical_anchor_score(query: str, title: str, abstract: str) -> float:
+    """Exact term overlap for method/dataset names that embeddings blur."""
+    q = set(re.findall(r"[a-z][a-z0-9-]{2,}|[一-鿿]{2,}", (query or '').lower()))
+    if not q:
+        return 0.0
+    title_terms = set(re.findall(r"[a-z][a-z0-9-]{2,}|[一-鿿]{2,}", (title or '').lower()))
+    body_terms = set(re.findall(r"[a-z][a-z0-9-]{2,}|[一-鿿]{2,}", (abstract or '').lower()))
+    return min(1.0, 0.65 * len(q & title_terms) / len(q) +
+               0.35 * len(q & body_terms) / len(q))
+
 
 def recommend(paragraph: str, top_k: int = 5) -> dict:
     db.init_db()
@@ -48,7 +58,17 @@ def recommend(paragraph: str, top_k: int = 5) -> dict:
     try:
         pvec = embeddings.embed_texts([paragraph])[0]
         pvec = np.asarray(pvec, dtype=np.float32)
-        cands = embeddings.search_papers(paragraph, top_k * 2)
+        cands = embeddings.search_papers(paragraph, max(top_k * 4, 20))
+        # Citation recommendation benefits from lexical anchors (method
+        # names, datasets and exact claims) that paper-level vectors can blur.
+        # Add the normal hybrid/FTS lane, then deduplicate before evidence
+        # verification so a strong exact match is not hidden by vector rank.
+        hybrid = embeddings.search_hybrid(paragraph, max(top_k * 5, 20))
+        seen = {x["paper_id"] for x in cands}
+        for pid in hybrid.ids:
+            if pid not in seen:
+                cands.append({"paper_id": pid, "score": 0.0})
+                seen.add(pid)
     except Exception as e:
         degraded = f"向量检索不可用（{e}），降级为词面重叠匹配"
         pvec = None
@@ -66,24 +86,59 @@ def recommend(paragraph: str, top_k: int = 5) -> dict:
             evidence, escore = embeddings.best_sentence(pvec, pid)
         else:
             evidence, escore = _best_sentence_overlap(paragraph, row["abstract"] or "")
+        evidence_source = "abstract"
+        if not evidence or _norm(evidence) not in _norm(row["abstract"] or ""):
+            ce, cs = _best_chunk_evidence(paragraph, pid)
+            if ce and cs > escore:
+                evidence, escore, evidence_source = ce, cs, "fulltext"
         if evidence:
             # 机械校验：证据句必须能在库内摘要原文中回取到
             verified = _norm(evidence) in _norm(row["abstract"] or "")
+            if not verified:
+                with db.conn() as cdb:
+                    verified = bool(cdb.execute(
+                        "SELECT 1 FROM chunks WHERE paper_id=? AND kind!='reference' "
+                        "AND instr(replace(lower(text),' ',''),?)>0 LIMIT 1",
+                        (pid, _norm(evidence))).fetchone())
         strong = bool(evidence) and verified and (pvec is None or escore >= 0.35)
         out.append({
             "paper_id": pid, "score": round(c["score"], 3),
             "evidence_sentence": evidence, "evidence_score": round(escore, 3),
+            "evidence_source": evidence_source,
             "verified": verified, "strong": strong,
             "title": row["title"], "year": row["year"], "venue": row["venue"],
             "authors": json.loads(row["authors"] or "[]"),
             "doi": row["doi"], "arxiv_id": row["arxiv_id"],
         })
-    out.sort(key=lambda x: (not x["strong"], -x["score"]))
+        out[-1]["lexical_score"] = round(
+            _lexical_anchor_score(paragraph, row["title"], row["abstract"] or ""), 3)
+    # Verified evidence is the primary signal; within the same tier combine
+    # retrieval score and sentence support so exact claims outrank merely
+    # semantically similar papers.
+    out.sort(key=lambda x: (not x["strong"],
+                            -(0.45 * x["score"] + 0.25 * x["evidence_score"] +
+                              0.30 * x.get("lexical_score", 0.0))))
     return {"candidates": out[:top_k], "degraded": degraded}
 
 
 def _norm(s: str) -> str:
     return re.sub(r"\s+", "", s or "").lower()
+
+def _best_chunk_evidence(paragraph: str, paper_id: int) -> tuple[str | None, float]:
+    q = set(_norm(paragraph)[i:i + 2] for i in range(len(_norm(paragraph)) - 1))
+    best, best_s = None, 0.0
+    with db.conn() as c:
+        rows = c.execute("SELECT text FROM chunks WHERE paper_id=? AND kind!='reference'", (paper_id,)).fetchall()
+    for row in rows:
+        for sentence in embeddings.split_sentences(row["text"] or ""):
+            g = _norm(sentence)
+            if len(g) < 30:
+                continue
+            gs = set(g[i:i + 2] for i in range(len(g) - 1))
+            score = len(q & gs) / max(len(gs), 1)
+            if score > best_s:
+                best, best_s = sentence, score
+    return best, best_s
 
 
 def _best_sentence_overlap(paragraph: str, abstract: str) -> tuple[str | None, float]:

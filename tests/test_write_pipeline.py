@@ -164,6 +164,40 @@ class PipelineOfflineTests(unittest.TestCase):
         self.assertEqual(wl2, [])
         self.assertIsNone(err2)
 
+    def test_writer_boundary_requires_verified_claim_binding(self):
+        """Writer boundary rejects model_summary / unverified_recall evidence.
+
+        Cards, table/figure summaries and any chunk that cannot be traced back
+        to a native page or imported fulltext must not earn a citation slot,
+        even when the bundle marks them ``verified=True`` (the legacy
+        heuristic did this when a quote landed in card_json or the same chunk
+        that produced it).  Evidence with the right source_kind but not bound
+        to any claim must also be excluded.
+        """
+        bundle = {
+            "evidence": [
+                {"evidence_id": "ok", "paper_id": self.p1,
+                 "quote": "verified claim quote", "verified": True,
+                 "source_kind": "native_page"},
+                {"evidence_id": "card_only", "paper_id": self.p2,
+                 "quote": "card json text", "verified": True,
+                 "source_kind": "model_summary"},
+                {"evidence_id": "unverified", "paper_id": self.p2,
+                 "quote": "retrieval candidate", "verified": False,
+                 "source_kind": "abstract"},
+                {"evidence_id": "unbound", "paper_id": self.p2,
+                 "quote": "verified but not attached", "verified": True,
+                 "source_kind": "native_page"},
+            ],
+            "claims": [{"claim_id": "c1", "text": "claim",
+                        "evidence_ids": ["ok", "unverified", "card_only"]}],
+        }
+        bound = pipeline._bound_verified_evidence(bundle)
+        self.assertEqual([e["evidence_id"] for e in bound], ["ok"])
+        wl = pipeline._evidence_whitelist(bundle)
+        self.assertEqual([e["paper_id"] for e in wl], [self.p1])
+        self.assertEqual(wl[0]["evidence_sentence"], "verified claim quote")
+
     # ── 缓存 ──
 
     def test_cache_key_stable_and_sensitive(self):
@@ -191,6 +225,35 @@ class PipelineOfflineTests(unittest.TestCase):
         self.assertEqual(r["status"], "reused")     # 命中缓存：LLM 若被调用会抛 LLMUnavailable
         rows = pipeline._latest_sections(run["id"])
         self.assertEqual(rows[0]["content"], "已缓存内容 [1]")
+
+    def test_review_failure_persists_checkpoint_and_resume_skips_generation(self):
+        """模型初稿先落盘；评审服务失败后重试应复用原稿。"""
+        run = pipeline.create_run("agent evaluation methods", max_rewrites=1)
+        with db.conn() as c:
+            c.execute("INSERT INTO outlines(run_id,version,title,outline_json) VALUES(?,?,?,?)",
+                      (run["id"], 1, "t", "[]"))
+            c.commit()
+        sec = {"no": 1, "title": "研究背景", "points": ["背景论点"], "words": 100,
+               "paper_ids": []}
+        bundle = {"section_id": "section-1", "evidence": [], "claims": [],
+                  "coverage": 0.0}
+        with mock.patch.object(pipeline, "build_evidence_bundle", return_value=bundle), \
+             mock.patch.object(pipeline.llm, "available", return_value=True), \
+             mock.patch.object(pipeline.llm, "chat", return_value="初稿内容"), \
+             mock.patch.object(pipeline.writing, "review_text",
+                               side_effect=[RuntimeError("review down"),
+                                            {"score": 8, "issues": []}]) as review:
+            with self.assertRaises(RuntimeError):
+                pipeline._write_one(run, sec, 1, force=False)
+            with db.conn() as c:
+                row = dict(c.execute("SELECT * FROM sections WHERE run_id=?", (run["id"],)).fetchone())
+            self.assertEqual(row["checkpoint"], "review_pending")
+            self.assertEqual(row["raw_content"], "初稿内容")
+            result = pipeline._write_one(run, sec, 1, force=False)
+            self.assertEqual(result["status"], "done")
+            self.assertEqual(review.call_count, 2)
+            # 只有第一次真正生成，重试从 checkpoint 直接进入评审。
+            self.assertEqual(pipeline.llm.chat.call_count, 1)
 
     # ── 白名单外编号剥离 ──
 
@@ -275,6 +338,16 @@ class PipelineOfflineTests(unittest.TestCase):
         st = pipeline.get_run_state(run["id"])
         self.assertIn("run", st) and self.assertIn("outline", st) and self.assertIn("sections", st)
         self.assertEqual(st["sections"][0]["citations"]["1"]["paper_id"], self.p1)
+
+    def test_stage_audit_persists_run_and_section_reports(self):
+        run = pipeline.create_run("agent evaluation methods")
+        self._seed_sections(run["id"])
+        result = pipeline.stage_audit(run["id"])
+        self.assertIn("issues", result)
+        saved = pipeline.get_run(run["id"])
+        self.assertIn("audit", saved)
+        state = pipeline.get_run_state(run["id"])
+        self.assertIn("audit", state["sections"][0])
 
 
 if __name__ == "__main__":

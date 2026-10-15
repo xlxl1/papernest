@@ -88,6 +88,29 @@ class WriteOnlineTests(unittest.TestCase):
                 "abstract": "LLM judges show bias in evaluation pipelines.",
                 "year": 2024, "venue": "TestVenue", "authors": ["Bob Lee"],
                 "doi": None, "arxiv_id": "8002", "source": "s2"})
+            # Inline page rows so EvidenceAgent can verify quotes against an
+            # independent native source instead of falling back to model
+            # summaries.  Without this, the new strict provenance rule rejects
+            # every candidate and the writer ends up with an empty whitelist.
+            c.executemany(
+                "INSERT INTO pages(paper_id,page_no,text) VALUES(?,?,?)",
+                [(self.p1, 1, "Tool use reliability is hard to measure for "
+                              "long horizon agent tasks."),
+                 (self.p2, 1, "LLM judges show bias in agent evaluation "
+                              "pipelines.")])
+            # A single structured chunk per paper.  EvidenceAgent searches
+            # ``chunks_fts`` (and falls back to ``chunks`` when missing), so
+            # without at least one chunk row per paper the bundle comes back
+            # empty in this fixture.
+            c.executemany(
+                "INSERT INTO chunks(paper_id,chunk_no,section_path,start_page,"
+                "end_page,kind,block_type,text) VALUES(?,?,?,?,?,?,?,?)",
+                [(self.p1, 1, "1 Intro", 1, 1, "text", "text",
+                  "Tool use reliability is hard to measure for long horizon "
+                  "agent tasks."),
+                 (self.p2, 1, "1 Intro", 1, 1, "text", "text",
+                  "LLM judges show bias in agent evaluation pipelines.")])
+            c.commit()
 
     def tearDown(self):
         self._embed_patch.stop()
@@ -191,6 +214,31 @@ class WriteOnlineTests(unittest.TestCase):
         cit = json.loads(pipeline._latest_sections(run["id"])[0]["citations_json"])
         self.assertEqual(list(cit), ["1"])
         self.assertTrue(cit["1"]["verified"])
+
+    def test_writer_prompt_excludes_unbound_paper_context(self):
+        run, secs = self._seed()
+        bundle = {
+            "claims": [{"claim_id": "c1", "text": "supported claim",
+                        "evidence_ids": ["e1"]}],
+            "evidence": [
+                {"evidence_id": "e1", "paper_id": self.p1,
+                 "quote": "verified quote", "page": 2, "verified": True},
+                {"evidence_id": "e2", "paper_id": self.p1,
+                 "quote": "unverified retrieval text", "verified": False},
+            ],
+        }
+        captured = {}
+        fake = FakeLLM()
+        with self._online(fake), mock.patch.object(pipeline, "build_evidence_bundle",
+                                                   return_value=mock.Mock(model_dump=lambda: bundle)), \
+             mock.patch.object(pipeline.llm, "chat", side_effect=lambda system, user, **kw:
+                               captured.setdefault("user", user) or _review(9)):
+            # Call the prompt seam directly to make the boundary assertion
+            # independent of retrieval implementation details.
+            pipeline._draft_section(run, secs[0],
+                                    [{"paper_id": self.p1}], 1, None, bundle)
+        self.assertIn("verified quote", captured["user"])
+        self.assertNotIn("unverified retrieval text", captured["user"])
 
     # ── 缓存：在线路径重跑未变节 0 次调用 ──
 

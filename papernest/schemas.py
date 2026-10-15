@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class AgentRequest(BaseModel):
@@ -108,6 +108,13 @@ class NoteCreate(BaseModel):
     tags: list[str] = Field(default_factory=list, max_length=20)
     paper_id: int | None = Field(default=None, ge=1)
 
+    @field_validator("tags")
+    @classmethod
+    def _tag_lengths(cls, values: list[str]) -> list[str]:
+        if any(len(tag) > 100 for tag in values):
+            raise ValueError("单个标签不能超过 100 个字符")
+        return values
+
 
 class NoteUpdate(BaseModel):
     title: str | None = Field(default=None, min_length=1, max_length=200)
@@ -115,6 +122,13 @@ class NoteUpdate(BaseModel):
     note_type: str | None = Field(default=None, max_length=40)
     tags: list[str] | None = Field(default=None, max_length=20)
     paper_id: int | None = Field(default=None, ge=1)
+
+    @field_validator("tags")
+    @classmethod
+    def _tag_lengths(cls, values: list[str] | None) -> list[str] | None:
+        if values is not None and any(len(tag) > 100 for tag in values):
+            raise ValueError("单个标签不能超过 100 个字符")
+        return values
 
 
 class DocumentCreate(BaseModel):
@@ -127,6 +141,10 @@ class DocumentUpdate(BaseModel):
     title: str | None = Field(default=None, min_length=1, max_length=200)
     content: str | None = Field(default=None, max_length=300_000)
     status: str | None = Field(default=None, max_length=30)
+    # 客户端带上读取时的 version 即启用乐观锁；省略时保留旧客户端的兼容行为。
+    expected_version: int | None = Field(default=None, ge=1)
+    # 兼容常见的 REST 客户端写法：直接回传文档响应里的 version 字段。
+    version: int | None = Field(default=None, ge=1)
 
 
 class SourceAttach(BaseModel):
@@ -142,6 +160,13 @@ class WritingRequest(BaseModel):
     paper_ids: list[int] = Field(default_factory=list, max_length=30)
     save: bool = True
 
+    @field_validator("paper_ids")
+    @classmethod
+    def _positive_paper_ids(cls, values: list[int]) -> list[int]:
+        if any(pid < 1 for pid in values):
+            raise ValueError("paper_ids 必须是正整数")
+        return values
+
 
 class WriteRunCreate(BaseModel):
     """二期写作流水线：创建 run 并启动选题 Agent。"""
@@ -149,6 +174,7 @@ class WriteRunCreate(BaseModel):
     project_id: int | None = Field(default=None, ge=1)
     target_words: int = Field(default=3000, ge=500, le=20_000)
     max_rewrites: int = Field(default=2, ge=0, le=3)
+    pause_after_section: bool = False
 
 
 class WriteTopicSelect(BaseModel):
@@ -163,6 +189,20 @@ class WriteOutlineSection(BaseModel):
     paper_ids: list[int] = Field(default_factory=list, max_length=30)
     words: int = Field(default=600, ge=100, le=3000)
     no_support: bool = False
+
+    @field_validator("paper_ids")
+    @classmethod
+    def _positive_paper_ids(cls, values: list[int]) -> list[int]:
+        if any(pid < 1 for pid in values):
+            raise ValueError("paper_ids 必须是正整数")
+        return values
+
+    @field_validator("points")
+    @classmethod
+    def _point_lengths(cls, values: list[str]) -> list[str]:
+        if any(len(point) > 2000 for point in values):
+            raise ValueError("单个大纲要点不能超过 2000 个字符")
+        return values
 
 
 class WriteOutlineUpdate(BaseModel):

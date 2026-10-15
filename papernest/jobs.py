@@ -8,6 +8,7 @@ GET /api/jobs/{id}/events 以 SSE 收实时进度。进度持久化，
 import concurrent.futures
 import json
 import os
+import sqlite3
 import threading
 import time
 import uuid
@@ -31,6 +32,14 @@ class JobConflict(Exception):
     """同一资源已有任务在跑（dedupe_key 冲突）。"""
 
 
+class JobCancelled(Exception):
+    """任务被用户取消，执行器应停止继续推进并丢弃部分结果。"""
+
+
+_recovered_ids: set[str] = set()
+_recovered_lock = threading.Lock()
+
+
 def _pool() -> concurrent.futures.ThreadPoolExecutor:
     global _executor
     if _executor is None:
@@ -41,11 +50,21 @@ def _pool() -> concurrent.futures.ThreadPoolExecutor:
     return _executor
 
 
-def create_job(kind: str, params: dict, dedupe_key: str | None = None) -> str:
-    """建任务。dedupe_key 非空时，同键已有 queued/running 任务则抛 JobConflict。
+def create_job(kind: str, params: dict, dedupe_key: str | None = None,
+               idempotency_key: str | None = None, max_attempts: int = 1) -> str:
+    """建任务。支持资源去重、客户端幂等和持久化重试上限。
 
     没有这道闸时，前端连点两次「开写」会让两个线程交错写同一批 sections 行。
     """
+    if not isinstance(params, dict):
+        raise ValueError("任务参数必须是对象")
+    try:
+        params_json = json.dumps(params, ensure_ascii=False, sort_keys=True)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("任务参数必须可序列化为 JSON") from exc
+    if len(params_json.encode("utf-8")) > 1_000_000:
+        raise ValueError("任务参数不能超过 1MB")
+    max_attempts = max(1, min(int(max_attempts), 5))
     job_id = uuid.uuid4().hex[:12]
     db.init_db()
     # **必须是写事务**：这是一次读-改-写（先查同键有没有在跑、再插）。
@@ -54,14 +73,42 @@ def create_job(kind: str, params: dict, dedupe_key: str | None = None) -> str:
     # 真正的保证在 `_migrate_8` 的部分唯一索引上，这里的事务只是让错误变成
     # 干净的 JobConflict 而不是 IntegrityError。
     with db.conn(immediate=True) as c:
+        if idempotency_key:
+            existing = c.execute(
+                "SELECT id, kind, params_json FROM jobs WHERE idempotency_key=?",
+                (idempotency_key,)).fetchone()
+            if existing:
+                if existing["kind"] != kind:
+                    raise JobConflict("幂等键已被另一种任务类型使用")
+                if existing["params_json"] != params_json:
+                    raise JobConflict("幂等键已存在，但任务参数不同")
+                return existing["id"]
         if dedupe_key:
             busy = c.execute(
                 """SELECT id FROM jobs WHERE dedupe_key=? AND status IN ('queued','running')
                    ORDER BY created_at DESC LIMIT 1""", (dedupe_key,)).fetchone()
             if busy:
                 raise JobConflict(f"已有任务 {busy['id']} 在处理该对象，请等它结束或先取消")
-        c.execute("INSERT INTO jobs(id,kind,params_json,dedupe_key) VALUES(?,?,?,?)",
-                  (job_id, kind, json.dumps(params, ensure_ascii=False), dedupe_key))
+        try:
+            c.execute("""INSERT INTO jobs(
+                       id,kind,params_json,dedupe_key,idempotency_key,max_attempts)
+                       VALUES(?,?,?,?,?,?)""",
+                      (job_id, kind, params_json, dedupe_key,
+                       idempotency_key, max_attempts))
+        except sqlite3.IntegrityError as exc:
+            # 并发请求可能同时通过上面的 SELECT，唯一索引是最终闸门。
+            if idempotency_key:
+                existing = c.execute(
+                    "SELECT id, kind, params_json FROM jobs WHERE idempotency_key=?",
+                    (idempotency_key,)
+                ).fetchone()
+                if existing:
+                    if existing["kind"] != kind or existing["params_json"] != params_json:
+                        raise JobConflict("幂等键已存在，但任务参数不同") from exc
+                    return existing["id"]
+            if dedupe_key:
+                raise JobConflict("已有任务在处理该对象，请等它结束或先取消") from exc
+            raise
     return job_id
 
 
@@ -71,26 +118,60 @@ def submit(job_id: str):
 
 
 def claim_job(job_id: str) -> bool:
-    """原子认领：queued → running。返回 False 表示别人已经领走（防重复执行）。"""
+    """原子认领：queued → running。
+
+    并发上限在 SQLite 写事务中再次校验，因此多个 uvicorn worker / 多个容器
+    共享同一 SQLite 库时也不会各自突破本进程的 ``ThreadPoolExecutor`` 上限。
+    """
     with db.conn() as c:
         cur = c.execute(
-            """UPDATE jobs SET status='running', stage='start', message='任务开始',
-               progress=0.01, updated_at=datetime('now','localtime')
-               WHERE id=? AND status='queued'""", (job_id,))
+            """UPDATE jobs SET status='running', stage='start', message='任务开始', error=NULL,
+               progress=0.01, attempt=attempt+1, cancel_requested=0,
+               updated_at=datetime('now','localtime')
+               WHERE id=? AND status='queued' AND cancel_requested=0
+                 AND (SELECT COUNT(*) FROM jobs WHERE status='running') < ?""",
+            (job_id, MAX_CONCURRENT))
         return cur.rowcount > 0
 
 
 def recover_stale_jobs() -> int:
-    """服务启动时调用：上次进程留下的 queued/running 任务永远不会再被推进，
-    如实标 failed，免得 SSE 客户端对着一个死任务无限轮询。"""
+    """服务启动时恢复可重试任务，达到上限的任务才标记 failed。
+
+    running 任务无法知道进程中断前执行到了哪一步，因此恢复时从 runner
+    起点重新执行；runner 自己负责幂等写入，且 attempt 持久化避免无限重试。
+    """
     db.init_db()
-    with db.conn() as c:
-        cur = c.execute(
-            """UPDATE jobs SET status='failed',
-               error=COALESCE(NULLIF(error,''), '服务重启，任务被中断（未完成的步骤需重新提交）'),
-               updated_at=datetime('now','localtime')
-               WHERE status IN ('queued','running')""")
-        return cur.rowcount
+    with db.conn(immediate=True) as c:
+        rows = c.execute("""SELECT id, attempt, max_attempts FROM jobs
+                           WHERE status IN ('queued','running')
+                           ORDER BY created_at""").fetchall()
+        recover, failed = [], []
+        for row in rows:
+            if int(row["attempt"] or 0) < int(row["max_attempts"] or 1):
+                recover.append(row["id"])
+            else:
+                failed.append(row["id"])
+        if recover:
+            c.executemany("""UPDATE jobs SET status='queued', stage='recovered',
+                           message='服务重启后自动恢复，任务将重新执行',
+                           error=COALESCE(NULLIF(error,''), '服务重启后恢复'),
+                           updated_at=datetime('now','localtime') WHERE id=?""",
+                          [(job_id,) for job_id in recover])
+        if failed:
+            c.executemany("""UPDATE jobs SET status='failed',
+                           error=COALESCE(NULLIF(error,''), '服务重启，重试次数已耗尽'),
+                           updated_at=datetime('now','localtime') WHERE id=?""",
+                          [(job_id,) for job_id in failed])
+    with _recovered_lock:
+        _recovered_ids.update(recover)
+    return len(rows)
+
+
+def drain_recovered() -> list[str]:
+    with _recovered_lock:
+        ids = list(_recovered_ids)
+        _recovered_ids.clear()
+    return ids
 
 
 def get_job(job_id: str) -> dict | None:
@@ -109,12 +190,15 @@ def get_job(job_id: str) -> dict | None:
 
 def list_jobs(limit: int = 20) -> list[dict]:
     with db.conn() as c:
-        rows = c.execute("""SELECT id, kind, status, stage, progress, message, error, created_at
+        rows = c.execute("""SELECT id, kind, status, stage, progress, message, error,
+                                   attempt, max_attempts, cancel_requested, created_at
                             FROM jobs ORDER BY created_at DESC LIMIT ?""", (limit,)).fetchall()
     return [dict(r) for r in rows]
 
 
 def set_progress(job_id: str, frac: float, stage: str, message: str):
+    if is_cancel_requested(job_id):
+        raise JobCancelled("任务已请求取消")
     with db.conn() as c:
         c.execute("""UPDATE jobs SET status='running', progress=?, stage=?, message=?,
                      updated_at=datetime('now','localtime') WHERE id=?""",
@@ -123,19 +207,69 @@ def set_progress(job_id: str, frac: float, stage: str, message: str):
 
 
 def finish_job(job_id: str, result: dict):
-    with db.conn() as c:
-        c.execute("""UPDATE jobs SET status='done', progress=1.0, stage='done',
-                     result_json=?, updated_at=datetime('now','localtime') WHERE id=?""",
+    with db.conn(immediate=True) as c:
+        cur = c.execute("""UPDATE jobs SET status='done', progress=1.0, stage='done', message='完成',
+                     error=NULL,
+                     result_json=?, updated_at=datetime('now','localtime')
+                     WHERE id=? AND cancel_requested=0""",
                   (json.dumps(result, ensure_ascii=False), job_id))
+        if cur.rowcount == 0:
+            c.execute("""UPDATE jobs SET status='cancelled', stage='cancelled',
+                       message='用户取消', updated_at=datetime('now','localtime') WHERE id=?""",
+                      (job_id,))
         c.commit()
 
 
 def fail_job(job_id: str, error: str):
-    with db.conn() as c:
-        c.execute("""UPDATE jobs SET status='failed', error=?,
-                     updated_at=datetime('now','localtime') WHERE id=?""",
-                  (error[:1000], job_id))
+    with db.conn(immediate=True) as c:
+        cur = c.execute("""UPDATE jobs SET status='failed', error=?,
+                     updated_at=datetime('now','localtime')
+                     WHERE id=? AND cancel_requested=0""",
+                        (error[:1000], job_id))
+        if cur.rowcount == 0:
+            c.execute("""UPDATE jobs SET status='cancelled', stage='cancelled',
+                       message='用户取消', updated_at=datetime('now','localtime') WHERE id=?""",
+                      (job_id,))
         c.commit()
+
+
+def is_cancel_requested(job_id: str) -> bool:
+    with db.conn() as c:
+        row = c.execute("SELECT status, cancel_requested FROM jobs WHERE id=?",
+                        (job_id,)).fetchone()
+    return not row or row["status"] == "cancelled" or bool(row["cancel_requested"])
+
+
+def cancel_job(job_id: str) -> dict | None:
+    """取消 queued 任务，或给 running 任务设置取消标记。"""
+    with db.conn(immediate=True) as c:
+        row = c.execute("SELECT status FROM jobs WHERE id=?", (job_id,)).fetchone()
+        if not row or row["status"] in ("done", "failed", "cancelled"):
+            return None
+        if row["status"] == "queued":
+            c.execute("""UPDATE jobs SET status='cancelled', stage='cancelled',
+                       message='用户取消', cancel_requested=1,
+                       updated_at=datetime('now','localtime') WHERE id=?""", (job_id,))
+        else:
+            c.execute("""UPDATE jobs SET cancel_requested=1, message='等待当前步骤结束后取消',
+                       updated_at=datetime('now','localtime') WHERE id=?""", (job_id,))
+    return get_job(job_id)
+
+
+def _retry_job(job_id: str, error: str) -> bool:
+    """异常后把任务重新排队；返回 True 表示还会继续执行。"""
+    with db.conn(immediate=True) as c:
+        row = c.execute("SELECT status, attempt, max_attempts, cancel_requested FROM jobs WHERE id=?",
+                        (job_id,)).fetchone()
+        if not row or row["status"] != "running" or row["cancel_requested"]:
+            return False
+        if int(row["attempt"] or 0) >= int(row["max_attempts"] or 1):
+            return False
+        c.execute("""UPDATE jobs SET status='queued', stage='retrying',
+                   message='本次执行失败，准备重试', error=?, updated_at=datetime('now','localtime')
+                   WHERE id=?""", (error[:1000], job_id))
+    submit(job_id)
+    return True
 
 
 def execute_job(job_id: str):
@@ -148,7 +282,14 @@ def execute_job(job_id: str):
         fail_job(job_id, f"未知任务类型：{job['kind']}")
         return
     if not claim_job(job_id):
-        return  # 已被认领或已结束：重复提交不会跑第二遍
+        # 已被认领/结束时无需再排队；只是跨进程达到并发上限时，延迟重试，
+        # 避免把线程池 worker 阻塞在 sleep 上导致所有任务互相饿死。
+        state = get_job(job_id)
+        if state and state["status"] == "queued" and not state.get("cancel_requested"):
+            timer = threading.Timer(0.5, submit, args=(job_id,))
+            timer.daemon = True
+            timer.start()
+        return
     started = time.perf_counter()
 
     def progress(frac: float, stage: str = "", message: str = ""):
@@ -157,9 +298,24 @@ def execute_job(job_id: str):
     try:
         result = runner(job["params"], progress)
         result["_elapsed_ms"] = round((time.perf_counter() - started) * 1000)
-        finish_job(job_id, result)
+        if is_cancel_requested(job_id):
+            with db.conn() as c:
+                c.execute("""UPDATE jobs SET status='cancelled', stage='cancelled',
+                           message='用户取消', updated_at=datetime('now','localtime') WHERE id=?""",
+                          (job_id,))
+                c.commit()
+        else:
+            finish_job(job_id, result)
+    except JobCancelled as exc:
+        with db.conn() as c:
+            c.execute("""UPDATE jobs SET status='cancelled', stage='cancelled',
+                       message=?, error=NULL, updated_at=datetime('now','localtime') WHERE id=?""",
+                      (str(exc)[:300] or "用户取消", job_id))
+            c.commit()
     except Exception as exc:
-        fail_job(job_id, f"{type(exc).__name__}: {exc}")
+        error = f"{type(exc).__name__}: {exc}"
+        if not _retry_job(job_id, error):
+            fail_job(job_id, error)
 
 
 # ── 各任务的执行体：params dict + progress 回调 → 结果 dict ──
